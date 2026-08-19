@@ -34,6 +34,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeInteractionsKeys(ctx)...)
 	// Claude API Keys
 	out = append(out, s.synthesizeClaudeKeys(ctx)...)
+	// Cursor API Keys
+	out = append(out, s.synthesizeCursorKeys(ctx)...)
 	// Codex API Keys
 	out = append(out, s.synthesizeCodexKeys(ctx)...)
 	// OpenAI-compat
@@ -163,6 +165,59 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		if len(a.Metadata) == 0 {
 			a.Metadata = nil
 		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// synthesizeCursorKeys creates Auth entries for Cursor API keys. The key is
+// stored as an attribute; the executor exchanges it for a short-lived Agent
+// Connect JWT on demand.
+func (s *ConfigSynthesizer) synthesizeCursorKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	cfg := ctx.Config
+	now := ctx.Now
+	idGen := ctx.IDGenerator
+
+	out := make([]*coreauth.Auth, 0, len(cfg.CursorKey))
+	for i := range cfg.CursorKey {
+		ck := cfg.CursorKey[i]
+		key := strings.TrimSpace(ck.APIKey)
+		if key == "" {
+			continue
+		}
+		base := strings.TrimSpace(ck.BaseURL)
+		id, token := idGen.Next("cursor:apikey", key, base)
+		attrs := map[string]string{
+			"source":  fmt.Sprintf("config:cursor[%s]", token),
+			"api_key": key,
+		}
+		if ck.Priority != 0 {
+			attrs["priority"] = strconv.Itoa(ck.Priority)
+		}
+		metadata := map[string]any{
+			"type":    "cursor",
+			"api_key": key,
+		}
+		if base != "" {
+			attrs["base_url"] = base
+			metadata["base_url"] = base
+		}
+		if ck.DisableCooling {
+			metadata["disable_cooling"] = true
+		}
+		a := &coreauth.Auth{
+			ID:         id,
+			Provider:   "cursor",
+			Label:      "cursor-apikey",
+			Prefix:     strings.TrimSpace(ck.Prefix),
+			Status:     coreauth.StatusActive,
+			ProxyURL:   strings.TrimSpace(ck.ProxyURL),
+			Attributes: attrs,
+			Metadata:   metadata,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
 		out = append(out, a)
 	}
 	return out

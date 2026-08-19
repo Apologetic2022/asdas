@@ -484,6 +484,9 @@ func (e *CursorExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 
 func (e *CursorExecutor) ensureCredentials(ctx context.Context, auth *cliproxyauth.Auth) (cursorlib.AccountCredentials, error) {
 	creds := cursorlib.CredentialsFromMetadata(authMetadata(auth))
+	if apiKey := cursorExecAPIKey(auth); apiKey != "" {
+		return e.ensureAPIKeyCredentials(ctx, auth, creds, apiKey)
+	}
 	if creds.AccessToken == "" {
 		return creds, fmt.Errorf("cursor: auth missing access_token")
 	}
@@ -510,6 +513,60 @@ func (e *CursorExecutor) ensureCredentials(ctx context.Context, auth *cliproxyau
 		}
 	}
 	return creds, nil
+}
+
+// ensureAPIKeyCredentials keeps a short-lived Agent Connect JWT fresh for a
+// config-provided Cursor user API key (exchanged via /auth/exchange_user_api_key).
+func (e *CursorExecutor) ensureAPIKeyCredentials(ctx context.Context, auth *cliproxyauth.Auth, creds cursorlib.AccountCredentials, apiKey string) (cursorlib.AccountCredentials, error) {
+	needsExchange := creds.AccessToken == ""
+	if !needsExchange {
+		if expired := stringFromMeta(authMetadata(auth), "expired"); expired != "" {
+			storage := &cursorauth.TokenStorage{AccessToken: creds.AccessToken, RefreshToken: apiKey, Expired: expired}
+			needsExchange = storage.NeedsRefresh()
+		} else if exp := cursorauth.TokenExpiry(creds.AccessToken); !exp.IsZero() && time.Now().After(exp) {
+			needsExchange = true
+		}
+	}
+	if !needsExchange {
+		return creds, nil
+	}
+	refreshed, err := e.svc.RefreshToken(ctx, apiKey, "", creds.BaseURL)
+	if err != nil {
+		if creds.AccessToken == "" {
+			return creds, fmt.Errorf("cursor: api key exchange failed: %w", err)
+		}
+		log.Warnf("cursor api key exchange failed, using existing token: %v", err)
+		return creds, nil
+	}
+	creds.AccessToken = refreshed.AccessToken
+	if auth != nil {
+		if auth.Metadata == nil {
+			auth.Metadata = map[string]any{}
+		}
+		auth.Metadata["access_token"] = refreshed.AccessToken
+		if !refreshed.ExpiresAt.IsZero() {
+			auth.Metadata["expired"] = refreshed.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+	}
+	return creds, nil
+}
+
+// cursorExecAPIKey returns the configured Cursor user API key for an auth.
+func cursorExecAPIKey(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if key := strings.TrimSpace(auth.Attributes["api_key"]); key != "" {
+			return key
+		}
+	}
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["api_key"].(string); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 func authMetadata(auth *cliproxyauth.Auth) map[string]any {
