@@ -140,8 +140,21 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
-	if sessOpts.ToolChoice.ForcesToolCall() && len(result.ToolCalls) == 0 {
-		log.Warnf("cursor: run completed without satisfying tool_choice %s; returning text response", toolChoiceLabel(sessOpts.ToolChoice))
+	if sessOpts.ToolChoice.ForcesToolCall() && len(result.ToolCalls) == 0 && ctx.Err() == nil {
+		// The directive is advisory; a run that ignored it gets one retry
+		// before the text answer is surfaced.
+		log.Warnf("cursor: run did not satisfy tool_choice %s; retrying once", toolChoiceLabel(sessOpts.ToolChoice))
+		if retry, errRetry := cursorlib.RunChat(ctx, creds, upstreamModel, messages, tools, sessOpts); errRetry == nil && len(retry.ToolCalls) > 0 {
+			result = retry
+		} else {
+			log.Warnf("cursor: retry did not satisfy tool_choice %s; returning text response", toolChoiceLabel(sessOpts.ToolChoice))
+		}
+	}
+	if result.InputTokens == 0 && result.OutputTokens == 0 {
+		// Upstream usage rides on TurnEnded, which does not exist yet when a
+		// segment pauses for client tools; estimate so usage is never zero.
+		result.InputTokens = estimateCursorPromptTokens(messages, tools)
+		result.OutputTokens = estimateCursorCompletionTokens(result)
 	}
 
 	outPayload := buildOpenAIChatCompletion(req.Model, result)
@@ -232,78 +245,107 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 
 		contentEmitted := false
-		iterate := func() error {
-			return session.IterSegment(ctx, func(ev cursorlib.StreamEvent) error {
-				var delta map[string]any
-				switch ev.Type {
-				case "text_delta":
-					contentEmitted = true
-					delta = map[string]any{"content": ev.Text}
-				case "thinking_delta":
-					contentEmitted = true
-					delta = map[string]any{"reasoning_content": ev.Text}
-				case "tool_call":
-					if ev.ToolCall == nil {
-						return nil
-					}
-					contentEmitted = true
-					args, _ := json.Marshal(ev.ToolCall.Arguments)
-					if args == nil {
-						args = []byte("{}")
-					}
-					delta = map[string]any{
-						"tool_calls": []map[string]any{
-							{
-								"index": toolIndex,
-								"id":    ev.ToolCall.ID,
-								"type":  "function",
-								"function": map[string]any{
-									"name":      ev.ToolCall.Name,
-									"arguments": string(args),
-								},
+		outputChars := 0
+		emitEvent := func(ev cursorlib.StreamEvent) error {
+			var delta map[string]any
+			switch ev.Type {
+			case "text_delta":
+				contentEmitted = true
+				outputChars += len(ev.Text)
+				delta = map[string]any{"content": ev.Text}
+			case "thinking_delta":
+				contentEmitted = true
+				outputChars += len(ev.Text)
+				delta = map[string]any{"reasoning_content": ev.Text}
+			case "tool_call":
+				if ev.ToolCall == nil {
+					return nil
+				}
+				contentEmitted = true
+				args, _ := json.Marshal(ev.ToolCall.Arguments)
+				if args == nil {
+					args = []byte("{}")
+				}
+				outputChars += len(ev.ToolCall.Name) + len(args) + 16
+				delta = map[string]any{
+					"tool_calls": []map[string]any{
+						{
+							"index": toolIndex,
+							"id":    ev.ToolCall.ID,
+							"type":  "function",
+							"function": map[string]any{
+								"name":      ev.ToolCall.Name,
+								"arguments": string(args),
 							},
 						},
-					}
-					toolIndex++
-				case "usage_final":
-					usageFinal = ev
-					reporter.Publish(ctx, usage.Detail{
-						InputTokens:     ev.InputTokens,
-						OutputTokens:    ev.OutputTokens,
-						CachedTokens:    ev.CacheReadTokens,
-						CacheReadTokens: ev.CacheReadTokens,
-						ReasoningTokens: ev.ReasoningTokens,
-						TotalTokens:     ev.InputTokens + ev.OutputTokens,
-					})
-					return nil
-				case "error":
-					return fmt.Errorf("%s", ev.Message)
-				case "segment_end":
-					if ev.Reason != "" {
-						finishReason = ev.Reason
-					}
-					return nil
-				default:
-					return nil
-				}
-				if delta == nil {
-					return nil
-				}
-				chunk, _ := json.Marshal(map[string]any{
-					"id":      completionID,
-					"object":  "chat.completion.chunk",
-					"created": created,
-					"model":   req.Model,
-					"choices": []map[string]any{
-						{"index": 0, "delta": delta, "finish_reason": nil},
 					},
+				}
+				toolIndex++
+			case "usage_final":
+				usageFinal = ev
+				reporter.Publish(ctx, usage.Detail{
+					InputTokens:     ev.InputTokens,
+					OutputTokens:    ev.OutputTokens,
+					CachedTokens:    ev.CacheReadTokens,
+					CacheReadTokens: ev.CacheReadTokens,
+					ReasoningTokens: ev.ReasoningTokens,
+					TotalTokens:     ev.InputTokens + ev.OutputTokens,
 				})
-				if !emitLine([]byte("data: " + string(chunk))) {
-					return context.Canceled
+				return nil
+			case "error":
+				return fmt.Errorf("%s", ev.Message)
+			case "segment_end":
+				if ev.Reason != "" {
+					finishReason = ev.Reason
 				}
 				return nil
+			default:
+				return nil
+			}
+			if delta == nil {
+				return nil
+			}
+			chunk, _ := json.Marshal(map[string]any{
+				"id":      completionID,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   req.Model,
+				"choices": []map[string]any{
+					{"index": 0, "delta": delta, "finish_reason": nil},
+				},
 			})
+			if !emitLine([]byte("data: " + string(chunk))) {
+				return context.Canceled
+			}
+			return nil
 		}
+
+		// Forced tool choices hold text back until the model commits to a tool
+		// call, so an unsatisfied run can be retried without duplicating text.
+		buffering := sessOpts.ToolChoice.ForcesToolCall()
+		var buffered []cursorlib.StreamEvent
+		handleEvent := func(ev cursorlib.StreamEvent) error {
+			if buffering {
+				switch ev.Type {
+				case "text_delta", "thinking_delta":
+					buffered = append(buffered, ev)
+					return nil
+				case "tool_call":
+					buffering = false
+					for _, b := range buffered {
+						if err := emitEvent(b); err != nil {
+							return err
+						}
+					}
+					buffered = nil
+				}
+			}
+			return emitEvent(ev)
+		}
+		iterate := func() error {
+			return session.IterSegment(ctx, handleEvent)
+		}
+
 		errIter := iterate()
 		if errIter != nil && resumedLive && !contentEmitted && ctx.Err() == nil {
 			// The live run died before producing any output for the resumed
@@ -316,6 +358,19 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				errIter = iterate()
 			}
 		}
+		if errIter == nil && sessOpts.ToolChoice.ForcesToolCall() && toolIndex == 0 && ctx.Err() == nil {
+			// The model ignored the forced tool choice; retry once with a
+			// fresh run before surfacing the buffered text answer.
+			log.Warnf("cursor: stream did not satisfy tool_choice %s; retrying run once", toolChoiceLabel(sessOpts.ToolChoice))
+			_ = session.Close()
+			if retry, errRetry := cursorlib.StartSession(ctx, creds, upstreamModel, messages, tools, sessOpts); errRetry == nil {
+				session = retry
+				buffered = nil
+				buffering = true
+				finishReason = "stop"
+				errIter = iterate()
+			}
+		}
 		if errIter != nil {
 			reporter.PublishFailure(ctx, errIter)
 			select {
@@ -324,6 +379,16 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			_ = session.Close()
 			return
+		}
+		if len(buffered) > 0 {
+			// Still no tool call after the retry: surface the text response.
+			for _, b := range buffered {
+				if err := emitEvent(b); err != nil {
+					_ = session.Close()
+					return
+				}
+			}
+			buffered = nil
 		}
 
 		if finishReason == "tool_calls" && toolIndex == 0 {
@@ -348,18 +413,30 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if !emitLine([]byte("data: " + string(endChunk))) {
 			return
 		}
-		if usageFinal.Type == "usage_final" {
-			usageChunk, _ := json.Marshal(map[string]any{
-				"id":      completionID,
-				"object":  "chat.completion.chunk",
-				"created": created,
-				"model":   req.Model,
-				"choices": []map[string]any{},
-				"usage":   openAIUsagePayload(usageFinal.InputTokens, usageFinal.OutputTokens, usageFinal.CacheReadTokens, usageFinal.ReasoningTokens),
-			})
-			if !emitLine([]byte("data: " + string(usageChunk))) {
-				return
+		if usageFinal.Type != "usage_final" {
+			// The run is paused for client tools, so no TurnEnded usage exists
+			// yet; estimate so streaming clients still receive token counts.
+			usageFinal = cursorlib.StreamEvent{
+				Type:         "usage_final",
+				InputTokens:  estimateCursorPromptTokens(messages, tools),
+				OutputTokens: estimateTokensFromChars(outputChars),
 			}
+			reporter.Publish(ctx, usage.Detail{
+				InputTokens:  usageFinal.InputTokens,
+				OutputTokens: usageFinal.OutputTokens,
+				TotalTokens:  usageFinal.InputTokens + usageFinal.OutputTokens,
+			})
+		}
+		usageChunk, _ := json.Marshal(map[string]any{
+			"id":      completionID,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   req.Model,
+			"choices": []map[string]any{},
+			"usage":   openAIUsagePayload(usageFinal.InputTokens, usageFinal.OutputTokens, usageFinal.CacheReadTokens, usageFinal.ReasoningTokens),
+		})
+		if !emitLine([]byte("data: " + string(usageChunk))) {
+			return
 		}
 		doneChunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
 		for i := range doneChunks {
@@ -444,6 +521,58 @@ func toolChoiceLabel(choice cursorlib.ToolChoice) string {
 		return fmt.Sprintf("function %q", choice.FunctionName)
 	}
 	return fmt.Sprintf("%q", choice.Mode)
+}
+
+// estimateTokensFromChars approximates a token count from a character count
+// (~4 characters per token, the usual heuristic for latin-heavy prompts).
+func estimateTokensFromChars(chars int) int64 {
+	if chars <= 0 {
+		return 0
+	}
+	tokens := int64(chars / 4)
+	if tokens < 1 {
+		tokens = 1
+	}
+	return tokens
+}
+
+// estimateCursorPromptTokens approximates prompt tokens for a run whose
+// pre-tool segment ended before upstream TurnEnded usage exists.
+func estimateCursorPromptTokens(messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition) int64 {
+	chars := 0
+	for i := range messages {
+		chars += len(messages[i].Role) + len(messages[i].Content) + 8
+		for j := range messages[i].ToolCalls {
+			chars += len(messages[i].ToolCalls[j].Name) + 16
+			if b, err := json.Marshal(messages[i].ToolCalls[j].Arguments); err == nil {
+				chars += len(b)
+			}
+		}
+	}
+	for i := range tools {
+		chars += len(tools[i].Name) + len(tools[i].Description) + 16
+		if b, err := json.Marshal(tools[i].Parameters); err == nil {
+			chars += len(b)
+		}
+	}
+	tokens := estimateTokensFromChars(chars)
+	if tokens < 1 {
+		tokens = 1
+	}
+	return tokens
+}
+
+// estimateCursorCompletionTokens approximates completion tokens from the
+// collected segment output.
+func estimateCursorCompletionTokens(result *cursorlib.ChatResult) int64 {
+	chars := len(result.Text) + len(result.Thinking)
+	for i := range result.ToolCalls {
+		chars += len(result.ToolCalls[i].Name) + 16
+		if b, err := json.Marshal(result.ToolCalls[i].Arguments); err == nil {
+			chars += len(b)
+		}
+	}
+	return estimateTokensFromChars(chars)
 }
 
 func openAIUsagePayload(input, output, cacheRead, reasoning int64) map[string]any {

@@ -284,6 +284,9 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 			"role":    "system",
 			"content": directive,
 		})))
+		// Agent scaffolding can drown out system rows, so repeat the
+		// constraint on the user action itself; models weight it heavily.
+		actionText = actionText + "\n\n[Response constraint: " + directive + "]"
 	}
 
 	conversationID := uuid.NewString()
