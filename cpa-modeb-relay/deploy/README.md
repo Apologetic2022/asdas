@@ -112,4 +112,6 @@ compose 会把 `./config.yaml`、`./auths`、`./logs` 挂进容器，路径可�
 - **`bind: address already in use`**：8317 被占用，换 `PORT` 或停掉占用进程。
 - **`/v1/models` 返回空列表**：没有任何可用凭据，检查 `config.yaml` 里的 `cursor-api-key` 是否写入成功。
 - **日志出现 `cursor: api key exchange failed ... 401 Invalid User API Key`**：key 无效或已撤销，此时会退回内置模型列表，实际请求仍会失败。
+- **客户端报 `unknown provider for model <模型名>`**：这个模型没有注册进模型表。Cursor 账号能跑哪些模型只有 `AvailableModels` 说了算，所以先看日志里有没有 `cursor: model catalog unavailable`——上游拿不到目录时，网关会用 auth 目录下 `cursor-model-catalog.json` 里缓存的上一次结果顶上，并在后台每隔一段时间重试，一旦 Cursor 恢复就自动重新注册，不需要改配置。只有连缓存都没有（比如全新部署时上游就是不通）才会退到那份只有几个模型的内置列表，这时 `grok-4.6` 之类的模型就会报这个错。
+- **出网代理 `Too many open files`**：如果 Cursor 的流量要经过一层本机 CONNECT 代理，注意它的 `LimitNOFILE`：每个进行中的 run 各占一条隧道，默认的 1024 很容易在高并发下耗尽，随后连模型目录都拉不下来。
 - **改了配置没生效**：确认服务对 `config.yaml` 有写权限（systemd unit 里已经把 `CONFIG_DIR` 加进 `ReadWritePaths`），并在日志里找 `config file changed, reloading`。
