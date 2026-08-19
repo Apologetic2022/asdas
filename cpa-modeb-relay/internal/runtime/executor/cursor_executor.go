@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,7 +33,67 @@ type CursorExecutor struct {
 
 // NewCursorExecutor creates a Cursor executor.
 func NewCursorExecutor(cfg *config.Config) *CursorExecutor {
+	registerCursorStickyHint()
 	return &CursorExecutor{cfg: cfg, svc: cursorauth.NewAuthService()}
+}
+
+var cursorStickyHintOnce sync.Once
+
+// registerCursorStickyHint pins requests that carry trailing tool results to
+// the auth whose live Cursor session is waiting for those results. Without the
+// pin the selector may rotate to another account mid-conversation, which both
+// misattributes usage and throws away the provider prompt cache.
+func registerCursorStickyHint() {
+	cursorStickyHintOnce.Do(func() {
+		cliproxyauth.RegisterStickyAuthHint(func(_ http.Header, payload []byte) (string, bool) {
+			for _, id := range trailingToolCallIDs(payload) {
+				if session := cursorlib.DefaultSessionManager().LookupPending(id); session != nil && strings.TrimSpace(session.AuthID) != "" {
+					return session.AuthID, true
+				}
+			}
+			return "", false
+		})
+	})
+}
+
+// trailingToolCallIDs extracts the tool call ids of the trailing tool-result
+// rows of an OpenAI chat payload (role:"tool") or a Claude messages payload
+// (user content blocks of type "tool_result").
+func trailingToolCallIDs(payload []byte) []string {
+	arr := gjson.GetBytes(payload, "messages")
+	if !arr.IsArray() {
+		return nil
+	}
+	items := arr.Array()
+	var ids []string
+	for i := len(items) - 1; i >= 0; i-- {
+		item := items[i]
+		switch item.Get("role").String() {
+		case "tool":
+			if id := item.Get("tool_call_id").String(); id != "" {
+				ids = append(ids, id)
+				continue
+			}
+		case "user":
+			content := item.Get("content")
+			found := false
+			if content.IsArray() {
+				for _, part := range content.Array() {
+					if part.Get("type").String() == "tool_result" {
+						if id := part.Get("tool_use_id").String(); id != "" {
+							ids = append(ids, id)
+							found = true
+						}
+					}
+				}
+			}
+			if found {
+				continue
+			}
+		}
+		break
+	}
+	return ids
 }
 
 // Identifier returns the executor identifier.
@@ -68,15 +129,19 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 	tools := extractTools(body)
+	sessOpts := cursorlib.SessionOptions{AuthID: authID(auth), ToolChoice: extractToolChoice(body)}
 
 	creds, err := e.ensureCredentials(ctx, auth)
 	if err != nil {
 		return resp, err
 	}
 
-	result, err := cursorlib.RunChat(ctx, creds, upstreamModel, messages, tools)
+	result, err := cursorlib.RunChat(ctx, creds, upstreamModel, messages, tools, sessOpts)
 	if err != nil {
 		return resp, err
+	}
+	if sessOpts.ToolChoice.ForcesToolCall() && len(result.ToolCalls) == 0 {
+		log.Warnf("cursor: run completed without satisfying tool_choice %s; returning text response", toolChoiceLabel(sessOpts.ToolChoice))
 	}
 
 	outPayload := buildOpenAIChatCompletion(req.Model, result)
@@ -118,13 +183,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 	tools := extractTools(body)
+	sessOpts := cursorlib.SessionOptions{AuthID: authID(auth), ToolChoice: extractToolChoice(body)}
 
 	creds, err := e.ensureCredentials(ctx, auth)
 	if err != nil {
 		return nil, err
 	}
 
-	session, err := openCursorSession(ctx, creds, upstreamModel, messages, tools)
+	session, resumedLive, err := openCursorSession(ctx, creds, upstreamModel, messages, tools, sessOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -165,73 +231,91 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return
 		}
 
-		errIter := session.IterSegment(ctx, func(ev cursorlib.StreamEvent) error {
-			var delta map[string]any
-			switch ev.Type {
-			case "text_delta":
-				delta = map[string]any{"content": ev.Text}
-			case "thinking_delta":
-				delta = map[string]any{"reasoning_content": ev.Text}
-			case "tool_call":
-				if ev.ToolCall == nil {
-					return nil
-				}
-				args, _ := json.Marshal(ev.ToolCall.Arguments)
-				if args == nil {
-					args = []byte("{}")
-				}
-				delta = map[string]any{
-					"tool_calls": []map[string]any{
-						{
-							"index": toolIndex,
-							"id":    ev.ToolCall.ID,
-							"type":  "function",
-							"function": map[string]any{
-								"name":      ev.ToolCall.Name,
-								"arguments": string(args),
+		contentEmitted := false
+		iterate := func() error {
+			return session.IterSegment(ctx, func(ev cursorlib.StreamEvent) error {
+				var delta map[string]any
+				switch ev.Type {
+				case "text_delta":
+					contentEmitted = true
+					delta = map[string]any{"content": ev.Text}
+				case "thinking_delta":
+					contentEmitted = true
+					delta = map[string]any{"reasoning_content": ev.Text}
+				case "tool_call":
+					if ev.ToolCall == nil {
+						return nil
+					}
+					contentEmitted = true
+					args, _ := json.Marshal(ev.ToolCall.Arguments)
+					if args == nil {
+						args = []byte("{}")
+					}
+					delta = map[string]any{
+						"tool_calls": []map[string]any{
+							{
+								"index": toolIndex,
+								"id":    ev.ToolCall.ID,
+								"type":  "function",
+								"function": map[string]any{
+									"name":      ev.ToolCall.Name,
+									"arguments": string(args),
+								},
 							},
 						},
+					}
+					toolIndex++
+				case "usage_final":
+					usageFinal = ev
+					reporter.Publish(ctx, usage.Detail{
+						InputTokens:     ev.InputTokens,
+						OutputTokens:    ev.OutputTokens,
+						CachedTokens:    ev.CacheReadTokens,
+						CacheReadTokens: ev.CacheReadTokens,
+						ReasoningTokens: ev.ReasoningTokens,
+						TotalTokens:     ev.InputTokens + ev.OutputTokens,
+					})
+					return nil
+				case "error":
+					return fmt.Errorf("%s", ev.Message)
+				case "segment_end":
+					if ev.Reason != "" {
+						finishReason = ev.Reason
+					}
+					return nil
+				default:
+					return nil
+				}
+				if delta == nil {
+					return nil
+				}
+				chunk, _ := json.Marshal(map[string]any{
+					"id":      completionID,
+					"object":  "chat.completion.chunk",
+					"created": created,
+					"model":   req.Model,
+					"choices": []map[string]any{
+						{"index": 0, "delta": delta, "finish_reason": nil},
 					},
-				}
-				toolIndex++
-			case "usage_final":
-				usageFinal = ev
-				reporter.Publish(ctx, usage.Detail{
-					InputTokens:     ev.InputTokens,
-					OutputTokens:    ev.OutputTokens,
-					CachedTokens:    ev.CacheReadTokens,
-					CacheReadTokens: ev.CacheReadTokens,
-					ReasoningTokens: ev.ReasoningTokens,
-					TotalTokens:     ev.InputTokens + ev.OutputTokens,
 				})
-				return nil
-			case "error":
-				return fmt.Errorf("%s", ev.Message)
-			case "segment_end":
-				if ev.Reason != "" {
-					finishReason = ev.Reason
+				if !emitLine([]byte("data: " + string(chunk))) {
+					return context.Canceled
 				}
 				return nil
-			default:
-				return nil
-			}
-			if delta == nil {
-				return nil
-			}
-			chunk, _ := json.Marshal(map[string]any{
-				"id":      completionID,
-				"object":  "chat.completion.chunk",
-				"created": created,
-				"model":   req.Model,
-				"choices": []map[string]any{
-					{"index": 0, "delta": delta, "finish_reason": nil},
-				},
 			})
-			if !emitLine([]byte("data: " + string(chunk))) {
-				return context.Canceled
+		}
+		errIter := iterate()
+		if errIter != nil && resumedLive && !contentEmitted && ctx.Err() == nil {
+			// The live run died before producing any output for the resumed
+			// segment (idle upstream teardown while waiting on tool results).
+			// Rebuild a fresh run carrying the tool results in history.
+			log.Warnf("cursor: resumed stream failed before output (%v); rebuilding run from history", errIter)
+			if rebuilt, errRebuild := cursorlib.StartSession(ctx, creds, upstreamModel, messages, tools, sessOpts); errRebuild == nil {
+				session = rebuilt
+				finishReason = "stop"
+				errIter = iterate()
 			}
-			return nil
-		})
+		}
 		if errIter != nil {
 			reporter.PublishFailure(ctx, errIter)
 			select {
@@ -248,6 +332,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if finishReason != "tool_calls" {
 			_ = session.Close()
 		}
+		if sessOpts.ToolChoice.ForcesToolCall() && toolIndex == 0 {
+			log.Warnf("cursor: stream completed without satisfying tool_choice %s; returning text response", toolChoiceLabel(sessOpts.ToolChoice))
+		}
 
 		endChunk, _ := json.Marshal(map[string]any{
 			"id":      completionID,
@@ -261,7 +348,19 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if !emitLine([]byte("data: " + string(endChunk))) {
 			return
 		}
-		_ = usageFinal
+		if usageFinal.Type == "usage_final" {
+			usageChunk, _ := json.Marshal(map[string]any{
+				"id":      completionID,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   req.Model,
+				"choices": []map[string]any{},
+				"usage":   openAIUsagePayload(usageFinal.InputTokens, usageFinal.OutputTokens, usageFinal.CacheReadTokens, usageFinal.ReasoningTokens),
+			})
+			if !emitLine([]byte("data: " + string(usageChunk))) {
+				return
+			}
+		}
 		doneChunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
 		for i := range doneChunks {
 			select {
@@ -274,49 +373,91 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	return &cliproxyexecutor.StreamResult{Chunks: out}, nil
 }
 
-func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition) (*cursorlib.Session, error) {
-	results := trailingToolResults(messages)
+// openCursorSession returns a live session for the request. The second return
+// reports whether the session is a resumed live run (tool results were fed to
+// the original bidi stream), which makes an early failure eligible for a
+// rebuild from history.
+func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, opts cursorlib.SessionOptions) (*cursorlib.Session, bool, error) {
+	results := cursorlib.TrailingToolResults(messages)
 	if len(results) > 0 {
-		session, err := cursorlib.DefaultSessionManager().ResolveForToolResults(results)
-		if err != nil {
-			return nil, err
+		session, err := cursorlib.ResumeSession(results)
+		if err == nil {
+			return session, true, nil
 		}
-		if err = session.SubmitToolResults(results); err != nil {
-			return nil, err
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
 		}
-		return session, nil
+		log.Warnf("cursor: resuming tool results failed (%v); rebuilding run from history", err)
 	}
-	return cursorlib.StartSession(ctx, creds, model, messages, tools)
+	session, err := cursorlib.StartSession(ctx, creds, model, messages, tools, opts)
+	return session, false, err
 }
 
-func trailingToolResults(messages []cursorlib.ChatMessage) []cursorlib.ToolResult {
-	start := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		switch messages[i].Role {
-		case "tool":
-			start = i
-			continue
-		case "assistant":
-			if len(messages[i].ToolCalls) > 0 && start >= 0 {
-				out := make([]cursorlib.ToolResult, 0, len(messages)-start)
-				for _, msg := range messages[start:] {
-					if msg.Role != "tool" || strings.TrimSpace(msg.ToolCallID) == "" {
-						continue
-					}
-					out = append(out, cursorlib.ToolResult{
-						ToolCallID: msg.ToolCallID,
-						Name:       msg.Name,
-						Content:    msg.Content,
-					})
-				}
-				return out
+func authID(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	return auth.ID
+}
+
+// extractToolChoice parses the OpenAI tool_choice field (string or object
+// form, plus the Claude-style {"type":"tool","name":…} passthrough).
+func extractToolChoice(body []byte) cursorlib.ToolChoice {
+	tc := gjson.GetBytes(body, "tool_choice")
+	if !tc.Exists() {
+		return cursorlib.ToolChoice{}
+	}
+	if tc.Type == gjson.String {
+		switch strings.ToLower(strings.TrimSpace(tc.String())) {
+		case "none":
+			return cursorlib.ToolChoice{Mode: "none"}
+		case "required", "any":
+			return cursorlib.ToolChoice{Mode: "required"}
+		case "auto", "":
+			return cursorlib.ToolChoice{Mode: "auto"}
+		}
+		return cursorlib.ToolChoice{}
+	}
+	if tc.IsObject() {
+		switch strings.ToLower(strings.TrimSpace(tc.Get("type").String())) {
+		case "function":
+			if name := strings.TrimSpace(tc.Get("function.name").String()); name != "" {
+				return cursorlib.ToolChoice{Mode: "function", FunctionName: name}
 			}
-			return nil
-		default:
-			return nil
+		case "tool":
+			if name := strings.TrimSpace(tc.Get("name").String()); name != "" {
+				return cursorlib.ToolChoice{Mode: "function", FunctionName: name}
+			}
+		case "any", "required":
+			return cursorlib.ToolChoice{Mode: "required"}
+		case "none":
+			return cursorlib.ToolChoice{Mode: "none"}
+		case "auto":
+			return cursorlib.ToolChoice{Mode: "auto"}
 		}
 	}
-	return nil
+	return cursorlib.ToolChoice{}
+}
+
+func toolChoiceLabel(choice cursorlib.ToolChoice) string {
+	if choice.Mode == "function" {
+		return fmt.Sprintf("function %q", choice.FunctionName)
+	}
+	return fmt.Sprintf("%q", choice.Mode)
+}
+
+func openAIUsagePayload(input, output, cacheRead, reasoning int64) map[string]any {
+	return map[string]any{
+		"prompt_tokens":     input,
+		"completion_tokens": output,
+		"total_tokens":      input + output,
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens": cacheRead,
+		},
+		"completion_tokens_details": map[string]any{
+			"reasoning_tokens": reasoning,
+		},
+	}
 }
 
 // CountTokens returns a best-effort character-based estimate.
@@ -531,11 +672,7 @@ func buildOpenAIChatCompletion(model string, result *cursorlib.ChatResult) []byt
 				"finish_reason": finish,
 			},
 		},
-		"usage": map[string]any{
-			"prompt_tokens":     result.InputTokens,
-			"completion_tokens": result.OutputTokens,
-			"total_tokens":      result.InputTokens + result.OutputTokens,
-		},
+		"usage": openAIUsagePayload(result.InputTokens, result.OutputTokens, result.CacheReadTokens, result.ReasoningTokens),
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

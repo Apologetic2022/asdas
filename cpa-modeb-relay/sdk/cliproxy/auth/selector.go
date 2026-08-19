@@ -22,6 +22,55 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
+// StickyAuthHintFunc resolves the auth ID that must serve a request, e.g. a
+// provider session that is still waiting on the request's tool results.
+// Implementations return ok=false when they have no opinion.
+type StickyAuthHintFunc func(headers http.Header, payload []byte) (authID string, ok bool)
+
+var (
+	stickyHintMu    sync.RWMutex
+	stickyAuthHints []StickyAuthHintFunc
+)
+
+// RegisterStickyAuthHint installs a provider-supplied hint consulted before
+// normal selection. Used to keep multi-turn tool conversations (and their
+// provider prompt cache) on the account that owns the live session.
+func RegisterStickyAuthHint(fn StickyAuthHintFunc) {
+	if fn == nil {
+		return
+	}
+	stickyHintMu.Lock()
+	stickyAuthHints = append(stickyAuthHints, fn)
+	stickyHintMu.Unlock()
+}
+
+// stickyHintedAuth returns the auth pinned by a registered hint when it is
+// present in the candidate list and not disabled.
+func stickyHintedAuth(opts cliproxyexecutor.Options, auths []*Auth) *Auth {
+	stickyHintMu.RLock()
+	hints := stickyAuthHints
+	stickyHintMu.RUnlock()
+	if len(hints) == 0 {
+		return nil
+	}
+	for _, hint := range hints {
+		id, ok := hint(opts.Headers, opts.OriginalRequest)
+		if !ok || id == "" {
+			continue
+		}
+		for _, candidate := range auths {
+			if candidate == nil || candidate.ID != id {
+				continue
+			}
+			if candidate.Disabled || candidate.Status == StatusDisabled {
+				continue
+			}
+			return candidate
+		}
+	}
+	return nil
+}
+
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
 type RoundRobinSelector struct {
 	mu      sync.Mutex
@@ -255,7 +304,9 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 
 // Pick selects the next available auth for the provider in a round-robin manner.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
+	if pinned := stickyHintedAuth(opts, auths); pinned != nil {
+		return pinned, nil
+	}
 	now := time.Now()
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
@@ -292,7 +343,9 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
 
 // Pick selects the first available auth for the provider in a deterministic manner.
 func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	_ = opts
+	if pinned := stickyHintedAuth(opts, auths); pinned != nil {
+		return pinned, nil
+	}
 	now := time.Now()
 	available, err := getAvailableAuths(auths, provider, model, now)
 	if err != nil {
@@ -417,6 +470,17 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	if pinned := stickyHintedAuth(opts, auths); pinned != nil {
+		// A live provider session owns this request (e.g. pending tool
+		// results); rotating accounts here would break the session and drop
+		// the provider prompt cache. Refresh the session binding as well so
+		// later plain turns stay on the same account.
+		if primaryID != "" {
+			s.cache.Set(provider+"::"+primaryID+"::"+model, pinned.ID)
+		}
+		entry.Infof("session-affinity: provider session pin | auth=%s provider=%s model=%s", pinned.ID, provider, model)
+		return pinned, nil
+	}
 	if primaryID == "" {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		return s.fallback.Pick(ctx, provider, model, opts, auths)

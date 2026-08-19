@@ -22,6 +22,51 @@ type ChatMessage struct {
 	ToolCalls  []ToolCall
 }
 
+// ToolChoice captures the OpenAI tool_choice constraint for one request.
+// Mode is one of "", "auto", "none", "required", "function".
+// FunctionName is set when Mode is "function".
+type ToolChoice struct {
+	Mode         string
+	FunctionName string
+}
+
+// ForcesToolCall reports whether the constraint demands at least one tool call.
+func (c ToolChoice) ForcesToolCall() bool {
+	return c.Mode == "required" || c.Mode == "function"
+}
+
+// ApplyToolChoice narrows the advertised tool set according to the constraint.
+// "none" removes all tools; a forced function keeps only the named tool when present.
+func ApplyToolChoice(tools []ToolDefinition, choice ToolChoice) []ToolDefinition {
+	switch choice.Mode {
+	case "none":
+		return nil
+	case "function":
+		for i := range tools {
+			if tools[i].Name == choice.FunctionName {
+				return tools[i : i+1]
+			}
+		}
+	}
+	return tools
+}
+
+// toolChoiceDirective renders the constraint as an explicit system instruction.
+// Cursor's Agent Connect protocol has no native tool_choice field, so the
+// requirement is enforced through the conversation state instead.
+func toolChoiceDirective(choice ToolChoice) string {
+	switch choice.Mode {
+	case "required":
+		return "Tool call required: you MUST respond by invoking one of the provided tools. " +
+			"Do not reply with plain text. If information seems missing, pick the most relevant tool " +
+			"and supply reasonable arguments."
+	case "function":
+		return fmt.Sprintf("Tool call required: you MUST respond by invoking the tool named %q. "+
+			"Do not reply with plain text and do not invoke any other tool.", choice.FunctionName)
+	}
+	return ""
+}
+
 // AccountCredentials are the fields required to open an Agent run.
 type AccountCredentials struct {
 	AccessToken   string
@@ -112,7 +157,14 @@ func storeBlob(store map[string][]byte, data []byte) []byte {
 	return id
 }
 
-func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
+// resumeContinuationPrompt drives a rebuilt run whose trailing history already
+// contains the client-supplied tool results (used when the original bidi
+// stream died while waiting for those results).
+const resumeContinuationPrompt = "Continue the conversation. The results of your earlier tool calls are " +
+	"already provided in the conversation history above. Use them to fulfill the user's most recent " +
+	"request. Call more tools if needed; otherwise answer the user directly."
+
+func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition, choice ToolChoice) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
 	selection := ResolveRequestedModel(model)
 	model = selection.ModelID
 	blobStore := map[string][]byte{}
@@ -135,10 +187,21 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		return nil, nil, "", fmt.Errorf("cursor: request has no user message")
 	}
 
+	// When assistant/tool rows trail the last user message the request is a
+	// tool-results continuation that must be replayed in a fresh run: keep the
+	// whole transcript as history and drive the run with a continuation prompt.
+	resume := historyEnd < len(messages)-1
+	historyMsgs := messages[:historyEnd]
+	actionText := activeUser.Content
+	if resume {
+		historyMsgs = messages
+		actionText = resumeContinuationPrompt
+	}
+
 	// Track tool names so tool-result parts can include toolName (cursor2api).
 	toolNames := map[string]string{}
 	rootIDs := [][]byte{systemBlob}
-	for _, msg := range messages[:historyEnd] {
+	for _, msg := range historyMsgs {
 		switch msg.Role {
 		case "user":
 			if strings.TrimSpace(msg.Content) == "" {
@@ -216,6 +279,13 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		}
 	}
 
+	if directive := toolChoiceDirective(choice); directive != "" {
+		rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
+			"role":    "system",
+			"content": directive,
+		})))
+	}
+
 	conversationID := uuid.NewString()
 	// Desktop / cursor2api do not set exclude_workspace_context by default;
 	// forcing it true is rejected for many accounts ("Workspace context
@@ -259,7 +329,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 			Action: &agentv1.ConversationAction_UserMessageAction{
 				UserMessageAction: &agentv1.UserMessageAction{
 					UserMessage: &agentv1.UserMessage{
-						Text:      activeUser.Content,
+						Text:      actionText,
 						MessageId: uuid.NewString(),
 					},
 				},

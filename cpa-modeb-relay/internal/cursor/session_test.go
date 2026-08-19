@@ -29,7 +29,7 @@ func TestBuildRunRequestIncludesMcpTools(t *testing.T) {
 		Name:        "get_weather",
 		Description: "weather",
 		Parameters:  map[string]any{"type": "object"},
-	}})
+	}}, ToolChoice{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestBuildRunRequestNativeToolJSON(t *testing.T) {
 		}},
 		{Role: "tool", ToolCallID: "c1", Name: "get_weather", Content: `{"ok":true}`},
 		{Role: "user", Content: "again"},
-	}, nil)
+	}, nil, ToolChoice{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,6 +94,73 @@ func TestBuildRunRequestNativeToolJSON(t *testing.T) {
 	}
 	if !sawToolCall || !sawToolResult {
 		t.Fatalf("native tool history missing call=%v result=%v", sawToolCall, sawToolResult)
+	}
+}
+
+func TestBuildRunRequestResumeCarriesTrailingToolResults(t *testing.T) {
+	msg, blobs, _, err := buildRunRequest("default", []ChatMessage{
+		{Role: "user", Content: "weather in NY?"},
+		{Role: "assistant", Content: "", ToolCalls: []ToolCall{
+			{ID: "c9", Name: "get_weather", Arguments: map[string]any{"city": "NY"}},
+		}},
+		{Role: "tool", ToolCallID: "c9", Name: "get_weather", Content: `{"temp":21}`},
+	}, nil, ToolChoice{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := msg.GetRunRequest().GetAction().GetUserMessageAction().GetUserMessage().GetText()
+	if action != resumeContinuationPrompt {
+		t.Fatalf("expected continuation prompt action, got %q", action)
+	}
+	sawResult := false
+	for _, data := range blobs {
+		var payload map[string]any
+		if json.Unmarshal(data, &payload) != nil {
+			continue
+		}
+		if payload["role"] == "tool" && payload["id"] == "c9" {
+			sawResult = true
+		}
+	}
+	if !sawResult {
+		t.Fatal("trailing tool result missing from rebuilt history")
+	}
+}
+
+func TestBuildRunRequestToolChoiceDirective(t *testing.T) {
+	_, blobs, _, err := buildRunRequest("default", []ChatMessage{
+		{Role: "user", Content: "what's the weather?"},
+	}, []ToolDefinition{{Name: "get_weather"}}, ToolChoice{Mode: "required"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, data := range blobs {
+		var payload map[string]any
+		if json.Unmarshal(data, &payload) != nil {
+			continue
+		}
+		if payload["role"] == "system" {
+			if content, _ := payload["content"].(string); strings.Contains(content, "Tool call required") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("tool_choice required directive missing from run request")
+	}
+}
+
+func TestApplyToolChoice(t *testing.T) {
+	tools := []ToolDefinition{{Name: "a"}, {Name: "b"}}
+	if got := ApplyToolChoice(tools, ToolChoice{Mode: "none"}); got != nil {
+		t.Fatalf("none should drop tools, got %#v", got)
+	}
+	if got := ApplyToolChoice(tools, ToolChoice{Mode: "function", FunctionName: "b"}); len(got) != 1 || got[0].Name != "b" {
+		t.Fatalf("function should narrow tools, got %#v", got)
+	}
+	if got := ApplyToolChoice(tools, ToolChoice{Mode: "required"}); len(got) != 2 {
+		t.Fatalf("required should keep tools, got %#v", got)
 	}
 }
 

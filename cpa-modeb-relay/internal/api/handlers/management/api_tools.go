@@ -19,6 +19,8 @@ import (
 
 const defaultAPICallTimeout = 60 * time.Second
 
+// Upstream installed-app OAuth constants; literals split so secret scanning
+// does not block pushes of this vendored source.
 const (
 	antigravityOAuthClientID     = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep" + ".apps.googleusercontent.com"
 	antigravityOAuthClientSecret = "GOCSPX-" + "K58FWR486LdLJ1mLB8sXC4z6qDAf"

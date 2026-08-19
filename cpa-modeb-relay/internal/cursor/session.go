@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -58,11 +59,21 @@ type pendingExec struct {
 	call    ToolCall
 }
 
+// SessionOptions carries per-request modifiers for a Cursor Agent run.
+type SessionOptions struct {
+	// AuthID identifies the gateway credential that owns this run so that
+	// follow-up tool-result requests can be pinned to the same account.
+	AuthID string
+	// ToolChoice is the OpenAI tool_choice constraint for the run.
+	ToolChoice ToolChoice
+}
+
 // Session is a live Agent Connect run that can pause for client tools.
 type Session struct {
 	ID             string
 	ConversationID string
 	Model          string
+	AuthID         string
 
 	mu           sync.Mutex
 	stream       *BidiStream
@@ -78,6 +89,14 @@ type Session struct {
 	cancel       context.CancelFunc
 	lastActivity time.Time
 	manager      *SessionManager
+
+	// turnEndedSeen records that the pre-tool segment already delivered its
+	// TurnEnded (and usage). When it did not, the TurnEnded that surfaces
+	// right after tool results are submitted belongs to the previous segment
+	// and must not terminate the new one (see handleServerMessage).
+	turnEndedSeen      bool
+	swallowTurnEnd     bool
+	contentSinceResume bool
 }
 
 // ChatResult is the collected text response from one Agent segment / run.
@@ -96,12 +115,13 @@ type ChatResult struct {
 }
 
 // StartSession opens a new Agent run for the given messages/tools.
-func StartSession(ctx context.Context, creds AccountCredentials, model string, messages []ChatMessage, tools []ToolDefinition) (*Session, error) {
+func StartSession(ctx context.Context, creds AccountCredentials, model string, messages []ChatMessage, tools []ToolDefinition, opts SessionOptions) (*Session, error) {
 	if strings.TrimSpace(creds.AccessToken) == "" {
 		return nil, fmt.Errorf("cursor: access_token is required")
 	}
+	tools = ApplyToolChoice(tools, opts.ToolChoice)
 	selection := ResolveRequestedModel(model)
-	clientMsg, blobStore, conversationID, err := buildRunRequest(model, messages, tools)
+	clientMsg, blobStore, conversationID, err := buildRunRequest(model, messages, tools, opts.ToolChoice)
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +158,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		ID:             uuid.NewString(),
 		ConversationID: conversationID,
 		Model:          selection.ModelID,
+		AuthID:         opts.AuthID,
 		stream:         stream,
 		blobStore:      blobStore,
 		tools:          append([]ToolDefinition(nil), tools...),
@@ -171,6 +192,14 @@ func indexTools(tools []ToolDefinition) map[string]*ToolDefinition {
 func (s *Session) touch() {
 	s.mu.Lock()
 	s.lastActivity = time.Now()
+	s.mu.Unlock()
+}
+
+// markContent records that the current segment produced model output; used to
+// distinguish a real TurnEnded from a stale pre-tool one after a resume.
+func (s *Session) markContent() {
+	s.mu.Lock()
+	s.contentSinceResume = true
 	s.mu.Unlock()
 }
 
@@ -468,6 +497,13 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 			s.manager.UnbindPending(result.ToolCallID)
 		}
 	}
+	s.mu.Lock()
+	// If the pre-tool segment never delivered its TurnEnded, the next one that
+	// surfaces after the resume belongs to that finished segment.
+	s.swallowTurnEnd = !s.turnEndedSeen
+	s.turnEndedSeen = false
+	s.contentSinceResume = false
+	s.mu.Unlock()
 	s.resumeReading()
 	return nil
 }
@@ -535,20 +571,12 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 	case *agentv1.AgentServerMessage_InteractionUpdate:
 		switch u := m.InteractionUpdate.Message.(type) {
 		case *agentv1.InteractionUpdate_TextDelta:
+			s.markContent()
 			s.emit(StreamEvent{Type: "text_delta", Text: u.TextDelta.GetText()})
 		case *agentv1.InteractionUpdate_ThinkingDelta:
+			s.markContent()
 			s.emit(StreamEvent{Type: "thinking_delta", Text: u.ThinkingDelta.GetText()})
 		case *agentv1.InteractionUpdate_TurnEnded:
-			// cursor2api: some transports emit turn_ended for the pre-tool
-			// segment before mcp_result is returned. Keep the bidi run open
-			// while client tools are still pending.
-			s.mu.Lock()
-			pendingCount := len(s.pending)
-			waiting := s.waitingTools
-			s.mu.Unlock()
-			if pendingCount > 0 || waiting {
-				return false, nil
-			}
 			ev := StreamEvent{Type: "usage_final"}
 			if u.TurnEnded.InputTokens != nil {
 				ev.InputTokens = *u.TurnEnded.InputTokens
@@ -564,6 +592,30 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			}
 			if u.TurnEnded.ReasoningTokens != nil {
 				ev.ReasoningTokens = *u.TurnEnded.ReasoningTokens
+			}
+			s.mu.Lock()
+			pendingCount := len(s.pending)
+			waiting := s.waitingTools
+			swallow := s.swallowTurnEnd && !s.contentSinceResume
+			s.swallowTurnEnd = false
+			if pendingCount > 0 || waiting {
+				s.turnEndedSeen = true
+			}
+			s.mu.Unlock()
+			if pendingCount > 0 || waiting {
+				// cursor2api: some transports emit turn_ended for the pre-tool
+				// segment before mcp_result is returned. Surface its usage so
+				// tool_calls responses carry token counts, but keep the bidi
+				// run open while client tools are still pending.
+				s.emit(ev)
+				return false, nil
+			}
+			if swallow {
+				// Late TurnEnded for the pre-tool segment that was still in
+				// flight when reading paused; it must not end the segment the
+				// client resumed with tool results.
+				s.emit(ev)
+				return false, nil
 			}
 			s.emit(ev)
 			s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
@@ -658,6 +710,7 @@ func (s *Session) handleMcpArgs(req *agentv1.ExecServerMessage, args *agentv1.Mc
 	if s.manager != nil {
 		s.manager.BindPending(callID, s)
 	}
+	s.markContent()
 	s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
 	return true, nil
 }
@@ -764,19 +817,20 @@ func buildMcpToolDefinitions(tools []ToolDefinition) []*agentv1.McpToolDefinitio
 }
 
 // RunChat performs a text/tool Cursor Agent segment and returns the collected result.
-func RunChat(ctx context.Context, creds AccountCredentials, model string, messages []ChatMessage, tools []ToolDefinition) (*ChatResult, error) {
-	results := extractToolResults(messages)
-	if len(results) > 0 {
-		session, err := DefaultSessionManager().ResolveForToolResults(results)
-		if err != nil {
-			return nil, err
+func RunChat(ctx context.Context, creds AccountCredentials, model string, messages []ChatMessage, tools []ToolDefinition, opts SessionOptions) (*ChatResult, error) {
+	if results := extractToolResults(messages); len(results) > 0 {
+		result, err := resumeWithToolResults(ctx, results)
+		if err == nil {
+			return result, nil
 		}
-		if err = session.SubmitToolResults(results); err != nil {
-			return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		return session.CollectSegment(ctx)
+		// The live run is gone (idle stream torn down, gateway restart, …).
+		// Rebuild a fresh run whose history carries the tool results.
+		log.Warnf("cursor: resuming tool results failed (%v); rebuilding run from history", err)
 	}
-	session, err := StartSession(ctx, creds, model, messages, tools)
+	session, err := StartSession(ctx, creds, model, messages, tools, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -789,6 +843,45 @@ func RunChat(ctx context.Context, creds AccountCredentials, model string, messag
 		_ = session.Close()
 	}
 	return result, nil
+}
+
+// resumeWithToolResults feeds trailing tool results into the live session that
+// requested them and collects the follow-up segment.
+func resumeWithToolResults(ctx context.Context, results []ToolResult) (*ChatResult, error) {
+	session, err := ResumeSession(results)
+	if err != nil {
+		return nil, err
+	}
+	result, err := session.CollectSegment(ctx)
+	if err != nil {
+		_ = session.Close()
+		return nil, err
+	}
+	if result.FinishReason != "tool_calls" {
+		_ = session.Close()
+	}
+	return result, nil
+}
+
+// TrailingToolResults returns the tool results trailing the latest assistant
+// tool_calls message, or nil when the request is not a tool-results turn.
+func TrailingToolResults(messages []ChatMessage) []ToolResult {
+	return extractToolResults(messages)
+}
+
+// ResumeSession resolves the live session that owns the trailing tool results
+// and submits them so the run continues. The session is closed on submit
+// failure so callers can rebuild a fresh run from history.
+func ResumeSession(results []ToolResult) (*Session, error) {
+	session, err := DefaultSessionManager().ResolveForToolResults(results)
+	if err != nil {
+		return nil, err
+	}
+	if err = session.SubmitToolResults(results); err != nil {
+		_ = session.Close()
+		return nil, err
+	}
+	return session, nil
 }
 
 func extractToolResults(messages []ChatMessage) []ToolResult {
