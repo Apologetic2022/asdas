@@ -1,0 +1,865 @@
+From 97bde9d8662adc9bbb09fbf9d45789f8681ac6e0 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 08:00:40 +0000
+Subject: [PATCH 7/7] Fix 'No exec result': handle built-in tool execs, wire-name
+ collisions, fuzzy tool-id resume, parallel-call drain
+
+Root causes found from production traffic on 15.204.94.214:
+
+1. Cursor's agent harness dispatched its built-in tools (task, shell,
+   read_file, list_dir, ...) as exec variants absent from the trimmed MVP
+   proto. The oneof decoded to nil and handleExec closed the exec stream
+   with no result, so the model saw the opaque 'No exec result' failure,
+   retried, and gave up (client symptom: Task tool 'No exec result',
+   subagent no return, directory reads with zero output).
+
+2. Client MCP tools whose names collide with the built-ins (Task, Bash,
+   Glob, Grep, Read, Write, ...) could bind to the unusable built-in of
+   the same name.
+
+3. Agent CLIs rewrite tool_call ids (call-<uuid>-N_<original>), so live
+   session resume always failed with 'unknown or expired tool_call_id'
+   and every tool round-trip rebuilt the run, losing the prompt cache.
+
+4. decodeMcpArguments re-parsed every string argument as JSON, turning
+   'true' into a boolean and JSON file bodies into objects, which failed
+   client tool schema validation.
+
+5. Only the first client tool call in a read batch surfaced before the
+   segment paused, splitting parallel tool calls across turns.
+
+Fixes:
+- handleExec now answers unknown (built-in) exec variants with a
+  model-readable throw naming the callable MCP tools, and logs the
+  unknown proto field numbers.
+- MCP tools that collide with built-in names are advertised under an
+  mcp_-prefixed wire name and mapped back to the client name on emit;
+  a run-request system directive plus action-text constraint steer the
+  model to the MCP toolset.
+- SessionManager resolves client-rewritten/sanitized tool_call ids by
+  containment and normalizes them before SubmitToolResults, so live
+  resume works and the prompt cache is preserved.
+- fromProtobufValue keeps string arguments verbatim.
+- readLoop now uses a persistent reader goroutine and drains for 120ms
+  after the first tool call so parallel calls share one segment.
+- StartSession retries once on transient run-open 5xx from Cursor edge.
+
+Co-authored-by: Apologetic2022 <Apologetic2022@users.noreply.github.com>
+---
+ internal/cursor/agent.go           |  77 +++++++-
+ internal/cursor/session.go         | 288 ++++++++++++++++++++++-------
+ internal/cursor/session_manager.go |  63 ++++++-
+ internal/cursor/session_test.go    | 118 ++++++++++++
+ internal/cursor/values.go          |  26 +--
+ 5 files changed, 469 insertions(+), 103 deletions(-)
+
+diff --git a/internal/cursor/agent.go b/internal/cursor/agent.go
+index e298be6..86d405c 100644
+--- a/internal/cursor/agent.go
++++ b/internal/cursor/agent.go
+@@ -67,6 +67,63 @@ func toolChoiceDirective(choice ToolChoice) string {
+ 	return ""
+ }
+ 
++// nativeAgentToolNames are the lowercase names of Cursor's built-in agent
++// tools. A client MCP tool whose name matches one of these (case-insensitive)
++// is advertised under a prefixed wire name so the model cannot bind the call
++// to the unusable built-in of the same name.
++var nativeAgentToolNames = map[string]bool{
++	"task": true, "shell": true, "bash": true, "terminal": true, "run_terminal_cmd": true,
++	"read_file": true, "read": true, "list_dir": true, "ls": true,
++	"glob": true, "glob_file_search": true, "file_search": true, "codebase_search": true,
++	"grep": true, "grep_search": true, "search": true, "search_replace": true,
++	"edit": true, "edit_file": true, "write": true, "create_file": true, "delete_file": true,
++	"todo_write": true, "todowrite": true, "todo": true,
++	"web_search": true, "websearch": true, "web_fetch": true, "webfetch": true, "fetch": true,
++	"read_lints": true, "create_diagram": true, "update_memory": true, "fetch_rules": true,
++	"apply_patch": true,
++}
++
++// mcpWireNamePrefix namespaces colliding MCP tool names on the Cursor wire.
++const mcpWireNamePrefix = "mcp_"
++
++// wireToolName returns the name a client tool is advertised under to the
++// upstream agent harness.
++func wireToolName(name string) string {
++	trimmed := strings.TrimSpace(name)
++	if nativeAgentToolNames[strings.ToLower(trimmed)] {
++		return mcpWireNamePrefix + trimmed
++	}
++	return trimmed
++}
++
++// mcpOnlyToolDirective forbids Cursor's built-in agent tools when the client
++// declared its own toolset. The built-ins execute through exec variants this
++// headless gateway does not implement, so any call to them fails with
++// "No exec result" on the client side.
++func mcpOnlyToolDirective(tools []ToolDefinition) string {
++	names := make([]string, 0, len(tools))
++	for i := range tools {
++		name := strings.TrimSpace(tools[i].Name)
++		if name == "" {
++			continue
++		}
++		wire := wireToolName(name)
++		if wire != name {
++			names = append(names, fmt.Sprintf("%s (use this whenever %s is needed)", wire, name))
++		} else {
++			names = append(names, name)
++		}
++	}
++	if len(names) == 0 {
++		return ""
++	}
++	return "The ONLY tools available in this session are these MCP tools: " +
++		strings.Join(names, ", ") + ". " +
++		"Cursor built-in tools (task, shell, terminal commands, read_file, list_dir, glob, grep, " +
++		"search, edit_file, write, todo, web fetch/search, subagents) are NOT available here and " +
++		"every call to them fails. Never call built-in tools; always use the MCP tools listed above."
++}
++
+ // AccountCredentials are the fields required to open an Agent run.
+ type AccountCredentials struct {
+ 	AccessToken   string
+@@ -235,8 +292,10 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 				content = append(content, map[string]any{
+ 					"type":       "tool-call",
+ 					"toolCallId": tc.ID,
+-					"toolName":   tc.Name,
+-					"args":       args,
++					// History rows use the wire name the tool is advertised
++					// under so the model links past calls to a callable tool.
++					"toolName": wireToolName(tc.Name),
++					"args":     args,
+ 				})
+ 			}
+ 			if len(content) == 0 {
+@@ -256,7 +315,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 			}
+ 			resultPart := map[string]any{
+ 				"type":       "tool-result",
+-				"toolName":   toolName,
++				"toolName":   wireToolName(toolName),
+ 				"toolCallId": msg.ToolCallID,
+ 				"result":     msg.Content,
+ 				"toolKind":   "mcp",
+@@ -289,6 +348,18 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 		actionText = actionText + "\n\n[Response constraint: " + directive + "]"
+ 	}
+ 
++	if directive := mcpOnlyToolDirective(tools); directive != "" {
++		// The Cursor agent harness also advertises its built-in tools (task,
++		// shell, read_file, list_dir, glob, grep, …). This headless gateway
++		// cannot execute them — the model would see "No exec result" — so
++		// steer the model to the declared MCP tools on the first attempt.
++		rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
++			"role":    "system",
++			"content": directive,
++		})))
++		actionText = actionText + "\n\n[Tool constraint: " + directive + "]"
++	}
++
+ 	conversationID := uuid.NewString()
+ 	// Desktop / cursor2api do not set exclude_workspace_context by default;
+ 	// forcing it true is rejected for many accounts ("Workspace context
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index 1756c99..4515521 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/google/uuid"
+ 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+ 	log "github.com/sirupsen/logrus"
++	"google.golang.org/protobuf/encoding/protowire"
+ 	"google.golang.org/protobuf/proto"
+ )
+ 
+@@ -131,12 +132,6 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 	}
+ 
+ 	profile := ProfileFromCredentials(creds)
+-	requestID := uuid.NewString()
+-	headers, err := profile.Headers(creds.AccessToken, requestID, "")
+-	if err != nil {
+-		return nil, err
+-	}
+-	headers["x-original-request-id"] = requestID
+ 
+ 	// Detach the Agent H2 stream from the inbound HTTP request context.
+ 	// Tool round-trips span multiple client requests; cancelling with the
+@@ -145,7 +140,23 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 		return nil, err
+ 	}
+ 	runCtx, cancel := context.WithCancel(context.Background())
+-	stream, err := OpenAgentRun(runCtx, creds.BaseURL, headers, first)
++	openRun := func() (*BidiStream, error) {
++		requestID := uuid.NewString()
++		headers, errHdr := profile.Headers(creds.AccessToken, requestID, "")
++		if errHdr != nil {
++			return nil, errHdr
++		}
++		headers["x-original-request-id"] = requestID
++		return OpenAgentRun(runCtx, creds.BaseURL, headers, first)
++	}
++	stream, err := openRun()
++	if err != nil && isTransientRunOpenError(err) && ctx.Err() == nil {
++		// Cursor's edge occasionally answers a run open with a bare 502/503;
++		// a single quick retry rides it out instead of failing the request.
++		log.Warnf("cursor: agent run open failed transiently (%v); retrying once", err)
++		time.Sleep(500 * time.Millisecond)
++		stream, err = openRun()
++	}
+ 	if err != nil {
+ 		cancel()
+ 		return nil, err
+@@ -177,6 +188,26 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 	return session, nil
+ }
+ 
++// isTransientRunOpenError reports whether an agent run open failure is worth
++// one immediate retry (upstream edge 5xx or a broken connection attempt).
++func isTransientRunOpenError(err error) bool {
++	if err == nil {
++		return false
++	}
++	msg := err.Error()
++	for _, marker := range []string{
++		"cursor agent run HTTP 502",
++		"cursor agent run HTTP 503",
++		"cursor agent run HTTP 504",
++		"cursor h2 open:",
++	} {
++		if strings.Contains(msg, marker) {
++			return true
++		}
++	}
++	return false
++}
++
+ func indexTools(tools []ToolDefinition) map[string]*ToolDefinition {
+ 	out := make(map[string]*ToolDefinition, len(tools))
+ 	for i := range tools {
+@@ -184,7 +215,13 @@ func indexTools(tools []ToolDefinition) map[string]*ToolDefinition {
+ 		if name == "" {
+ 			continue
+ 		}
++		// Index by both the client name and the wire name the tool was
++		// advertised under; emitted tool_call events always carry the
++		// client name (tools[i].Name).
+ 		out[name] = &tools[i]
++		if wire := wireToolName(name); wire != name {
++			out[wire] = &tools[i]
++		}
+ 	}
+ 	return out
+ }
+@@ -230,6 +267,18 @@ func (s *Session) heartbeatLoop(ctx context.Context) {
+ 	}
+ }
+ 
++// readChunk is one raw read from the Agent H2 response body.
++type readChunk struct {
++	data []byte
++	err  error
++}
++
++// parallelToolGrace is how long the read loop keeps draining after the first
++// client tool call before pausing the segment. Parallel tool calls are sent
++// back-to-back by the upstream agent; without the grace window only the first
++// one would surface in the current segment.
++const parallelToolGrace = 120 * time.Millisecond
++
+ func (s *Session) readLoop(ctx context.Context) {
+ 	defer close(s.events)
+ 	decoder := NewDecoder()
+@@ -240,12 +289,33 @@ func (s *Session) readLoop(ctx context.Context) {
+ 			decoder.SetCompression(enc)
+ 		}
+ 	}
+-	readBuf := make([]byte, 32*1024)
++
++	// A dedicated goroutine performs the blocking body reads so the consumer
++	// loop can bound waits (parallel tool-call drain) without losing data.
++	reads := make(chan readChunk, 4)
++	go func() {
++		buf := make([]byte, 32*1024)
++		for {
++			n, errRead := s.stream.Read(buf)
++			chunk := readChunk{err: errRead}
++			if n > 0 {
++				chunk.data = append([]byte(nil), buf[:n]...)
++			}
++			select {
++			case reads <- chunk:
++			case <-ctx.Done():
++				return
++			}
++			if errRead != nil {
++				return
++			}
++		}
++	}()
++
+ 	for {
+ 		s.mu.Lock()
+ 		waiting := s.waitingTools
+ 		closed := s.closed
+-		stream := s.stream
+ 		pauseCh := s.pauseCh
+ 		s.mu.Unlock()
+ 		if closed {
+@@ -272,62 +342,94 @@ func (s *Session) readLoop(ctx context.Context) {
+ 			}
+ 		}
+ 
+-		n, errRead := stream.Read(readBuf)
+-		if n > 0 {
+-			envelopes, errFeed := decoder.Feed(readBuf[:n])
+-			if errFeed != nil {
+-				s.fail(errFeed)
+-				return
+-			}
+-			endForTools := false
+-			for _, env := range envelopes {
+-				if env.EndStream() {
+-					if len(env.Payload) > 0 {
+-						var trailer struct {
+-							Error json.RawMessage `json:"error"`
+-						}
+-						_ = json.Unmarshal(env.Payload, &trailer)
+-						if len(trailer.Error) > 0 && string(trailer.Error) != "null" {
+-							s.fail(fmt.Errorf("cursor connect end-stream error: %s", string(trailer.Error)))
+-							return
+-						}
+-					}
+-					s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
+-					_ = s.Close()
+-					return
+-				}
+-				serverMsg := &agentv1.AgentServerMessage{}
+-				if err := proto.Unmarshal(env.Payload, serverMsg); err != nil {
+-					s.fail(fmt.Errorf("cursor decode server message: %w", err))
+-					return
+-				}
+-				pause, err := s.handleServerMessage(serverMsg)
+-				if err != nil {
+-					s.fail(err)
++		var chunk readChunk
++		select {
++		case <-ctx.Done():
++			continue
++		case chunk = <-reads:
++		}
++		endForTools, done := s.processChunk(decoder, chunk)
++		if done {
++			return
++		}
++		if !endForTools {
++			continue
++		}
++		// First client tool call of the segment: keep draining briefly so
++		// parallel tool calls issued together surface in the same segment.
++		timer := time.NewTimer(parallelToolGrace)
++	drain:
++		for {
++			select {
++			case <-ctx.Done():
++				timer.Stop()
++				break drain
++			case <-timer.C:
++				break drain
++			case chunk = <-reads:
++				_, done = s.processChunk(decoder, chunk)
++				if done {
++					timer.Stop()
+ 					return
+ 				}
+-				if pause {
+-					endForTools = true
+-				}
+-			}
+-			if endForTools {
+-				s.beginWaitingTools()
+-				s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
+ 			}
+ 		}
+-		if errRead == io.EOF {
+-			s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
+-			_ = s.Close()
+-			return
+-		}
+-		if errRead != nil {
+-			s.fail(errRead)
+-			return
++		s.beginWaitingTools()
++		s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
++	}
++}
++
++// processChunk feeds one raw read into the Connect decoder and dispatches the
++// complete envelopes. It reports whether the segment paused for client tools
++// and whether the read loop is finished.
++func (s *Session) processChunk(decoder *Decoder, chunk readChunk) (endForTools bool, done bool) {
++	if len(chunk.data) > 0 {
++		envelopes, errFeed := decoder.Feed(chunk.data)
++		if errFeed != nil {
++			s.fail(errFeed)
++			return false, true
+ 		}
+-		if n == 0 {
+-			time.Sleep(10 * time.Millisecond)
++		for _, env := range envelopes {
++			if env.EndStream() {
++				if len(env.Payload) > 0 {
++					var trailer struct {
++						Error json.RawMessage `json:"error"`
++					}
++					_ = json.Unmarshal(env.Payload, &trailer)
++					if len(trailer.Error) > 0 && string(trailer.Error) != "null" {
++						s.fail(fmt.Errorf("cursor connect end-stream error: %s", string(trailer.Error)))
++						return false, true
++					}
++				}
++				s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
++				_ = s.Close()
++				return false, true
++			}
++			serverMsg := &agentv1.AgentServerMessage{}
++			if err := proto.Unmarshal(env.Payload, serverMsg); err != nil {
++				s.fail(fmt.Errorf("cursor decode server message: %w", err))
++				return false, true
++			}
++			pause, err := s.handleServerMessage(serverMsg)
++			if err != nil {
++				s.fail(err)
++				return false, true
++			}
++			if pause {
++				endForTools = true
++			}
+ 		}
+ 	}
++	if chunk.err == io.EOF {
++		s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
++		_ = s.Close()
++		return false, true
++	}
++	if chunk.err != nil {
++		s.fail(chunk.err)
++		return false, true
++	}
++	return endForTools, false
+ }
+ 
+ func (s *Session) beginWaitingTools() {
+@@ -640,7 +742,15 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
+ func (s *Session) handleExec(req *agentv1.ExecServerMessage) (bool, error) {
+ 	switch m := req.Message.(type) {
+ 	case nil:
+-		return false, sendExecStreamClose(s.stream, req.Id)
++		// The agent harness asked the client to execute one of Cursor's
++		// built-in tools (task, shell, read_file, list_dir, …) whose exec
++		// variant is not part of the trimmed MVP proto, so the oneof decoded
++		// to nil. Closing the exec stream silently makes the model see the
++		// opaque "No exec result" failure; answer with an instructive error
++		// instead so the model reroutes to the declared MCP tools.
++		fields := unknownProtoFieldNumbers(req.ProtoReflect().GetUnknown())
++		log.Warnf("cursor: rejecting built-in tool exec request (unknown exec variant, proto fields %v); steering model to MCP tools %v", fields, s.availableToolNames())
++		return false, s.throwExec(req, s.nativeToolUnavailableMessage())
+ 	case *agentv1.ExecServerMessage_RequestContextArgs:
+ 		result := &agentv1.RequestContextResult{
+ 			Result: &agentv1.RequestContextResult_Success{
+@@ -748,11 +858,12 @@ func (s *Session) lookupTool(name, provider string) *ToolDefinition {
+ 	return nil
+ }
+ 
++// availableToolNames returns the wire names the model can actually call.
+ func (s *Session) availableToolNames() []string {
+ 	names := make([]string, 0, len(s.tools))
+ 	for _, t := range s.tools {
+ 		if t.Name != "" {
+-			names = append(names, t.Name)
++			names = append(names, wireToolName(t.Name))
+ 		}
+ 	}
+ 	return names
+@@ -767,12 +878,32 @@ func (s *Session) requestContext() *agentv1.RequestContext {
+ }
+ 
+ func rejectUnsupportedExec(stream *BidiStream, req *agentv1.ExecServerMessage) error {
++	return throwExecOnStream(stream, req.Id, "No handler for Cursor exec message")
++}
++
++// nativeToolUnavailableMessage tells the model why a built-in tool failed and
++// which tools it must use instead.
++func (s *Session) nativeToolUnavailableMessage() string {
++	names := s.availableToolNames()
++	if len(names) == 0 {
++		return "This built-in tool is not available in this environment. Answer the user directly without tools."
++	}
++	return "This built-in tool is not available in this environment. Do not retry it. " +
++		"Use ONLY these MCP tools instead: " + strings.Join(names, ", ") + "."
++}
++
++// throwExec reports a client-side exec failure with a model-readable reason.
++func (s *Session) throwExec(req *agentv1.ExecServerMessage, message string) error {
++	return throwExecOnStream(s.stream, req.Id, message)
++}
++
++func throwExecOnStream(stream *BidiStream, id uint32, message string) error {
+ 	code := "exec_variant_unsupported"
+ 	control := &agentv1.ExecClientControlMessage{
+ 		Message: &agentv1.ExecClientControlMessage_Throw{
+ 			Throw: &agentv1.ExecClientThrow{
+-				Id:        req.Id,
+-				Error:     "No handler for Cursor exec message",
++				Id:        id,
++				Error:     message,
+ 				ErrorCode: &code,
+ 			},
+ 		},
+@@ -787,7 +918,22 @@ func rejectUnsupportedExec(stream *BidiStream, req *agentv1.ExecServerMessage) e
+ 	if err = stream.WriteEnvelope(payload, false); err != nil {
+ 		return err
+ 	}
+-	return sendExecStreamClose(stream, req.Id)
++	return sendExecStreamClose(stream, id)
++}
++
++// unknownProtoFieldNumbers lists the field numbers present in a message's
++// unknown-fields blob (used to identify trimmed-away exec variants in logs).
++func unknownProtoFieldNumbers(raw []byte) []int {
++	var fields []int
++	for len(raw) > 0 {
++		num, _, n := protowire.ConsumeField(raw)
++		if n < 0 {
++			break
++		}
++		fields = append(fields, int(num))
++		raw = raw[n:]
++	}
++	return fields
+ }
+ 
+ func buildMcpToolDefinitions(tools []ToolDefinition) []*agentv1.McpToolDefinition {
+@@ -797,6 +943,9 @@ func buildMcpToolDefinitions(tools []ToolDefinition) []*agentv1.McpToolDefinitio
+ 		if name == "" {
+ 			continue
+ 		}
++		// Advertise under the wire name so calls cannot bind to a Cursor
++		// built-in tool of the same name (which this gateway cannot execute).
++		wire := wireToolName(name)
+ 		schema := tool.Parameters
+ 		if schema == nil {
+ 			schema = map[string]any{"type": "object", "properties": map[string]any{}}
+@@ -806,11 +955,11 @@ func buildMcpToolDefinitions(tools []ToolDefinition) []*agentv1.McpToolDefinitio
+ 			value, _ = toProtobufValue(map[string]any{"type": "object"})
+ 		}
+ 		out = append(out, &agentv1.McpToolDefinition{
+-			Name:               name,
++			Name:               wire,
+ 			Description:        tool.Description,
+ 			InputSchema:        value,
+ 			ProviderIdentifier: MCPProviderIdentifier,
+-			ToolName:           name,
++			ToolName:           wire,
+ 		})
+ 	}
+ 	return out
+@@ -870,14 +1019,15 @@ func TrailingToolResults(messages []ChatMessage) []ToolResult {
+ }
+ 
+ // ResumeSession resolves the live session that owns the trailing tool results
+-// and submits them so the run continues. The session is closed on submit
+-// failure so callers can rebuild a fresh run from history.
++// and submits them so the run continues. Client-rewritten tool_call_ids are
++// normalized back to the upstream pending ids before submission. The session
++// is closed on submit failure so callers can rebuild a fresh run from history.
+ func ResumeSession(results []ToolResult) (*Session, error) {
+-	session, err := DefaultSessionManager().ResolveForToolResults(results)
++	session, normalized, err := DefaultSessionManager().ResolveForToolResults(results)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if err = session.SubmitToolResults(results); err != nil {
++	if err = session.SubmitToolResults(normalized); err != nil {
+ 		_ = session.Close()
+ 		return nil, err
+ 	}
+diff --git a/internal/cursor/session_manager.go b/internal/cursor/session_manager.go
+index 2fe28a0..4af29e3 100644
+--- a/internal/cursor/session_manager.go
++++ b/internal/cursor/session_manager.go
+@@ -2,8 +2,11 @@ package cursor
+ 
+ import (
+ 	"fmt"
++	"strings"
+ 	"sync"
+ 	"time"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+ )
+ 
+ const (
+@@ -80,41 +83,81 @@ func (m *SessionManager) LookupPending(toolCallID string) *Session {
+ 	}
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+-	session := m.pending[toolCallID]
++	canonical := m.canonicalPendingIDLocked(toolCallID)
++	if canonical == "" {
++		return nil
++	}
++	session := m.pending[canonical]
+ 	if session != nil {
+ 		session.touch()
+ 	}
+ 	return session
+ }
+ 
+-// ResolveForToolResults finds the single live session that owns all results.
+-func (m *SessionManager) ResolveForToolResults(results []ToolResult) (*Session, error) {
++// canonicalPendingIDLocked maps a client-supplied tool_call_id to the pending
++// id the upstream run is waiting on. Anthropic-protocol responses carry a
++// sanitized copy of the id and agent CLIs commonly prefix their own call ids
++// around it (e.g. "call-<uuid>-13_<original>"), so an exact match is tried
++// first and containment of the original or its sanitized form second.
++func (m *SessionManager) canonicalPendingIDLocked(clientID string) string {
++	if clientID == "" {
++		return ""
++	}
++	if _, ok := m.pending[clientID]; ok {
++		return clientID
++	}
++	const minMatchLen = 8 // avoid accidental containment of short ids
++	best := ""
++	for pid := range m.pending {
++		if len(pid) < minMatchLen {
++			continue
++		}
++		if strings.Contains(clientID, pid) || strings.Contains(clientID, util.SanitizeClaudeToolID(pid)) {
++			if len(pid) > len(best) {
++				best = pid
++			}
++		}
++	}
++	return best
++}
++
++// ResolveForToolResults finds the single live session that owns all results
++// and returns the results rewritten to the upstream pending ids so they can
++// be submitted directly.
++func (m *SessionManager) ResolveForToolResults(results []ToolResult) (*Session, []ToolResult, error) {
+ 	if len(results) == 0 {
+-		return nil, fmt.Errorf("cursor: no tool results")
++		return nil, nil, fmt.Errorf("cursor: no tool results")
+ 	}
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+ 	var owner *Session
+-	for _, result := range results {
++	normalized := make([]ToolResult, len(results))
++	for i, result := range results {
+ 		if result.ToolCallID == "" {
+-			return nil, fmt.Errorf("cursor: tool result missing tool_call_id")
++			return nil, nil, fmt.Errorf("cursor: tool result missing tool_call_id")
++		}
++		canonical := m.canonicalPendingIDLocked(result.ToolCallID)
++		if canonical == "" {
++			return nil, nil, fmt.Errorf("cursor: unknown or expired tool_call_id %s", result.ToolCallID)
+ 		}
+-		session := m.pending[result.ToolCallID]
++		session := m.pending[canonical]
+ 		if session == nil {
+-			return nil, fmt.Errorf("cursor: unknown or expired tool_call_id %s", result.ToolCallID)
++			return nil, nil, fmt.Errorf("cursor: unknown or expired tool_call_id %s", result.ToolCallID)
+ 		}
++		normalized[i] = result
++		normalized[i].ToolCallID = canonical
+ 		if owner == nil {
+ 			owner = session
+ 			continue
+ 		}
+ 		if owner.ID != session.ID {
+-			return nil, fmt.Errorf("cursor: tool results belong to different sessions")
++			return nil, nil, fmt.Errorf("cursor: tool results belong to different sessions")
+ 		}
+ 	}
+ 	if owner != nil {
+ 		owner.touch()
+ 	}
+-	return owner, nil
++	return owner, normalized, nil
+ }
+ 
+ // Remove drops a session and all of its pending indexes.
+diff --git a/internal/cursor/session_test.go b/internal/cursor/session_test.go
+index 60f36f2..afd6f63 100644
+--- a/internal/cursor/session_test.go
++++ b/internal/cursor/session_test.go
+@@ -187,3 +187,121 @@ func TestProtobufValueRoundTrip(t *testing.T) {
+ 		t.Fatal("empty roundtrip")
+ 	}
+ }
++
++func TestFromProtobufValueKeepsStringsVerbatim(t *testing.T) {
++	// Strings that look like JSON must NOT be re-parsed: "true" is a shell
++	// command, "{\"a\":1}" is a file body, "123" is a literal string arg.
++	for _, s := range []string{"true", "false", "null", "123", `{"a":1}`, `[1,2]`, "ls -la"} {
++		v, err := toProtobufValue(s)
++		if err != nil {
++			t.Fatal(err)
++		}
++		out := fromProtobufValue(v)
++		got, ok := out.(string)
++		if !ok || got != s {
++			t.Fatalf("string %q corrupted to %#v", s, out)
++		}
++	}
++}
++
++func TestBuildRunRequestMcpOnlyDirective(t *testing.T) {
++	msg, blobs, _, err := buildRunRequest("default", []ChatMessage{
++		{Role: "user", Content: "list the workspace"},
++	}, []ToolDefinition{{Name: "Task"}, {Name: "Bash"}}, ToolChoice{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	found := false
++	for _, data := range blobs {
++		var payload map[string]any
++		if json.Unmarshal(data, &payload) != nil {
++			continue
++		}
++		if payload["role"] == "system" {
++			if content, _ := payload["content"].(string); strings.Contains(content, "ONLY tools available") &&
++				strings.Contains(content, "mcp_Task") && strings.Contains(content, "mcp_Bash") {
++				found = true
++			}
++		}
++	}
++	if !found {
++		t.Fatal("mcp-only tool directive missing from run request")
++	}
++	action := msg.GetRunRequest().GetAction().GetUserMessageAction().GetUserMessage().GetText()
++	if !strings.Contains(action, "Tool constraint") {
++		t.Fatalf("action text missing tool constraint: %q", action)
++	}
++}
++
++func TestCanonicalPendingIDFuzzyMatch(t *testing.T) {
++	m := NewSessionManager()
++	sess := &Session{ID: "s1", manager: m}
++	orig := "fc_ownxAbq-3LYxF7-a2d74f5f8eac5702_0"
++	m.BindPending(orig, sess)
++
++	// Exact.
++	if got := m.LookupPending(orig); got != sess {
++		t.Fatal("exact lookup failed")
++	}
++	// Client-side rewrite (ZCode style: prefix + original).
++	rewritten := "call-80338b6a-2b74-4b47-bd1c-3d18fae36cdd-13_" + orig
++	if got := m.LookupPending(rewritten); got != sess {
++		t.Fatal("rewritten id lookup failed")
++	}
++	// Unrelated id must not match.
++	if got := m.LookupPending("call-ffff-1_fc_other_9"); got != nil {
++		t.Fatal("unrelated id must not match")
++	}
++
++	owner, normalized, err := m.ResolveForToolResults([]ToolResult{{ToolCallID: rewritten, Content: "ok"}})
++	if err != nil || owner != sess {
++		t.Fatalf("resolve failed: %v", err)
++	}
++	if normalized[0].ToolCallID != orig {
++		t.Fatalf("expected normalization to %q, got %q", orig, normalized[0].ToolCallID)
++	}
++}
++
++func TestUnknownProtoFieldNumbers(t *testing.T) {
++	// field 99, varint 1: tag = 99<<3 | 0 = 0x318 → bytes 0x98 0x06, value 0x01
++	raw := []byte{0x98, 0x06, 0x01}
++	fields := unknownProtoFieldNumbers(raw)
++	if len(fields) != 1 || fields[0] != 99 {
++		t.Fatalf("expected [99], got %v", fields)
++	}
++}
++
++func TestWireToolNamePrefixesNativeCollisions(t *testing.T) {
++	cases := map[string]string{
++		"Task":        "mcp_Task",
++		"task":        "mcp_task",
++		"Bash":        "mcp_Bash",
++		"Glob":        "mcp_Glob",
++		"Grep":        "mcp_Grep",
++		"Read":        "mcp_Read",
++		"Write":       "mcp_Write",
++		"TodoWrite":   "mcp_TodoWrite",
++		"WebFetch":    "mcp_WebFetch",
++		"get_weather": "get_weather",
++		"MyCustom":    "MyCustom",
++	}
++	for in, want := range cases {
++		if got := wireToolName(in); got != want {
++			t.Fatalf("wireToolName(%q) = %q, want %q", in, got, want)
++		}
++	}
++}
++
++func TestIndexToolsMapsWireAndClientNames(t *testing.T) {
++	tools := []ToolDefinition{{Name: "Task"}, {Name: "get_weather"}}
++	idx := indexTools(tools)
++	if idx["Task"] == nil || idx["mcp_Task"] == nil || idx["Task"] != idx["mcp_Task"] {
++		t.Fatalf("wire alias not indexed: %#v", idx)
++	}
++	if idx["get_weather"] == nil {
++		t.Fatal("plain tool missing from index")
++	}
++	if idx["mcp_Task"].Name != "Task" {
++		t.Fatalf("client name must be preserved, got %q", idx["mcp_Task"].Name)
++	}
++}
+diff --git a/internal/cursor/values.go b/internal/cursor/values.go
+index 45465fa..8b7a129 100644
+--- a/internal/cursor/values.go
++++ b/internal/cursor/values.go
+@@ -27,30 +27,14 @@ func fromProtobufValue(v *structpb.Value) any {
+ 	if err = json.Unmarshal(raw, &decoded); err != nil {
+ 		return v.AsInterface()
+ 	}
+-	if s, ok := decoded.(string); ok {
+-		trimmed := trimSpaceJSON(s)
+-		if trimmed == "" {
+-			return s
+-		}
+-		var nested any
+-		if json.Unmarshal([]byte(trimmed), &nested) == nil {
+-			return nested
+-		}
+-	}
++	// String values are returned verbatim. Re-parsing strings that merely
++	// look like JSON corrupts legitimate tool arguments: a shell command
++	// "true" became a boolean and a JSON document passed as a write-file
++	// content string became an object, which then failed the client tool's
++	// schema validation ("no exec result" from the caller's perspective).
+ 	return decoded
+ }
+ 
+-func trimSpaceJSON(s string) string {
+-	start, end := 0, len(s)
+-	for start < end && (s[start] == ' ' || s[start] == '\n' || s[start] == '\r' || s[start] == '\t') {
+-		start++
+-	}
+-	for end > start && (s[end-1] == ' ' || s[end-1] == '\n' || s[end-1] == '\r' || s[end-1] == '\t') {
+-		end--
+-	}
+-	return s[start:end]
+-}
+-
+ func decodeMcpArguments(args *agentv1.McpArgs) map[string]any {
+ 	out := map[string]any{}
+ 	if args == nil {
+-- 
+2.43.0
+
