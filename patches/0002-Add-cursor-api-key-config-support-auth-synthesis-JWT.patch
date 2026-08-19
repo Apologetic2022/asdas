@@ -1,7 +1,7 @@
 From 4789ecdba0b1bee42025129090755a67eee61fd2 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Wed, 19 Aug 2026 04:50:04 +0000
-Subject: [PATCH 2/4] Add cursor-api-key config support (auth synthesis + JWT
+Subject: [PATCH 2/6] Add cursor-api-key config support (auth synthesis + JWT
  exchange)
 
 The production gateway authenticates to Cursor with a user API key

@@ -1,7 +1,7 @@
 From 82b13a9fdf4f3c2868e51e91b3258264a58d4f8a Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Wed, 19 Aug 2026 05:04:23 +0000
-Subject: [PATCH 4/4] Add usage estimation fallback and forced tool_choice
+Subject: [PATCH 4/6] Add usage estimation fallback and forced tool_choice
  retry
 
 Co-authored-by: Apologetic2022 <Apologetic2022@users.noreply.github.com>

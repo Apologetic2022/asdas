@@ -297,11 +297,118 @@ index ad18925..a6026a6 100644
  		TLSClientConfig: &tls.Config{
  			MinVersion: tls.VersionTLS12,
  			NextProtos: []string{"h2", "http/1.1"},
+diff --git a/internal/cursor/model_resolve.go b/internal/cursor/model_resolve.go
+index 05a8451..fb1bda1 100644
+--- a/internal/cursor/model_resolve.go
++++ b/internal/cursor/model_resolve.go
+@@ -1,6 +1,7 @@
+ package cursor
+ 
+ import (
++	"regexp"
+ 	"strings"
+ 
+ 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+@@ -31,6 +32,54 @@ var cursorSuffixTokens = map[string]struct{}{
+ 	"max":      {},
+ }
+ 
++// claudeClientAliasRe matches Anthropic-style client names such as
++// claude-4.6-sonnet, claude-4-sonnet or claude-4.5-haiku-thinking; the Cursor
++// catalog names the same models claude-sonnet-4-6 / claude-sonnet-4 /
++// claude-haiku-4-5-thinking. Cursor's own client (e.g. its Task subagent
++// probes) sends the Anthropic-style form, so both must resolve.
++var claudeClientAliasRe = regexp.MustCompile(`^claude-(\d+)(?:[.-](\d+))?-(opus|sonnet|haiku)(?:-(.+))?$`)
++
++// autoSwitchModelRe extracts the upstream-suggested fallback model from a
++// resource_exhausted run error payload.
++var autoSwitchModelRe = regexp.MustCompile(`"autoSwitchToModel"\s*:\s*"([^"]+)"`)
++
++// AutoSwitchModelFromError returns the model Cursor upstream suggests
++// switching to when a run is rejected with ERROR_RATE_LIMITED_CHANGEABLE
++// ("Other Models usage limit reached"), or "" when the error is unrelated.
++// The official Cursor client silently switches to that model; the gateway
++// mirrors this so per-model usage limits do not surface as hard failures.
++func AutoSwitchModelFromError(err error) string {
++	if err == nil {
++		return ""
++	}
++	msg := err.Error()
++	if !strings.Contains(msg, "resource_exhausted") && !strings.Contains(msg, "RATE_LIMITED") {
++		return ""
++	}
++	if m := autoSwitchModelRe.FindStringSubmatch(msg); m != nil {
++		return strings.TrimSpace(m[1])
++	}
++	return ""
++}
++
++// CanonicalizeModelID maps Anthropic-style claude aliases onto the Cursor
++// catalog id form. Any other id passes through unchanged.
++func CanonicalizeModelID(id string) string {
++	trimmed := strings.TrimSpace(id)
++	m := claudeClientAliasRe.FindStringSubmatch(strings.ToLower(trimmed))
++	if m == nil {
++		return trimmed
++	}
++	out := "claude-" + m[3] + "-" + m[1]
++	if m[2] != "" {
++		out += "-" + m[2]
++	}
++	if m[4] != "" {
++		out += "-" + m[4]
++	}
++	return out
++}
++
+ // ResolveRequestedModel maps a public/legacy Cursor model slug onto the base
+ // model id plus RequestedModel.parameters, matching cursor2api 3.7.12 behavior:
+ //
+@@ -38,7 +87,7 @@ var cursorSuffixTokens = map[string]struct{}{
+ //   - Desktop default prefers thinking=true when no variant suffix is given
+ //   - Hyphen suffixes are resolved into exact parameter id/value pairs
+ func ResolveRequestedModel(requested string) ModelSelection {
+-	requested = strings.TrimSpace(requested)
++	requested = CanonicalizeModelID(requested)
+ 	if requested == "" {
+ 		requested = "default"
+ 	}
 diff --git a/internal/cursor/model_resolve_test.go b/internal/cursor/model_resolve_test.go
-index aa3001b..3f120e0 100644
+index aa3001b..aa1cb04 100644
 --- a/internal/cursor/model_resolve_test.go
 +++ b/internal/cursor/model_resolve_test.go
-@@ -55,7 +55,7 @@ func TestResolveRequestedModelSuffix(t *testing.T) {
+@@ -1,14 +1,18 @@
+ package cursor
+ 
+-import "testing"
++import (
++	"fmt"
++	"testing"
++)
+ 
+ func TestResolveRequestedModelUsesCatalogParams(t *testing.T) {
+ 	RememberCatalog([]CatalogModel{{
+-		ID:         "claude-4.6-sonnet",
++		ID:         "claude-sonnet-4-6",
+ 		Parameters: []ModelParameter{{ID: "thinking", Value: "true"}},
+ 	}})
++	// The Anthropic-style client alias must resolve onto the catalog id.
+ 	sel := ResolveRequestedModel("claude-4.6-sonnet")
+-	if sel.PublicID != "claude-4.6-sonnet" {
++	if sel.PublicID != "claude-sonnet-4-6" {
+ 		t.Fatalf("public id = %q", sel.PublicID)
+ 	}
+ 	if len(sel.Parameters) != 1 || sel.Parameters[0].ID != "thinking" || sel.Parameters[0].Value != "true" {
+@@ -40,7 +44,7 @@ func TestResolveRequestedModelDefaultSelector(t *testing.T) {
+ 
+ func TestResolveRequestedModelSuffix(t *testing.T) {
+ 	sel := ResolveRequestedModel("claude-4.6-sonnet-thinking-xhigh")
+-	if sel.ModelID != "claude-4.6-sonnet" {
++	if sel.ModelID != "claude-sonnet-4-6" {
+ 		t.Fatalf("base model = %q", sel.ModelID)
+ 	}
+ 	got := map[string]string{}
+@@ -55,7 +59,7 @@ func TestResolveRequestedModelSuffix(t *testing.T) {
  func TestBuildRunRequestSendsParameters(t *testing.T) {
  	msg, _, _, err := buildRunRequest("gpt-5.4-thinking", []ChatMessage{
  		{Role: "user", Content: "hi"},
@@ -310,6 +417,152 @@ index aa3001b..3f120e0 100644
  	if err != nil {
  		t.Fatal(err)
  	}
+@@ -68,3 +72,65 @@ func TestBuildRunRequestSendsParameters(t *testing.T) {
+ 		t.Fatalf("expected thinking parameter, got %#v", req.GetParameters())
+ 	}
+ }
++
++func TestCanonicalizeModelID(t *testing.T) {
++	cases := map[string]string{
++		"claude-4.6-sonnet":          "claude-sonnet-4-6",
++		"claude-4-6-sonnet":          "claude-sonnet-4-6",
++		"claude-4-sonnet":            "claude-sonnet-4",
++		"claude-4.5-haiku":           "claude-haiku-4-5",
++		"claude-5-opus":              "claude-opus-5",
++		"claude-4.5-sonnet-thinking": "claude-sonnet-4-5-thinking",
++		"claude-sonnet-4-6":          "claude-sonnet-4-6",
++		"grok-4.6":                   "grok-4.6",
++		"gpt-5.2":                    "gpt-5.2",
++		"claude-fable-5":             "claude-fable-5",
++	}
++	for in, want := range cases {
++		if got := CanonicalizeModelID(in); got != want {
++			t.Errorf("CanonicalizeModelID(%q) = %q, want %q", in, got, want)
++		}
++	}
++}
++
++func TestClientAliasForModelID(t *testing.T) {
++	cases := map[string]string{
++		"claude-sonnet-4-6":          "claude-4.6-sonnet",
++		"claude-sonnet-4":            "claude-4-sonnet",
++		"claude-haiku-4-5":           "claude-4.5-haiku",
++		"claude-opus-5":              "claude-5-opus",
++		"claude-sonnet-4-5-thinking": "claude-4.5-sonnet-thinking",
++		"claude-fable-5":             "",
++		"grok-4.6":                   "",
++		"default":                    "",
++	}
++	for in, want := range cases {
++		if got := ClientAliasForModelID(in); got != want {
++			t.Errorf("ClientAliasForModelID(%q) = %q, want %q", in, got, want)
++		}
++	}
++}
++
++func TestResolveRequestedModelCanonicalizesClaudeAlias(t *testing.T) {
++	sel := ResolveRequestedModel("claude-4.6-sonnet")
++	if sel.PublicID != "claude-sonnet-4-6" {
++		t.Fatalf("PublicID = %q, want claude-sonnet-4-6", sel.PublicID)
++	}
++	selThinking := ResolveRequestedModel("claude-4.5-sonnet-thinking")
++	if selThinking.PublicID != "claude-sonnet-4-5" {
++		t.Fatalf("thinking alias PublicID = %q, want claude-sonnet-4-5", selThinking.PublicID)
++	}
++}
++
++func TestAutoSwitchModelFromError(t *testing.T) {
++	err := fmt.Errorf(`cursor connect end-stream error: {"code":"resource_exhausted","message":"Error","details":[{"debug":{"error":"ERROR_RATE_LIMITED_CHANGEABLE","details":{"additionalInfo":{"autoSwitchToModel":"grok-4.6"}}}}]}`)
++	if got := AutoSwitchModelFromError(err); got != "grok-4.6" {
++		t.Fatalf("AutoSwitchModelFromError = %q, want grok-4.6", got)
++	}
++	if got := AutoSwitchModelFromError(fmt.Errorf("dial tcp: i/o timeout")); got != "" {
++		t.Fatalf("unrelated error should yield empty, got %q", got)
++	}
++	if got := AutoSwitchModelFromError(nil); got != "" {
++		t.Fatalf("nil error should yield empty, got %q", got)
++	}
++}
+diff --git a/internal/cursor/models.go b/internal/cursor/models.go
+index 9797378..685e5f8 100644
+--- a/internal/cursor/models.go
++++ b/internal/cursor/models.go
+@@ -2,6 +2,7 @@ package cursor
+ 
+ import (
+ 	"context"
++	"regexp"
+ 	"sort"
+ 	"strings"
+ 	"sync"
+@@ -514,6 +515,67 @@ func CatalogToModelInfos(models []CatalogModel) []*registry.ModelInfo {
+ 			info.SupportedInputModalities = []string{"TEXT"}
+ 		}
+ 		out = append(out, info)
++		// Also register the Anthropic-style alias (claude-4.6-sonnet) so
++		// clients that use that naming — e.g. Cursor's Task subagent probes —
++		// route to this provider instead of failing with unknown provider.
++		if alias := ClientAliasForModelID(id); alias != "" {
++			if _, ok := seen[strings.ToLower(alias)]; !ok {
++				seen[strings.ToLower(alias)] = struct{}{}
++				aliasInfo := *info
++				aliasInfo.ID = alias
++				aliasInfo.Name = alias
++				out = append(out, &aliasInfo)
++			}
++		}
++	}
++	return out
++}
++
++// AppendClientAliases appends Anthropic-style alias entries for claude models
++// to a registry model list (used for the builtin fallback catalog).
++func AppendClientAliases(models []*registry.ModelInfo) []*registry.ModelInfo {
++	seen := make(map[string]struct{}, len(models))
++	for _, m := range models {
++		if m != nil {
++			seen[strings.ToLower(m.ID)] = struct{}{}
++		}
++	}
++	out := models
++	for _, m := range models {
++		if m == nil {
++			continue
++		}
++		alias := ClientAliasForModelID(m.ID)
++		if alias == "" {
++			continue
++		}
++		if _, ok := seen[strings.ToLower(alias)]; ok {
++			continue
++		}
++		seen[strings.ToLower(alias)] = struct{}{}
++		aliasInfo := *m
++		aliasInfo.ID = alias
++		aliasInfo.Name = alias
++		out = append(out, &aliasInfo)
+ 	}
+ 	return out
+ }
++
++// claudeCatalogIDRe matches Cursor catalog claude ids (claude-sonnet-4-6,
++// claude-opus-4-5-thinking, claude-sonnet-4).
++var claudeCatalogIDRe = regexp.MustCompile(`^claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?(-.+)?$`)
++
++// ClientAliasForModelID returns the Anthropic-style alias for a Cursor claude
++// catalog id (claude-sonnet-4-6 -> claude-4.6-sonnet), or "" when the id has
++// no such alias form.
++func ClientAliasForModelID(id string) string {
++	m := claudeCatalogIDRe.FindStringSubmatch(strings.ToLower(strings.TrimSpace(id)))
++	if m == nil {
++		return ""
++	}
++	version := m[2]
++	if m[3] != "" {
++		version += "." + m[3]
++	}
++	return "claude-" + version + "-" + m[1] + m[4]
++}
 diff --git a/internal/cursor/session.go b/internal/cursor/session.go
 index db37888..1756c99 100644
 --- a/internal/cursor/session.go
@@ -672,7 +925,7 @@ index 96a7af9..4fab3a8 100644
  			MinVersion: tls.VersionTLS12,
  			NextProtos: []string{"h2", "http/1.1"},
 diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
-index 82385da..19e24b9 100644
+index 82385da..6425df3 100644
 --- a/internal/runtime/executor/cursor_executor.go
 +++ b/internal/runtime/executor/cursor_executor.go
 @@ -7,6 +7,7 @@ import (
@@ -753,7 +1006,7 @@ index 82385da..19e24b9 100644
  // Identifier returns the executor identifier.
  func (e *CursorExecutor) Identifier() string { return "cursor" }
  
-@@ -68,16 +129,33 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
+@@ -68,15 +129,42 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
  		return resp, err
  	}
  	tools := extractTools(body)
@@ -767,8 +1020,19 @@ index 82385da..19e24b9 100644
 -	result, err := cursorlib.RunChat(ctx, creds, upstreamModel, messages, tools)
 +	result, err := cursorlib.RunChat(ctx, creds, upstreamModel, messages, tools, sessOpts)
  	if err != nil {
- 		return resp, err
- 	}
+-		return resp, err
++		fallback := cursorlib.AutoSwitchModelFromError(err)
++		if fallback == "" || ctx.Err() != nil {
++			return resp, err
++		}
++		// Upstream hit the per-model usage limit and named a switch target;
++		// mirror the official client and rerun on that model.
++		log.Warnf("cursor: model %s usage-limited; retrying with upstream-suggested %s", upstreamModel, fallback)
++		result, err = cursorlib.RunChat(ctx, creds, fallback, messages, tools, sessOpts)
++		if err != nil {
++			return resp, err
++		}
++	}
 +	if sessOpts.ToolChoice.ForcesToolCall() && len(result.ToolCalls) == 0 && ctx.Err() == nil {
 +		// The directive is advisory; a run that ignored it gets one retry
 +		// before the text answer is surfaced.
@@ -784,11 +1048,10 @@ index 82385da..19e24b9 100644
 +		// segment pauses for client tools; estimate so usage is never zero.
 +		result.InputTokens = estimateCursorPromptTokens(messages, tools)
 +		result.OutputTokens = estimateCursorCompletionTokens(result)
-+	}
+ 	}
  
  	outPayload := buildOpenAIChatCompletion(req.Model, result)
- 	reporter.Publish(ctx, usage.Detail{
-@@ -118,13 +196,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+@@ -118,13 +206,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
  		return nil, err
  	}
  	tools := extractTools(body)
@@ -804,7 +1067,7 @@ index 82385da..19e24b9 100644
  	if err != nil {
  		return nil, err
  	}
-@@ -165,21 +244,29 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+@@ -165,21 +254,29 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
  			return
  		}
  
@@ -835,7 +1098,7 @@ index 82385da..19e24b9 100644
  				delta = map[string]any{
  					"tool_calls": []map[string]any{
  						{
-@@ -231,7 +318,59 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+@@ -231,7 +328,74 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
  				return context.Canceled
  			}
  			return nil
@@ -880,6 +1143,21 @@ index 82385da..19e24b9 100644
 +				errIter = iterate()
 +			}
 +		}
++		if errIter != nil && !contentEmitted && ctx.Err() == nil {
++			if fallback := cursorlib.AutoSwitchModelFromError(errIter); fallback != "" {
++				// Per-model usage limit: rerun on the upstream-suggested model,
++				// matching the official client's silent switch.
++				log.Warnf("cursor: model %s usage-limited on stream; retrying with upstream-suggested %s", upstreamModel, fallback)
++				_ = session.Close()
++				if retry, errRetry := cursorlib.StartSession(ctx, creds, fallback, messages, tools, sessOpts); errRetry == nil {
++					session = retry
++					buffered = nil
++					buffering = sessOpts.ToolChoice.ForcesToolCall()
++					finishReason = "stop"
++					errIter = iterate()
++				}
++			}
++		}
 +		if errIter == nil && sessOpts.ToolChoice.ForcesToolCall() && toolIndex == 0 && ctx.Err() == nil {
 +			// The model ignored the forced tool choice; retry once with a
 +			// fresh run before surfacing the buffered text answer.
@@ -896,7 +1174,7 @@ index 82385da..19e24b9 100644
  		if errIter != nil {
  			reporter.PublishFailure(ctx, errIter)
  			select {
-@@ -241,6 +380,16 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+@@ -241,6 +405,16 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
  			_ = session.Close()
  			return
  		}
@@ -913,7 +1191,7 @@ index 82385da..19e24b9 100644
  
  		if finishReason == "tool_calls" && toolIndex == 0 {
  			finishReason = "stop"
-@@ -248,6 +397,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+@@ -248,6 +422,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
  		if finishReason != "tool_calls" {
  			_ = session.Close()
  		}
@@ -923,7 +1201,7 @@ index 82385da..19e24b9 100644
  
  		endChunk, _ := json.Marshal(map[string]any{
  			"id":      completionID,
-@@ -261,7 +413,31 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+@@ -261,7 +438,31 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
  		if !emitLine([]byte("data: " + string(endChunk))) {
  			return
  		}
@@ -956,7 +1234,7 @@ index 82385da..19e24b9 100644
  		doneChunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
  		for i := range doneChunks {
  			select {
-@@ -274,49 +450,143 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+@@ -274,49 +475,143 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
  	return &cliproxyexecutor.StreamResult{Chunks: out}, nil
  }
  
@@ -983,23 +1261,23 @@ index 82385da..19e24b9 100644
  		}
 -		return session, nil
 +		log.Warnf("cursor: resuming tool results failed (%v); rebuilding run from history", err)
- 	}
--	return cursorlib.StartSession(ctx, creds, model, messages, tools)
++	}
 +	session, err := cursorlib.StartSession(ctx, creds, model, messages, tools, opts)
 +	return session, false, err
++}
++
++func authID(auth *cliproxyauth.Auth) string {
++	if auth == nil {
++		return ""
+ 	}
+-	return cursorlib.StartSession(ctx, creds, model, messages, tools)
++	return auth.ID
  }
  
 -func trailingToolResults(messages []cursorlib.ChatMessage) []cursorlib.ToolResult {
 -	start := -1
 -	for i := len(messages) - 1; i >= 0; i-- {
 -		switch messages[i].Role {
-+func authID(auth *cliproxyauth.Auth) string {
-+	if auth == nil {
-+		return ""
-+	}
-+	return auth.ID
-+}
-+
 +// extractToolChoice parses the OpenAI tool_choice field (string or object
 +// form, plus the Claude-style {"type":"tool","name":…} passthrough).
 +func extractToolChoice(body []byte) cursorlib.ToolChoice {
@@ -1133,7 +1411,7 @@ index 82385da..19e24b9 100644
  }
  
  // CountTokens returns a best-effort character-based estimate.
-@@ -343,6 +613,9 @@ func (e *CursorExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
+@@ -343,6 +638,9 @@ func (e *CursorExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
  
  func (e *CursorExecutor) ensureCredentials(ctx context.Context, auth *cliproxyauth.Auth) (cursorlib.AccountCredentials, error) {
  	creds := cursorlib.CredentialsFromMetadata(authMetadata(auth))
@@ -1143,7 +1421,7 @@ index 82385da..19e24b9 100644
  	if creds.AccessToken == "" {
  		return creds, fmt.Errorf("cursor: auth missing access_token")
  	}
-@@ -371,6 +644,60 @@ func (e *CursorExecutor) ensureCredentials(ctx context.Context, auth *cliproxyau
+@@ -371,6 +669,60 @@ func (e *CursorExecutor) ensureCredentials(ctx context.Context, auth *cliproxyau
  	return creds, nil
  }
  
@@ -1204,7 +1482,7 @@ index 82385da..19e24b9 100644
  func authMetadata(auth *cliproxyauth.Auth) map[string]any {
  	if auth == nil {
  		return nil
-@@ -531,11 +858,7 @@ func buildOpenAIChatCompletion(model string, result *cursorlib.ChatResult) []byt
+@@ -531,11 +883,7 @@ func buildOpenAIChatCompletion(model string, result *cursorlib.ChatResult) []byt
  				"finish_reason": finish,
  			},
  		},
@@ -1521,3 +1799,24 @@ index ddcbbab..7ee5dba 100644
 +	}
 +	return ""
 +}
+diff --git a/sdk/cliproxy/service.go b/sdk/cliproxy/service.go
+index 8e8b6cc..d98e464 100644
+--- a/sdk/cliproxy/service.go
++++ b/sdk/cliproxy/service.go
+@@ -14,6 +14,7 @@ import (
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
++	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+@@ -2052,7 +2053,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
+ 		if fetched := s.fetchCursorModelsForAuth(ctx, a); len(fetched) > 0 {
+ 			models = fetched
+ 		} else {
+-			models = registry.GetCursorModels()
++			models = cursorlib.AppendClientAliases(registry.GetCursorModels())
+ 		}
+ 		models = applyExcludedModels(models, excluded)
+ 	default:

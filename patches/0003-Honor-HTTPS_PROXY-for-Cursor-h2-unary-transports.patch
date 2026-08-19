@@ -1,7 +1,7 @@
 From bc642b8eb17752536d32b72b5ffbccb081ea1353 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Wed, 19 Aug 2026 04:53:04 +0000
-Subject: [PATCH 3/4] Honor HTTPS_PROXY for Cursor h2/unary transports
+Subject: [PATCH 3/6] Honor HTTPS_PROXY for Cursor h2/unary transports
 
 The Agent Connect bidi stream and unary RPCs dialed upstream directly,
 bypassing the environment proxy. On deployments where gateway egress is

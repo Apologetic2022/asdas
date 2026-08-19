@@ -1,0 +1,252 @@
+From 8797467846570556dd3a79682d9efab4bd6dbc4f Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 06:38:25 +0000
+Subject: [PATCH 5/6] Register Anthropic-style claude aliases so Cursor Task
+ subagent probes resolve
+
+Co-authored-by: Apologetic2022 <Apologetic2022@users.noreply.github.com>
+---
+ internal/cursor/model_resolve.go      | 28 +++++++++++-
+ internal/cursor/model_resolve_test.go | 56 ++++++++++++++++++++++--
+ internal/cursor/models.go             | 62 +++++++++++++++++++++++++++
+ sdk/cliproxy/service.go               |  3 +-
+ 4 files changed, 144 insertions(+), 5 deletions(-)
+
+diff --git a/internal/cursor/model_resolve.go b/internal/cursor/model_resolve.go
+index 05a8451..2eabd98 100644
+--- a/internal/cursor/model_resolve.go
++++ b/internal/cursor/model_resolve.go
+@@ -1,6 +1,7 @@
+ package cursor
+ 
+ import (
++	"regexp"
+ 	"strings"
+ 
+ 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+@@ -31,6 +32,31 @@ var cursorSuffixTokens = map[string]struct{}{
+ 	"max":      {},
+ }
+ 
++// claudeClientAliasRe matches Anthropic-style client names such as
++// claude-4.6-sonnet, claude-4-sonnet or claude-4.5-haiku-thinking; the Cursor
++// catalog names the same models claude-sonnet-4-6 / claude-sonnet-4 /
++// claude-haiku-4-5-thinking. Cursor's own client (e.g. its Task subagent
++// probes) sends the Anthropic-style form, so both must resolve.
++var claudeClientAliasRe = regexp.MustCompile(`^claude-(\d+)(?:[.-](\d+))?-(opus|sonnet|haiku)(?:-(.+))?$`)
++
++// CanonicalizeModelID maps Anthropic-style claude aliases onto the Cursor
++// catalog id form. Any other id passes through unchanged.
++func CanonicalizeModelID(id string) string {
++	trimmed := strings.TrimSpace(id)
++	m := claudeClientAliasRe.FindStringSubmatch(strings.ToLower(trimmed))
++	if m == nil {
++		return trimmed
++	}
++	out := "claude-" + m[3] + "-" + m[1]
++	if m[2] != "" {
++		out += "-" + m[2]
++	}
++	if m[4] != "" {
++		out += "-" + m[4]
++	}
++	return out
++}
++
+ // ResolveRequestedModel maps a public/legacy Cursor model slug onto the base
+ // model id plus RequestedModel.parameters, matching cursor2api 3.7.12 behavior:
+ //
+@@ -38,7 +64,7 @@ var cursorSuffixTokens = map[string]struct{}{
+ //   - Desktop default prefers thinking=true when no variant suffix is given
+ //   - Hyphen suffixes are resolved into exact parameter id/value pairs
+ func ResolveRequestedModel(requested string) ModelSelection {
+-	requested = strings.TrimSpace(requested)
++	requested = CanonicalizeModelID(requested)
+ 	if requested == "" {
+ 		requested = "default"
+ 	}
+diff --git a/internal/cursor/model_resolve_test.go b/internal/cursor/model_resolve_test.go
+index 3f120e0..7def25d 100644
+--- a/internal/cursor/model_resolve_test.go
++++ b/internal/cursor/model_resolve_test.go
+@@ -4,11 +4,12 @@ import "testing"
+ 
+ func TestResolveRequestedModelUsesCatalogParams(t *testing.T) {
+ 	RememberCatalog([]CatalogModel{{
+-		ID:         "claude-4.6-sonnet",
++		ID:         "claude-sonnet-4-6",
+ 		Parameters: []ModelParameter{{ID: "thinking", Value: "true"}},
+ 	}})
++	// The Anthropic-style client alias must resolve onto the catalog id.
+ 	sel := ResolveRequestedModel("claude-4.6-sonnet")
+-	if sel.PublicID != "claude-4.6-sonnet" {
++	if sel.PublicID != "claude-sonnet-4-6" {
+ 		t.Fatalf("public id = %q", sel.PublicID)
+ 	}
+ 	if len(sel.Parameters) != 1 || sel.Parameters[0].ID != "thinking" || sel.Parameters[0].Value != "true" {
+@@ -40,7 +41,7 @@ func TestResolveRequestedModelDefaultSelector(t *testing.T) {
+ 
+ func TestResolveRequestedModelSuffix(t *testing.T) {
+ 	sel := ResolveRequestedModel("claude-4.6-sonnet-thinking-xhigh")
+-	if sel.ModelID != "claude-4.6-sonnet" {
++	if sel.ModelID != "claude-sonnet-4-6" {
+ 		t.Fatalf("base model = %q", sel.ModelID)
+ 	}
+ 	got := map[string]string{}
+@@ -68,3 +69,52 @@ func TestBuildRunRequestSendsParameters(t *testing.T) {
+ 		t.Fatalf("expected thinking parameter, got %#v", req.GetParameters())
+ 	}
+ }
++
++func TestCanonicalizeModelID(t *testing.T) {
++	cases := map[string]string{
++		"claude-4.6-sonnet":          "claude-sonnet-4-6",
++		"claude-4-6-sonnet":          "claude-sonnet-4-6",
++		"claude-4-sonnet":            "claude-sonnet-4",
++		"claude-4.5-haiku":           "claude-haiku-4-5",
++		"claude-5-opus":              "claude-opus-5",
++		"claude-4.5-sonnet-thinking": "claude-sonnet-4-5-thinking",
++		"claude-sonnet-4-6":          "claude-sonnet-4-6",
++		"grok-4.6":                   "grok-4.6",
++		"gpt-5.2":                    "gpt-5.2",
++		"claude-fable-5":             "claude-fable-5",
++	}
++	for in, want := range cases {
++		if got := CanonicalizeModelID(in); got != want {
++			t.Errorf("CanonicalizeModelID(%q) = %q, want %q", in, got, want)
++		}
++	}
++}
++
++func TestClientAliasForModelID(t *testing.T) {
++	cases := map[string]string{
++		"claude-sonnet-4-6":          "claude-4.6-sonnet",
++		"claude-sonnet-4":            "claude-4-sonnet",
++		"claude-haiku-4-5":           "claude-4.5-haiku",
++		"claude-opus-5":              "claude-5-opus",
++		"claude-sonnet-4-5-thinking": "claude-4.5-sonnet-thinking",
++		"claude-fable-5":             "",
++		"grok-4.6":                   "",
++		"default":                    "",
++	}
++	for in, want := range cases {
++		if got := ClientAliasForModelID(in); got != want {
++			t.Errorf("ClientAliasForModelID(%q) = %q, want %q", in, got, want)
++		}
++	}
++}
++
++func TestResolveRequestedModelCanonicalizesClaudeAlias(t *testing.T) {
++	sel := ResolveRequestedModel("claude-4.6-sonnet")
++	if sel.PublicID != "claude-sonnet-4-6" {
++		t.Fatalf("PublicID = %q, want claude-sonnet-4-6", sel.PublicID)
++	}
++	selThinking := ResolveRequestedModel("claude-4.5-sonnet-thinking")
++	if selThinking.PublicID != "claude-sonnet-4-5" {
++		t.Fatalf("thinking alias PublicID = %q, want claude-sonnet-4-5", selThinking.PublicID)
++	}
++}
+diff --git a/internal/cursor/models.go b/internal/cursor/models.go
+index 9797378..685e5f8 100644
+--- a/internal/cursor/models.go
++++ b/internal/cursor/models.go
+@@ -2,6 +2,7 @@ package cursor
+ 
+ import (
+ 	"context"
++	"regexp"
+ 	"sort"
+ 	"strings"
+ 	"sync"
+@@ -514,6 +515,67 @@ func CatalogToModelInfos(models []CatalogModel) []*registry.ModelInfo {
+ 			info.SupportedInputModalities = []string{"TEXT"}
+ 		}
+ 		out = append(out, info)
++		// Also register the Anthropic-style alias (claude-4.6-sonnet) so
++		// clients that use that naming — e.g. Cursor's Task subagent probes —
++		// route to this provider instead of failing with unknown provider.
++		if alias := ClientAliasForModelID(id); alias != "" {
++			if _, ok := seen[strings.ToLower(alias)]; !ok {
++				seen[strings.ToLower(alias)] = struct{}{}
++				aliasInfo := *info
++				aliasInfo.ID = alias
++				aliasInfo.Name = alias
++				out = append(out, &aliasInfo)
++			}
++		}
++	}
++	return out
++}
++
++// AppendClientAliases appends Anthropic-style alias entries for claude models
++// to a registry model list (used for the builtin fallback catalog).
++func AppendClientAliases(models []*registry.ModelInfo) []*registry.ModelInfo {
++	seen := make(map[string]struct{}, len(models))
++	for _, m := range models {
++		if m != nil {
++			seen[strings.ToLower(m.ID)] = struct{}{}
++		}
++	}
++	out := models
++	for _, m := range models {
++		if m == nil {
++			continue
++		}
++		alias := ClientAliasForModelID(m.ID)
++		if alias == "" {
++			continue
++		}
++		if _, ok := seen[strings.ToLower(alias)]; ok {
++			continue
++		}
++		seen[strings.ToLower(alias)] = struct{}{}
++		aliasInfo := *m
++		aliasInfo.ID = alias
++		aliasInfo.Name = alias
++		out = append(out, &aliasInfo)
+ 	}
+ 	return out
+ }
++
++// claudeCatalogIDRe matches Cursor catalog claude ids (claude-sonnet-4-6,
++// claude-opus-4-5-thinking, claude-sonnet-4).
++var claudeCatalogIDRe = regexp.MustCompile(`^claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?(-.+)?$`)
++
++// ClientAliasForModelID returns the Anthropic-style alias for a Cursor claude
++// catalog id (claude-sonnet-4-6 -> claude-4.6-sonnet), or "" when the id has
++// no such alias form.
++func ClientAliasForModelID(id string) string {
++	m := claudeCatalogIDRe.FindStringSubmatch(strings.ToLower(strings.TrimSpace(id)))
++	if m == nil {
++		return ""
++	}
++	version := m[2]
++	if m[3] != "" {
++		version += "." + m[3]
++	}
++	return "claude-" + version + "-" + m[1] + m[4]
++}
+diff --git a/sdk/cliproxy/service.go b/sdk/cliproxy/service.go
+index 8e8b6cc..d98e464 100644
+--- a/sdk/cliproxy/service.go
++++ b/sdk/cliproxy/service.go
+@@ -14,6 +14,7 @@ import (
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
++	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+@@ -2052,7 +2053,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
+ 		if fetched := s.fetchCursorModelsForAuth(ctx, a); len(fetched) > 0 {
+ 			models = fetched
+ 		} else {
+-			models = registry.GetCursorModels()
++			models = cursorlib.AppendClientAliases(registry.GetCursorModels())
+ 		}
+ 		models = applyExcludedModels(models, excluded)
+ 	default:
+-- 
+2.43.0
+

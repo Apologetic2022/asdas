@@ -1,0 +1,127 @@
+From 6b965ebcf6a65589eb76235f258e36efaccde11f Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 06:41:57 +0000
+Subject: [PATCH 6/6] Auto-switch to upstream-suggested model when per-model
+ usage limit is hit
+
+Co-authored-by: Apologetic2022 <Apologetic2022@users.noreply.github.com>
+---
+ internal/cursor/model_resolve.go             | 23 +++++++++++++++++
+ internal/cursor/model_resolve_test.go        | 18 ++++++++++++-
+ internal/runtime/executor/cursor_executor.go | 27 +++++++++++++++++++-
+ 3 files changed, 66 insertions(+), 2 deletions(-)
+
+diff --git a/internal/cursor/model_resolve.go b/internal/cursor/model_resolve.go
+index 2eabd98..fb1bda1 100644
+--- a/internal/cursor/model_resolve.go
++++ b/internal/cursor/model_resolve.go
+@@ -39,6 +39,29 @@ var cursorSuffixTokens = map[string]struct{}{
+ // probes) sends the Anthropic-style form, so both must resolve.
+ var claudeClientAliasRe = regexp.MustCompile(`^claude-(\d+)(?:[.-](\d+))?-(opus|sonnet|haiku)(?:-(.+))?$`)
+ 
++// autoSwitchModelRe extracts the upstream-suggested fallback model from a
++// resource_exhausted run error payload.
++var autoSwitchModelRe = regexp.MustCompile(`"autoSwitchToModel"\s*:\s*"([^"]+)"`)
++
++// AutoSwitchModelFromError returns the model Cursor upstream suggests
++// switching to when a run is rejected with ERROR_RATE_LIMITED_CHANGEABLE
++// ("Other Models usage limit reached"), or "" when the error is unrelated.
++// The official Cursor client silently switches to that model; the gateway
++// mirrors this so per-model usage limits do not surface as hard failures.
++func AutoSwitchModelFromError(err error) string {
++	if err == nil {
++		return ""
++	}
++	msg := err.Error()
++	if !strings.Contains(msg, "resource_exhausted") && !strings.Contains(msg, "RATE_LIMITED") {
++		return ""
++	}
++	if m := autoSwitchModelRe.FindStringSubmatch(msg); m != nil {
++		return strings.TrimSpace(m[1])
++	}
++	return ""
++}
++
+ // CanonicalizeModelID maps Anthropic-style claude aliases onto the Cursor
+ // catalog id form. Any other id passes through unchanged.
+ func CanonicalizeModelID(id string) string {
+diff --git a/internal/cursor/model_resolve_test.go b/internal/cursor/model_resolve_test.go
+index 7def25d..aa1cb04 100644
+--- a/internal/cursor/model_resolve_test.go
++++ b/internal/cursor/model_resolve_test.go
+@@ -1,6 +1,9 @@
+ package cursor
+ 
+-import "testing"
++import (
++	"fmt"
++	"testing"
++)
+ 
+ func TestResolveRequestedModelUsesCatalogParams(t *testing.T) {
+ 	RememberCatalog([]CatalogModel{{
+@@ -118,3 +121,16 @@ func TestResolveRequestedModelCanonicalizesClaudeAlias(t *testing.T) {
+ 		t.Fatalf("thinking alias PublicID = %q, want claude-sonnet-4-5", selThinking.PublicID)
+ 	}
+ }
++
++func TestAutoSwitchModelFromError(t *testing.T) {
++	err := fmt.Errorf(`cursor connect end-stream error: {"code":"resource_exhausted","message":"Error","details":[{"debug":{"error":"ERROR_RATE_LIMITED_CHANGEABLE","details":{"additionalInfo":{"autoSwitchToModel":"grok-4.6"}}}}]}`)
++	if got := AutoSwitchModelFromError(err); got != "grok-4.6" {
++		t.Fatalf("AutoSwitchModelFromError = %q, want grok-4.6", got)
++	}
++	if got := AutoSwitchModelFromError(fmt.Errorf("dial tcp: i/o timeout")); got != "" {
++		t.Fatalf("unrelated error should yield empty, got %q", got)
++	}
++	if got := AutoSwitchModelFromError(nil); got != "" {
++		t.Fatalf("nil error should yield empty, got %q", got)
++	}
++}
+diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
+index 19e24b9..6425df3 100644
+--- a/internal/runtime/executor/cursor_executor.go
++++ b/internal/runtime/executor/cursor_executor.go
+@@ -138,7 +138,17 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
+ 
+ 	result, err := cursorlib.RunChat(ctx, creds, upstreamModel, messages, tools, sessOpts)
+ 	if err != nil {
+-		return resp, err
++		fallback := cursorlib.AutoSwitchModelFromError(err)
++		if fallback == "" || ctx.Err() != nil {
++			return resp, err
++		}
++		// Upstream hit the per-model usage limit and named a switch target;
++		// mirror the official client and rerun on that model.
++		log.Warnf("cursor: model %s usage-limited; retrying with upstream-suggested %s", upstreamModel, fallback)
++		result, err = cursorlib.RunChat(ctx, creds, fallback, messages, tools, sessOpts)
++		if err != nil {
++			return resp, err
++		}
+ 	}
+ 	if sessOpts.ToolChoice.ForcesToolCall() && len(result.ToolCalls) == 0 && ctx.Err() == nil {
+ 		// The directive is advisory; a run that ignored it gets one retry
+@@ -358,6 +368,21 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 				errIter = iterate()
+ 			}
+ 		}
++		if errIter != nil && !contentEmitted && ctx.Err() == nil {
++			if fallback := cursorlib.AutoSwitchModelFromError(errIter); fallback != "" {
++				// Per-model usage limit: rerun on the upstream-suggested model,
++				// matching the official client's silent switch.
++				log.Warnf("cursor: model %s usage-limited on stream; retrying with upstream-suggested %s", upstreamModel, fallback)
++				_ = session.Close()
++				if retry, errRetry := cursorlib.StartSession(ctx, creds, fallback, messages, tools, sessOpts); errRetry == nil {
++					session = retry
++					buffered = nil
++					buffering = sessOpts.ToolChoice.ForcesToolCall()
++					finishReason = "stop"
++					errIter = iterate()
++				}
++			}
++		}
+ 		if errIter == nil && sessOpts.ToolChoice.ForcesToolCall() && toolIndex == 0 && ctx.Err() == nil {
+ 			// The model ignored the forced tool choice; retry once with a
+ 			// fresh run before surfacing the buffered text answer.
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From 2d2e1bcb4c2bf951b2f220b1d888026f4bc69e53 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Wed, 19 Aug 2026 04:39:49 +0000
-Subject: [PATCH 1/4] Fix cursor tool_choice handling, tool-call usage
+Subject: [PATCH 1/6] Fix cursor tool_choice handling, tool-call usage
  reporting, and session/cache affinity
 
 - tool_choice was dropped in the OpenAI->cursor request conversion: parse
