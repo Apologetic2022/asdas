@@ -43,6 +43,18 @@ func TestInjectCursorPanelIsIdempotent(t *testing.T) {
 	}
 }
 
+// The counters are read straight off the cursor-api-key entries, so the panel
+// breaks silently if the endpoint ever renames one of these fields.
+func TestCursorPanelReadsRequestCounters(t *testing.T) {
+	snippet := string(cursorPanelSnippet)
+
+	for _, field := range []string{"entry.success", "entry.failed", "entry.recent_requests", "entry.status_message"} {
+		if !strings.Contains(snippet, field) {
+			t.Fatalf("panel does not read %s", field)
+		}
+	}
+}
+
 func TestControlPanelContentRefreshesAfterFileChange(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ManagementFileName)
 	if err := os.WriteFile(path, []byte("<html><body>v1</body></html>"), 0o600); err != nil {

@@ -87,6 +87,10 @@
       'button{font:inherit}.btn{border:1px solid var(--line);border-radius:9px;padding:8px 12px;background:var(--bg);color:var(--text);cursor:pointer;font-size:13px}.btn:hover{border-color:var(--primary)}.btn.primary{background:var(--primary);border-color:var(--primary);color:#fff;font-weight:650}.btn.danger{color:var(--danger)}.btn.small{padding:6px 9px;font-size:12px}',
       '#key-list{display:grid;gap:10px}.empty{padding:26px;border:1px dashed var(--line);border-radius:12px;text-align:center;color:var(--muted)}',
       '.card{border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:14px}.card-top{display:flex;justify-content:space-between;gap:12px}.key{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:14px;font-weight:700;word-break:break-all}.meta{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.tag{border:1px solid var(--line);border-radius:999px;padding:3px 7px;color:var(--muted);font-size:11px}.tag.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 38%,var(--line))}.tag.off{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 38%,var(--line))}.actions{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}',
+      '.error-note{margin-top:8px;color:var(--danger);font-size:12px;word-break:break-word}',
+      '.chart{display:flex;align-items:flex-end;gap:2px;height:40px;margin-top:11px;padding:4px 6px;border:1px solid var(--line);border-radius:9px;background:var(--bg)}',
+      '.bar{flex:1;height:100%;display:flex;align-items:flex-end}.bar-fill{position:relative;display:block;width:100%;border-radius:2px;background:var(--ok)}.bar-failed{position:absolute;left:0;top:0;width:100%;border-radius:2px;background:var(--danger)}',
+      '.chart-note{margin-top:5px;color:var(--muted);font-size:11px}',
       '#form-wrap{margin-top:18px;border-top:1px solid var(--line);padding-top:18px}#form-wrap h3{margin:0 0 14px;font-size:16px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px}.field.full{grid-column:1/-1}.field label{display:block;margin-bottom:6px;color:var(--muted);font-size:12px;font-weight:650}',
       'input,textarea{width:100%;border:1px solid var(--line);border-radius:9px;padding:9px 10px;background:var(--panel);color:var(--text);outline:none;font:inherit;font-size:13px}input:focus,textarea:focus{border-color:var(--primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--primary) 17%,transparent)}textarea{min-height:74px;resize:vertical}',
       '.checks{display:flex;gap:18px;flex-wrap:wrap;align-items:center}.check{display:flex!important;align-items:center;gap:7px;color:var(--text)!important;font-weight:500!important;cursor:pointer}.check input{width:auto}.hint{margin-top:5px;color:var(--muted);font-size:11px}.form-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:15px}',
@@ -96,7 +100,7 @@
       '<button id="open" type="button">管理 Cursor API Key</button>',
       '<div id="overlay" class="hidden">',
       '  <section id="dialog" role="dialog" aria-modal="true" aria-labelledby="cursor-key-title">',
-      '    <div class="head"><div><h2 id="cursor-key-title">Cursor API Key</h2><p>无需 OAuth，直接管理模型与工具调用凭据</p></div><button id="close" class="icon" type="button" aria-label="关闭">&times;</button></div>',
+      '    <div class="head"><div><h2 id="cursor-key-title">Cursor API Key</h2><p>无需 OAuth，直接管理模型与工具调用凭据；调用与错误次数自服务启动累计</p></div><button id="close" class="icon" type="button" aria-label="关闭">&times;</button></div>',
       '    <div class="body">',
       '      <div class="auth"><div class="field"><label for="management-key">管理密钥（通常自动获取）</label><input id="management-key" type="password" autocomplete="off" placeholder="仅在自动获取失败时填写"><div class="auth-note">不会写入配置或浏览器永久存储；刷新页面后清空。</div></div></div>',
       '      <div class="toolbar"><span id="status" class="status">等待打开</span><div><button id="refresh" class="btn" type="button">刷新</button> <button id="add" class="btn primary" type="button">新增 Key</button></div></div>',
@@ -190,6 +194,34 @@
       return '<span class="tag' + (className ? ' ' + className : '') + '">' + escapeHTML(text) + '</span>';
     }
 
+    function count(value) {
+      return Number(value) || 0;
+    }
+
+    // Twenty ten-minute buckets, oldest first, matching what the panel draws for
+    // OAuth credentials.
+    function chart(buckets) {
+      if (!Array.isArray(buckets) || !buckets.length) return '';
+      var peak = buckets.reduce(function (highest, bucket) {
+        return Math.max(highest, count(bucket.success) + count(bucket.failed));
+      }, 0);
+      if (!peak) return '';
+      var bars = buckets.map(function (bucket) {
+        var success = count(bucket.success);
+        var failed = count(bucket.failed);
+        var total = success + failed;
+        var height = total ? Math.max(Math.round((total / peak) * 100), 8) : 0;
+        var failedShare = total ? Math.round((failed / total) * 100) : 0;
+        var label = (bucket.time || '') + ' 调用 ' + total + ' 次，失败 ' + failed + ' 次';
+        return '<span class="bar" title="' + escapeHTML(label) + '">' +
+          '<span class="bar-fill" style="height:' + height + '%">' +
+          '<span class="bar-failed" style="height:' + failedShare + '%"></span>' +
+          '</span></span>';
+      }).join('');
+      return '<div class="chart" role="img" aria-label="近 200 分钟调用趋势">' + bars + '</div>' +
+        '<div class="chart-note">近 200 分钟（每格 10 分钟），绿色成功，红色失败</div>';
+    }
+
     function render() {
       if (!entries.length) {
         list.innerHTML = '<div class="empty">尚未配置 Cursor API Key</div>';
@@ -197,14 +229,23 @@
       }
       list.innerHTML = entries.map(function (entry) {
         var base = entry['base-url'] || 'https://api2.cursor.sh（默认）';
+        var success = count(entry.success);
+        var failed = count(entry.failed);
         var meta = [
           tag(entry.disabled ? '已停用' : '启用', entry.disabled ? 'off' : 'ok'),
+          tag('调用 ' + (success + failed)),
+          tag('成功 ' + success),
+          tag('失败 ' + failed, failed ? 'off' : ''),
           tag('优先级 ' + (entry.priority || 0)),
           tag('地址 ' + base)
         ];
         if (entry.prefix) meta.push(tag('前缀 ' + entry.prefix));
         if (entry['disable-cooling']) meta.push(tag('不冷却'));
+        if (entry.unavailable) meta.push(tag('冷却中', 'off'));
         if (entry['auth-index']) meta.push(tag('Auth ' + entry['auth-index']));
+        var note = entry.status_message
+          ? '<div class="error-note">最近错误：' + escapeHTML(entry.status_message) + '</div>'
+          : '';
         return [
           '<article class="card">',
           '<div class="card-top"><div><div class="key">' + escapeHTML(maskKey(entry['api-key'])) + '</div><div class="meta">' + meta.join('') + '</div></div>',
@@ -212,22 +253,49 @@
           '<button class="btn small" type="button" data-action="edit" data-index="' + entry.index + '">编辑</button>',
           '<button class="btn small" type="button" data-action="toggle" data-index="' + entry.index + '">' + (entry.disabled ? '启用' : '停用') + '</button>',
           '<button class="btn small danger" type="button" data-action="delete" data-index="' + entry.index + '">删除</button>',
-          '</div></div></article>'
+          '</div></div>',
+          note,
+          chart(entry.recent_requests),
+          '</article>'
         ].join('');
       }).join('');
     }
 
-    async function load() {
-      setStatus('正在读取 Cursor API Key…');
+    function summary() {
+      var calls = 0;
+      var failures = 0;
+      entries.forEach(function (entry) {
+        calls += count(entry.success) + count(entry.failed);
+        failures += count(entry.failed);
+      });
+      return '已加载 ' + entries.length + ' 个 Key · 调用 ' + calls + ' 次 · 失败 ' + failures +
+        ' 次 · ' + new Date().toLocaleTimeString();
+    }
+
+    // quiet refreshes keep the current list on screen so a background poll cannot
+    // blank the panel over a transient error.
+    async function load(quiet) {
+      if (!quiet) setStatus('正在读取 Cursor API Key…');
       try {
         var payload = await request('GET', '/v0/management/cursor-api-key');
         entries = Array.isArray(payload['cursor-api-key']) ? payload['cursor-api-key'] : [];
         render();
-        setStatus('已加载 ' + entries.length + ' 个 Key', 'ok');
+        setStatus(summary(), 'ok');
       } catch (error) {
         setStatus(error.message || String(error), 'error');
-        list.innerHTML = '<div class="empty">读取失败，请检查管理密钥</div>';
+        if (!quiet) list.innerHTML = '<div class="empty">读取失败，请检查管理密钥</div>';
       }
+    }
+
+    var pollTimer = null;
+    function startPolling() {
+      stopPolling();
+      pollTimer = window.setInterval(function () { load(true); }, 15000);
+    }
+    function stopPolling() {
+      if (pollTimer === null) return;
+      window.clearInterval(pollTimer);
+      pollTimer = null;
     }
 
     function resetForm(entry) {
@@ -290,7 +358,7 @@
         }
         apiKeyInput.value = '';
         closeForm();
-        await load();
+        await load(true);
         setStatus('保存成功，配置已热重载', 'ok');
       } catch (error) {
         setStatus(error.message || String(error), 'error');
@@ -314,7 +382,7 @@
         try {
           await request('DELETE', '/v0/management/cursor-api-key?index=' + encodeURIComponent(index));
           closeForm();
-          await load();
+          await load(true);
           setStatus('删除成功', 'ok');
         } catch (error) {
           setStatus(error.message || String(error), 'error');
@@ -328,7 +396,7 @@
             index: index,
             value: { disabled: !entry.disabled }
           });
-          await load();
+          await load(true);
           setStatus(entry.disabled ? '已启用' : '已停用', 'ok');
         } catch (error) {
           setStatus(error.message || String(error), 'error');
@@ -338,16 +406,18 @@
 
     openButton.addEventListener('click', function () {
       overlay.classList.remove('hidden');
-      load();
+      load(false);
+      startPolling();
     });
     closeButton.addEventListener('click', function () {
       overlay.classList.add('hidden');
+      stopPolling();
       closeForm();
     });
     overlay.addEventListener('click', function (event) {
       if (event.target === overlay) closeButton.click();
     });
-    root.getElementById('refresh').addEventListener('click', load);
+    root.getElementById('refresh').addEventListener('click', function () { load(false); });
     root.getElementById('add').addEventListener('click', function () { resetForm(null); });
     root.getElementById('cancel').addEventListener('click', closeForm);
     form.addEventListener('submit', save);

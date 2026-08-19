@@ -3,9 +3,11 @@ package management
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 type geminiKeyWithAuthIndex struct {
@@ -23,6 +25,32 @@ type cursorKeyWithAuthIndex struct {
 	// Index is the position in cursor-api-key, which PATCH and DELETE address entries by.
 	Index     int    `json:"index"`
 	AuthIndex string `json:"auth-index,omitempty"`
+	authUsage
+}
+
+// authUsage carries the request counters the control panel already shows for auth
+// files, so a config-backed credential can report the same totals.
+type authUsage struct {
+	Success        int64                          `json:"success"`
+	Failed         int64                          `json:"failed"`
+	RecentRequests []coreauth.RecentRequestBucket `json:"recent_requests,omitempty"`
+	Status         coreauth.Status                `json:"status,omitempty"`
+	StatusMessage  string                         `json:"status_message,omitempty"`
+	Unavailable    bool                           `json:"unavailable,omitempty"`
+}
+
+func usageFromAuth(auth *coreauth.Auth, now time.Time) authUsage {
+	if auth == nil {
+		return authUsage{}
+	}
+	return authUsage{
+		Success:        auth.Success,
+		Failed:         auth.Failed,
+		RecentRequests: auth.RecentRequestsSnapshot(now),
+		Status:         auth.Status,
+		StatusMessage:  strings.TrimSpace(auth.StatusMessage),
+		Unavailable:    auth.Unavailable,
+	}
 }
 
 type codexKeyWithAuthIndex struct {
@@ -53,8 +81,8 @@ type openAICompatibilityWithAuthIndex struct {
 	AuthIndex      string                                   `json:"auth-index,omitempty"`
 }
 
-func (h *Handler) liveAuthIndexByID() map[string]string {
-	out := map[string]string{}
+func (h *Handler) liveAuthsByID() map[string]*coreauth.Auth {
+	out := map[string]*coreauth.Auth{}
 	if h == nil {
 		return out
 	}
@@ -64,7 +92,6 @@ func (h *Handler) liveAuthIndexByID() map[string]string {
 	if manager == nil {
 		return out
 	}
-	// authManager.List() returns clones, so EnsureIndex only affects these copies.
 	for _, auth := range manager.List() {
 		if auth == nil {
 			continue
@@ -73,14 +100,30 @@ func (h *Handler) liveAuthIndexByID() map[string]string {
 		if id == "" {
 			continue
 		}
-		idx := strings.TrimSpace(auth.Index)
-		if idx == "" {
-			idx = auth.EnsureIndex()
+		out[id] = auth
+	}
+	return out
+}
+
+// liveAuthIndex reports the display index of a live auth. authManager.List()
+// returns clones, so EnsureIndex only affects these copies.
+func liveAuthIndex(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if idx := strings.TrimSpace(auth.Index); idx != "" {
+		return idx
+	}
+	return auth.EnsureIndex()
+}
+
+func (h *Handler) liveAuthIndexByID() map[string]string {
+	live := h.liveAuthsByID()
+	out := make(map[string]string, len(live))
+	for id, auth := range live {
+		if idx := liveAuthIndex(auth); idx != "" {
+			out[id] = idx
 		}
-		if idx == "" {
-			continue
-		}
-		out[id] = idx
 	}
 	return out
 }
@@ -176,7 +219,9 @@ func (h *Handler) cursorKeysWithAuthIndex() []cursorKeyWithAuthIndex {
 	if h == nil {
 		return nil
 	}
-	liveIndexByID := h.liveAuthIndexByID()
+	// Cursor keys never reach the auth-file listing the panel reads counters from,
+	// so the request totals of the synthesized auth are reported here instead.
+	liveAuthByID := h.liveAuthsByID()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -184,20 +229,26 @@ func (h *Handler) cursorKeysWithAuthIndex() []cursorKeyWithAuthIndex {
 		return nil
 	}
 
+	now := time.Now()
 	idGen := synthesizer.NewStableIDGenerator()
 	out := make([]cursorKeyWithAuthIndex, len(h.cfg.CursorKey))
 	for i := range h.cfg.CursorKey {
 		entry := h.cfg.CursorKey[i]
-		authIndex := ""
-		if key := strings.TrimSpace(entry.APIKey); key != "" {
-			id, _ := idGen.Next("cursor:apikey", key, entry.BaseURL)
-			authIndex = liveIndexByID[id]
-		}
 		out[i] = cursorKeyWithAuthIndex{
 			CursorKey: entry,
 			Index:     i,
-			AuthIndex: authIndex,
 		}
+		key := strings.TrimSpace(entry.APIKey)
+		if key == "" {
+			continue
+		}
+		id, _ := idGen.Next("cursor:apikey", key, entry.BaseURL)
+		auth := liveAuthByID[id]
+		if auth == nil {
+			continue
+		}
+		out[i].AuthIndex = liveAuthIndex(auth)
+		out[i].authUsage = usageFromAuth(auth, now)
 	}
 	return out
 }

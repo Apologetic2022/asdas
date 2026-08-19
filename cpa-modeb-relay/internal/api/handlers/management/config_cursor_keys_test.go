@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func TestPutCursorKeysPersistsEntries(t *testing.T) {
@@ -98,6 +101,57 @@ func TestGetCursorKeysReportsPosition(t *testing.T) {
 	}
 	if body.CursorKey[0].Disabled || !body.CursorKey[1].Disabled {
 		t.Fatalf("disabled flags = %v,%v, want false,true", body.CursorKey[0].Disabled, body.CursorKey[1].Disabled)
+	}
+}
+
+func TestGetCursorKeysReportsRequestCounters(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	authID, _ := synthesizer.NewStableIDGenerator().Next("cursor:apikey", "crsr_a", "")
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:         authID,
+		Provider:   "cursor",
+		Attributes: map[string]string{"api_key": "crsr_a"},
+	}); err != nil {
+		t.Fatalf("register cursor auth: %v", err)
+	}
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: authID, Provider: "cursor", Success: true})
+	manager.MarkResult(context.Background(), coreauth.Result{AuthID: authID, Provider: "cursor", Success: false})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		CursorKey: []config.CursorKey{{APIKey: "crsr_a"}, {APIKey: "crsr_unused"}},
+	}, manager)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/cursor-api-key", nil)
+
+	h.GetCursorKeys(c)
+
+	var body struct {
+		CursorKey []struct {
+			APIKey         string                         `json:"api-key"`
+			Success        int64                          `json:"success"`
+			Failed         int64                          `json:"failed"`
+			RecentRequests []coreauth.RecentRequestBucket `json:"recent_requests"`
+		} `json:"cursor-api-key"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.CursorKey) != 2 {
+		t.Fatalf("cursor keys len = %d, want 2: %s", len(body.CursorKey), rec.Body.String())
+	}
+	used := body.CursorKey[0]
+	if used.Success != 1 || used.Failed != 1 {
+		t.Fatalf("counters = %d/%d, want 1/1: %s", used.Success, used.Failed, rec.Body.String())
+	}
+	bucketSuccess, bucketFailed := sumRecentRequestBuckets(used.RecentRequests)
+	if bucketSuccess != 1 || bucketFailed != 1 {
+		t.Fatalf("recent buckets = %d/%d, want 1/1: %s", bucketSuccess, bucketFailed, rec.Body.String())
+	}
+	unused := body.CursorKey[1]
+	if unused.Success != 0 || unused.Failed != 0 || len(unused.RecentRequests) != 0 {
+		t.Fatalf("key without a live auth reported usage: %s", rec.Body.String())
 	}
 }
 

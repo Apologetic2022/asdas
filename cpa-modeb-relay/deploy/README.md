@@ -44,6 +44,8 @@ sudo PORT=8318 SERVICE_NAME=cliproxyapi-2 CONFIG_DIR=/etc/cliproxyapi-2 \
 
 打开 `http://<host>:8317/management.html`，用管理密钥登录后，点左上角的「管理 Cursor API Key」按钮，在弹出的对话框里「新增 Key」。上游面板本身没有 Cursor 分区，这个按钮由本 fork 在下发页面时注入，走的还是下面那套管理 API。列表里的 Key 会掩码显示，编辑时留空即保留原值；「停用」写入 `disabled: true`，凭据留在配置里但不再参与调度。
 
+每个 Key 还会显示调用次数、成功与失败次数、最近一次错误，以及近 200 分钟每 10 分钟一格的调用趋势，和面板给 OAuth 凭据看的那套一致。计数来自内存里的凭据状态，服务重启后归零；对话框打开期间每 15 秒自动刷新。停用的 Key 不参与调度，也就没有计数。
+
 **命令行**
 
 ```bash
@@ -61,7 +63,7 @@ curl -X PUT http://127.0.0.1:8317/v0/management/cursor-api-key \
   -d '[{"api-key":"crsr_...","prefix":"cursor"}]'
 ```
 
-同一路由还支持 `GET` 查看、`POST` 追加单个 Key（不用回传已有列表）、`PATCH` 按 `index` 增量更新、`DELETE` 删除。
+同一路由还支持 `GET` 查看、`POST` 追加单个 Key（不用回传已有列表）、`PATCH` 按 `index` 增量更新、`DELETE` 删除。`GET` 返回的每条记录里带 `success`、`failed`、`recent_requests` 和 `status_message`，也就是面板画出来的那份调用统计。
 
 **TUI**
 
