@@ -304,7 +304,10 @@ nonstream-keepalive-interval: 0
 # Cursor API keys
 # Paste the Cursor user API key (crsr_...) issued by the Cursor dashboard. The relay exchanges
 # it for short-lived Agent Connect JWTs at runtime, so no browser login is required.
-# The same list is exposed over the management API at /v0/management/cursor-api-key.
+# Three ways to fill the key in without editing this block by hand:
+#   * run the binary with --cursor-api-key "crsr_..." to append it here
+#   * the TUI (--tui) API Keys tab: press [s] until "Cursor API Keys" is focused, then [a]
+#   * the management API at /v0/management/cursor-api-key (GET/PUT/PATCH/DELETE)
 # For OAuth credentials instead, run the binary with --cursor-login and keep the JSON in the auth dir.
 # cursor-api-key:
 #   - api-key: "crsr_..."          # required: Cursor user API key
