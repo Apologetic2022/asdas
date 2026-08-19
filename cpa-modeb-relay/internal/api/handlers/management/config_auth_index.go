@@ -20,6 +20,8 @@ type claudeKeyWithAuthIndex struct {
 
 type cursorKeyWithAuthIndex struct {
 	config.CursorKey
+	// Index is the position in cursor-api-key, which PATCH and DELETE address entries by.
+	Index     int    `json:"index"`
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
@@ -193,6 +195,7 @@ func (h *Handler) cursorKeysWithAuthIndex() []cursorKeyWithAuthIndex {
 		}
 		out[i] = cursorKeyWithAuthIndex{
 			CursorKey: entry,
+			Index:     i,
 			AuthIndex: authIndex,
 		}
 	}

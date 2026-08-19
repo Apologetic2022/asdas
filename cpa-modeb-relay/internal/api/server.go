@@ -5,6 +5,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
@@ -774,6 +775,7 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/cursor-api-key", s.mgmt.GetCursorKeys)
 		mgmt.PUT("/cursor-api-key", s.mgmt.PutCursorKeys)
+		mgmt.POST("/cursor-api-key", s.mgmt.PostCursorKeys)
 		mgmt.PATCH("/cursor-api-key", s.mgmt.PatchCursorKey)
 		mgmt.DELETE("/cursor-api-key", s.mgmt.DeleteCursorKey)
 
@@ -956,7 +958,13 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
-	c.File(filePath)
+	content, modTime, err := managementasset.ControlPanelContent(filePath)
+	if err != nil {
+		log.WithError(err).Error("failed to read management control panel asset")
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+	http.ServeContent(c.Writer, c.Request, managementasset.ManagementFileName, modTime, bytes.NewReader(content))
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {

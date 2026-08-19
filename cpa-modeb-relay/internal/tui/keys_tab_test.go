@@ -80,24 +80,18 @@ func TestKeysTabNavigatesCursorSection(t *testing.T) {
 	}
 }
 
-func TestAddCursorKeyAppendsToExistingEntries(t *testing.T) {
-	var received []map[string]any
+func TestAddCursorKeyPostsOnlyTheNewEntry(t *testing.T) {
+	var received map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"cursor-api-key": []map[string]any{
-					{"api-key": "crsr_existing", "auth-index": "cursor-1"},
-				},
-			})
-		case http.MethodPut:
-			if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
-				t.Errorf("decode put body: %v", err)
-			}
-			w.WriteHeader(http.StatusOK)
-		default:
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST so existing keys are never resent", r.Method)
 			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
 		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode post body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
@@ -107,13 +101,7 @@ func TestAddCursorKeyAppendsToExistingEntries(t *testing.T) {
 	if err := client.AddCursorKey("crsr_new"); err != nil {
 		t.Fatalf("AddCursorKey: %v", err)
 	}
-	if len(received) != 2 {
-		t.Fatalf("sent %d entries, want 2: %+v", len(received), received)
-	}
-	if _, ok := received[0]["auth-index"]; ok {
-		t.Fatalf("auth-index was echoed back to the server: %+v", received[0])
-	}
-	if received[0]["api-key"] != "crsr_existing" || received[1]["api-key"] != "crsr_new" {
-		t.Fatalf("unexpected entries: %+v", received)
+	if received["api-key"] != "crsr_new" {
+		t.Fatalf("unexpected body: %+v", received)
 	}
 }

@@ -623,6 +623,44 @@ func (h *Handler) PutCursorKeys(c *gin.Context) {
 	h.persistLocked(c)
 }
 
+// PostCursorKeys appends entries without requiring the caller to resend the
+// existing list, so a client that only holds masked keys can still add one.
+func (h *Handler) PostCursorKeys(c *gin.Context) {
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	var arr []config.CursorKey
+	if err = json.Unmarshal(data, &arr); err != nil {
+		var single config.CursorKey
+		if err2 := json.Unmarshal(data, &single); err2 != nil {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+		arr = []config.CursorKey{single}
+	}
+	added := make([]config.CursorKey, 0, len(arr))
+	for i := range arr {
+		normalizeCursorKey(&arr[i])
+		if arr[i].APIKey == "" {
+			c.JSON(400, gin.H{"error": "api-key is required"})
+			return
+		}
+		added = append(added, arr[i])
+	}
+	if len(added) == 0 {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.CursorKey = append(h.cfg.CursorKey, added...)
+	h.cfg.SanitizeCursorKeys()
+	h.persistLocked(c)
+}
+
 func (h *Handler) PatchCursorKey(c *gin.Context) {
 	type cursorKeyPatch struct {
 		APIKey         *string   `json:"api-key"`
@@ -632,6 +670,7 @@ func (h *Handler) PatchCursorKey(c *gin.Context) {
 		ProxyURL       *string   `json:"proxy-url"`
 		ExcludedModels *[]string `json:"excluded-models"`
 		DisableCooling *bool     `json:"disable-cooling"`
+		Disabled       *bool     `json:"disabled"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -684,6 +723,9 @@ func (h *Handler) PatchCursorKey(c *gin.Context) {
 	}
 	if body.Value.DisableCooling != nil {
 		entry.DisableCooling = *body.Value.DisableCooling
+	}
+	if body.Value.Disabled != nil {
+		entry.Disabled = *body.Value.Disabled
 	}
 	normalizeCursorKey(&entry)
 	h.cfg.CursorKey[targetIndex] = entry

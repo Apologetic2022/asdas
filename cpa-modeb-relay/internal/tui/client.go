@@ -80,6 +80,17 @@ func (c *Client) put(path string, body io.Reader) ([]byte, error) {
 	return data, nil
 }
 
+func (c *Client) post(path string, body io.Reader) ([]byte, error) {
+	data, code, err := c.doRequest("POST", path, body)
+	if err != nil {
+		return nil, err
+	}
+	if code >= 400 {
+		return nil, fmt.Errorf("HTTP %d: %s", code, strings.TrimSpace(string(data)))
+	}
+	return data, nil
+}
+
 func (c *Client) patch(path string, body io.Reader) ([]byte, error) {
 	data, code, err := c.doRequest("PATCH", path, body)
 	if err != nil {
@@ -313,20 +324,11 @@ func (c *Client) GetCursorKeys() ([]map[string]any, error) {
 
 // AddCursorKey appends a Cursor API key, keeping the existing entries intact.
 func (c *Client) AddCursorKey(apiKey string) error {
-	existing, err := c.GetCursorKeys()
+	body, err := json.Marshal(map[string]any{"api-key": apiKey})
 	if err != nil {
 		return err
 	}
-	entries := make([]map[string]any, 0, len(existing)+1)
-	for _, entry := range existing {
-		entries = append(entries, stripAuthIndex(entry))
-	}
-	entries = append(entries, map[string]any{"api-key": apiKey})
-	body, err := json.Marshal(entries)
-	if err != nil {
-		return err
-	}
-	_, err = c.put("/v0/management/cursor-api-key", strings.NewReader(string(body)))
+	_, err = c.post("/v0/management/cursor-api-key", strings.NewReader(string(body)))
 	return err
 }
 
@@ -353,18 +355,6 @@ func (c *Client) DeleteCursorKey(index int) error {
 		return fmt.Errorf("delete failed (HTTP %d)", code)
 	}
 	return nil
-}
-
-// stripAuthIndex drops the read-only auth-index field so a list can be sent back unchanged.
-func stripAuthIndex(entry map[string]any) map[string]any {
-	out := make(map[string]any, len(entry))
-	for k, v := range entry {
-		if k == "auth-index" {
-			continue
-		}
-		out[k] = v
-	}
-	return out
 }
 
 // GetVertexKeys fetches Vertex API keys.

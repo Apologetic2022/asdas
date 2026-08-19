@@ -70,6 +70,110 @@ func TestGetCursorKeysReturnsEntries(t *testing.T) {
 	}
 }
 
+func TestGetCursorKeysReportsPosition(t *testing.T) {
+	h := &Handler{cfg: &config.Config{
+		CursorKey: []config.CursorKey{{APIKey: "crsr_a"}, {APIKey: "crsr_b", Disabled: true}},
+	}}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/cursor-api-key", nil)
+
+	h.GetCursorKeys(c)
+
+	var body struct {
+		CursorKey []struct {
+			Index    int  `json:"index"`
+			Disabled bool `json:"disabled"`
+		} `json:"cursor-api-key"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.CursorKey) != 2 {
+		t.Fatalf("cursor keys len = %d, want 2: %s", len(body.CursorKey), rec.Body.String())
+	}
+	if body.CursorKey[0].Index != 0 || body.CursorKey[1].Index != 1 {
+		t.Fatalf("indexes = %d,%d, want 0,1", body.CursorKey[0].Index, body.CursorKey[1].Index)
+	}
+	if body.CursorKey[0].Disabled || !body.CursorKey[1].Disabled {
+		t.Fatalf("disabled flags = %v,%v, want false,true", body.CursorKey[0].Disabled, body.CursorKey[1].Disabled)
+	}
+}
+
+func TestPostCursorKeysAppendsWithoutResendingList(t *testing.T) {
+	h := &Handler{
+		cfg:            &config.Config{CursorKey: []config.CursorKey{{APIKey: "crsr_existing"}}},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/cursor-api-key",
+		strings.NewReader(`{"api-key":"  crsr_new  ","prefix":"cursor"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PostCursorKeys(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := len(h.cfg.CursorKey); got != 2 {
+		t.Fatalf("cursor keys len = %d, want 2", got)
+	}
+	if got := h.cfg.CursorKey[0].APIKey; got != "crsr_existing" {
+		t.Fatalf("existing key = %q, want %q", got, "crsr_existing")
+	}
+	if got := h.cfg.CursorKey[1].APIKey; got != "crsr_new" {
+		t.Fatalf("added key = %q, want %q", got, "crsr_new")
+	}
+}
+
+func TestPostCursorKeysRejectsMissingKey(t *testing.T) {
+	h := &Handler{cfg: &config.Config{}, configFilePath: writeTestConfigFile(t)}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/cursor-api-key",
+		strings.NewReader(`{"prefix":"cursor"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PostCursorKeys(c)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if got := len(h.cfg.CursorKey); got != 0 {
+		t.Fatalf("cursor keys len = %d, want 0", got)
+	}
+}
+
+func TestPatchCursorKeyTogglesDisabledKeepingKey(t *testing.T) {
+	h := &Handler{
+		cfg:            &config.Config{CursorKey: []config.CursorKey{{APIKey: "crsr_a"}}},
+		configFilePath: writeTestConfigFile(t),
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/cursor-api-key",
+		strings.NewReader(`{"index":0,"value":{"disabled":true}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	h.PatchCursorKey(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	entry := h.cfg.CursorKey[0]
+	if !entry.Disabled {
+		t.Fatal("disabled = false, want true")
+	}
+	if entry.APIKey != "crsr_a" {
+		t.Fatalf("api-key = %q, want it left untouched", entry.APIKey)
+	}
+}
+
 func TestPatchCursorKeyUpdatesMatchedEntry(t *testing.T) {
 	h := &Handler{
 		cfg: &config.Config{
