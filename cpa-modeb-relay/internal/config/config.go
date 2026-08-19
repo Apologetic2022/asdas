@@ -846,6 +846,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
 
+	// Sanitize Cursor keys: drop entries without an API key
+	cfg.SanitizeCursorKeys()
+
 	// Sanitize OpenAI compatibility providers: drop entries without base-url
 	cfg.SanitizeOpenAICompatibility()
 
@@ -1047,6 +1050,34 @@ func (cfg *Config) SanitizeCodexKeys() {
 		out = append(out, e)
 	}
 	cfg.CodexKey = out
+}
+
+// SanitizeCursorKeys drops Cursor API key entries without a key and normalizes
+// the remaining ones, deduplicating by key and base URL.
+func (cfg *Config) SanitizeCursorKeys() {
+	if cfg == nil || len(cfg.CursorKey) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(cfg.CursorKey))
+	out := make([]CursorKey, 0, len(cfg.CursorKey))
+	for i := range cfg.CursorKey {
+		entry := cfg.CursorKey[i]
+		entry.APIKey = strings.TrimSpace(entry.APIKey)
+		if entry.APIKey == "" {
+			continue
+		}
+		entry.Prefix = normalizeModelPrefix(entry.Prefix)
+		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
+		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		uniqueKey := entry.APIKey + "|" + entry.BaseURL
+		if _, exists := seen[uniqueKey]; exists {
+			continue
+		}
+		seen[uniqueKey] = struct{}{}
+		out = append(out, entry)
+	}
+	cfg.CursorKey = out
 }
 
 // SanitizeClaudeKeys normalizes headers for Claude credentials.

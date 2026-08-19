@@ -301,6 +301,22 @@ nonstream-keepalive-interval: 0
 #     experimental-cch-signing: false # optional: default is false; when true, sign the final /v1/messages body using the current Claude Code cch algorithm
 #                                     # keep this disabled unless you explicitly need the behavior, so upstream seed changes fall back to legacy proxy behavior
 
+# Cursor API keys
+# Paste the Cursor user API key (crsr_...) issued by the Cursor dashboard. The relay exchanges
+# it for short-lived Agent Connect JWTs at runtime, so no browser login is required.
+# The same list is exposed over the management API at /v0/management/cursor-api-key.
+# For OAuth credentials instead, run the binary with --cursor-login and keep the JSON in the auth dir.
+# cursor-api-key:
+#   - api-key: "crsr_..."          # required: Cursor user API key
+#     priority: 0                  # optional: selection preference when several credentials match
+#     prefix: "cursor"             # optional: require calls like "cursor/claude-opus-4.5" to target this credential
+#     base-url: "https://api2.cursor.sh" # optional: override the Cursor API endpoint
+#     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#     # proxy-url: "direct"        # optional: explicit direct connect for this credential
+#     excluded-models:
+#       - "gpt-5.1"                # exclude specific models (exact match, wildcards allowed)
+#     disable-cooling: false       # optional: per-auth override for auth/model cooldown scheduling
+
 # Default headers for Claude API requests. Update when Claude Code releases new versions.
 # In legacy mode, user-agent/package-version/runtime-version/timeout are used as fallbacks
 # when the client omits them, while OS/arch remain runtime-derived. When
