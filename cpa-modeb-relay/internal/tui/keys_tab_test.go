@@ -46,6 +46,23 @@ func TestKeysTabRendersCursorSection(t *testing.T) {
 	}
 }
 
+func TestKeysTabRendersCursorKeyUsage(t *testing.T) {
+	m := newKeysTabForTest(nil)
+	m.cursorKeys = []map[string]any{
+		{"api-key": "crsr_abcdefghijklmnop", "success": float64(12), "failed": float64(3)},
+		{"api-key": "crsr_qrstuvwxyz012345"},
+	}
+
+	content := m.renderContent()
+
+	if !strings.Contains(content, "[12 ✓ / 3 ✗]") {
+		t.Fatalf("cursor key usage missing from keys tab:\n%s", content)
+	}
+	if strings.Contains(content, "[0 ✓ / 0 ✗]") {
+		t.Fatalf("unused cursor key rendered empty counters:\n%s", content)
+	}
+}
+
 func TestKeysTabAddTargetsFocusedSection(t *testing.T) {
 	m := newKeysTabForTest(nil)
 

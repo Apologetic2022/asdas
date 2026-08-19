@@ -415,6 +415,9 @@ func (m keysTabModel) renderContent() string {
 		if baseURL := getString(entry, "base-url"); baseURL != "" {
 			info += " → " + baseURL
 		}
+		if usage := formatKeyUsage(entry); usage != "" {
+			info += " " + usage
+		}
 		m.renderInteractiveRow(&sb, keysSectionCursor, i, info, apiKey)
 	}
 	m.renderAddInput(&sb, keysSectionCursor)
@@ -524,6 +527,17 @@ func renderProviderKeys(sb *strings.Builder, title string, keys []map[string]any
 		sb.WriteString(fmt.Sprintf("  %d. %s\n", i+1, info))
 	}
 	sb.WriteString("\n")
+}
+
+// formatKeyUsage renders the request counters a key list entry carries, and
+// nothing at all for a credential that has not served a request yet.
+func formatKeyUsage(entry map[string]any) string {
+	success := int64(getFloat(entry, "success"))
+	failed := int64(getFloat(entry, "failed"))
+	if success+failed == 0 {
+		return ""
+	}
+	return fmt.Sprintf("[%d ✓ / %d ✗]", success, failed)
 }
 
 func maskKey(key string) string {
