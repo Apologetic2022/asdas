@@ -2,6 +2,7 @@ package cursor
 
 import (
 	"context"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -514,6 +515,67 @@ func CatalogToModelInfos(models []CatalogModel) []*registry.ModelInfo {
 			info.SupportedInputModalities = []string{"TEXT"}
 		}
 		out = append(out, info)
+		// Also register the Anthropic-style alias (claude-4.6-sonnet) so
+		// clients that use that naming — e.g. Cursor's Task subagent probes —
+		// route to this provider instead of failing with unknown provider.
+		if alias := ClientAliasForModelID(id); alias != "" {
+			if _, ok := seen[strings.ToLower(alias)]; !ok {
+				seen[strings.ToLower(alias)] = struct{}{}
+				aliasInfo := *info
+				aliasInfo.ID = alias
+				aliasInfo.Name = alias
+				out = append(out, &aliasInfo)
+			}
+		}
 	}
 	return out
+}
+
+// AppendClientAliases appends Anthropic-style alias entries for claude models
+// to a registry model list (used for the builtin fallback catalog).
+func AppendClientAliases(models []*registry.ModelInfo) []*registry.ModelInfo {
+	seen := make(map[string]struct{}, len(models))
+	for _, m := range models {
+		if m != nil {
+			seen[strings.ToLower(m.ID)] = struct{}{}
+		}
+	}
+	out := models
+	for _, m := range models {
+		if m == nil {
+			continue
+		}
+		alias := ClientAliasForModelID(m.ID)
+		if alias == "" {
+			continue
+		}
+		if _, ok := seen[strings.ToLower(alias)]; ok {
+			continue
+		}
+		seen[strings.ToLower(alias)] = struct{}{}
+		aliasInfo := *m
+		aliasInfo.ID = alias
+		aliasInfo.Name = alias
+		out = append(out, &aliasInfo)
+	}
+	return out
+}
+
+// claudeCatalogIDRe matches Cursor catalog claude ids (claude-sonnet-4-6,
+// claude-opus-4-5-thinking, claude-sonnet-4).
+var claudeCatalogIDRe = regexp.MustCompile(`^claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?(-.+)?$`)
+
+// ClientAliasForModelID returns the Anthropic-style alias for a Cursor claude
+// catalog id (claude-sonnet-4-6 -> claude-4.6-sonnet), or "" when the id has
+// no such alias form.
+func ClientAliasForModelID(id string) string {
+	m := claudeCatalogIDRe.FindStringSubmatch(strings.ToLower(strings.TrimSpace(id)))
+	if m == nil {
+		return ""
+	}
+	version := m[2]
+	if m[3] != "" {
+		version += "." + m[3]
+	}
+	return "claude-" + version + "-" + m[1] + m[4]
 }

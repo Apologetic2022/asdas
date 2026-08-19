@@ -14,6 +14,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
+	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -2052,7 +2053,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		if fetched := s.fetchCursorModelsForAuth(ctx, a); len(fetched) > 0 {
 			models = fetched
 		} else {
-			models = registry.GetCursorModels()
+			models = cursorlib.AppendClientAliases(registry.GetCursorModels())
 		}
 		models = applyExcludedModels(models, excluded)
 	default:

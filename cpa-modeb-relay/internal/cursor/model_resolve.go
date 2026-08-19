@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"regexp"
 	"strings"
 
 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
@@ -31,6 +32,31 @@ var cursorSuffixTokens = map[string]struct{}{
 	"max":      {},
 }
 
+// claudeClientAliasRe matches Anthropic-style client names such as
+// claude-4.6-sonnet, claude-4-sonnet or claude-4.5-haiku-thinking; the Cursor
+// catalog names the same models claude-sonnet-4-6 / claude-sonnet-4 /
+// claude-haiku-4-5-thinking. Cursor's own client (e.g. its Task subagent
+// probes) sends the Anthropic-style form, so both must resolve.
+var claudeClientAliasRe = regexp.MustCompile(`^claude-(\d+)(?:[.-](\d+))?-(opus|sonnet|haiku)(?:-(.+))?$`)
+
+// CanonicalizeModelID maps Anthropic-style claude aliases onto the Cursor
+// catalog id form. Any other id passes through unchanged.
+func CanonicalizeModelID(id string) string {
+	trimmed := strings.TrimSpace(id)
+	m := claudeClientAliasRe.FindStringSubmatch(strings.ToLower(trimmed))
+	if m == nil {
+		return trimmed
+	}
+	out := "claude-" + m[3] + "-" + m[1]
+	if m[2] != "" {
+		out += "-" + m[2]
+	}
+	if m[4] != "" {
+		out += "-" + m[4]
+	}
+	return out
+}
+
 // ResolveRequestedModel maps a public/legacy Cursor model slug onto the base
 // model id plus RequestedModel.parameters, matching cursor2api 3.7.12 behavior:
 //
@@ -38,7 +64,7 @@ var cursorSuffixTokens = map[string]struct{}{
 //   - Desktop default prefers thinking=true when no variant suffix is given
 //   - Hyphen suffixes are resolved into exact parameter id/value pairs
 func ResolveRequestedModel(requested string) ModelSelection {
-	requested = strings.TrimSpace(requested)
+	requested = CanonicalizeModelID(requested)
 	if requested == "" {
 		requested = "default"
 	}

@@ -4,11 +4,12 @@ import "testing"
 
 func TestResolveRequestedModelUsesCatalogParams(t *testing.T) {
 	RememberCatalog([]CatalogModel{{
-		ID:         "claude-4.6-sonnet",
+		ID:         "claude-sonnet-4-6",
 		Parameters: []ModelParameter{{ID: "thinking", Value: "true"}},
 	}})
+	// The Anthropic-style client alias must resolve onto the catalog id.
 	sel := ResolveRequestedModel("claude-4.6-sonnet")
-	if sel.PublicID != "claude-4.6-sonnet" {
+	if sel.PublicID != "claude-sonnet-4-6" {
 		t.Fatalf("public id = %q", sel.PublicID)
 	}
 	if len(sel.Parameters) != 1 || sel.Parameters[0].ID != "thinking" || sel.Parameters[0].Value != "true" {
@@ -40,7 +41,7 @@ func TestResolveRequestedModelDefaultSelector(t *testing.T) {
 
 func TestResolveRequestedModelSuffix(t *testing.T) {
 	sel := ResolveRequestedModel("claude-4.6-sonnet-thinking-xhigh")
-	if sel.ModelID != "claude-4.6-sonnet" {
+	if sel.ModelID != "claude-sonnet-4-6" {
 		t.Fatalf("base model = %q", sel.ModelID)
 	}
 	got := map[string]string{}
@@ -66,5 +67,54 @@ func TestBuildRunRequestSendsParameters(t *testing.T) {
 	}
 	if len(req.GetParameters()) == 0 || req.GetParameters()[0].GetId() != "thinking" {
 		t.Fatalf("expected thinking parameter, got %#v", req.GetParameters())
+	}
+}
+
+func TestCanonicalizeModelID(t *testing.T) {
+	cases := map[string]string{
+		"claude-4.6-sonnet":          "claude-sonnet-4-6",
+		"claude-4-6-sonnet":          "claude-sonnet-4-6",
+		"claude-4-sonnet":            "claude-sonnet-4",
+		"claude-4.5-haiku":           "claude-haiku-4-5",
+		"claude-5-opus":              "claude-opus-5",
+		"claude-4.5-sonnet-thinking": "claude-sonnet-4-5-thinking",
+		"claude-sonnet-4-6":          "claude-sonnet-4-6",
+		"grok-4.6":                   "grok-4.6",
+		"gpt-5.2":                    "gpt-5.2",
+		"claude-fable-5":             "claude-fable-5",
+	}
+	for in, want := range cases {
+		if got := CanonicalizeModelID(in); got != want {
+			t.Errorf("CanonicalizeModelID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestClientAliasForModelID(t *testing.T) {
+	cases := map[string]string{
+		"claude-sonnet-4-6":          "claude-4.6-sonnet",
+		"claude-sonnet-4":            "claude-4-sonnet",
+		"claude-haiku-4-5":           "claude-4.5-haiku",
+		"claude-opus-5":              "claude-5-opus",
+		"claude-sonnet-4-5-thinking": "claude-4.5-sonnet-thinking",
+		"claude-fable-5":             "",
+		"grok-4.6":                   "",
+		"default":                    "",
+	}
+	for in, want := range cases {
+		if got := ClientAliasForModelID(in); got != want {
+			t.Errorf("ClientAliasForModelID(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestResolveRequestedModelCanonicalizesClaudeAlias(t *testing.T) {
+	sel := ResolveRequestedModel("claude-4.6-sonnet")
+	if sel.PublicID != "claude-sonnet-4-6" {
+		t.Fatalf("PublicID = %q, want claude-sonnet-4-6", sel.PublicID)
+	}
+	selThinking := ResolveRequestedModel("claude-4.5-sonnet-thinking")
+	if selThinking.PublicID != "claude-sonnet-4-5" {
+		t.Fatalf("thinking alias PublicID = %q, want claude-sonnet-4-5", selThinking.PublicID)
 	}
 }
