@@ -26,40 +26,9 @@ message ConversationAction {
   }
 }
 
-message AssistantMessage {
-  string text = 1;
-}
-
-message ThinkingMessage {
-  string text = 1;
-  uint32 duration_ms = 2;
-}
-
-message ConversationStep {
-  oneof message {
-    AssistantMessage assistant_message = 1;
-    ToolCall tool_call = 2;
-    ThinkingMessage thinking_message = 3;
-  }
-}
-
-// Blob-addressed form of AgentConversationTurn: user_message and each step are
-// KV blob ids holding the serialized message.
-message AgentConversationTurnStructure {
-  bytes user_message = 1;
-  repeated bytes steps = 2;
-  optional string request_id = 3;
-}
-
-message ConversationTurnStructure {
-  oneof turn {
-    AgentConversationTurnStructure agent_conversation_turn = 1;
-  }
-}
-
 message ConversationStateStructure {
   repeated bytes root_prompt_messages_json = 1;
-  repeated bytes turns = 8;
+  repeated bytes turns = 2;
 }
 
 message ModelDetails {
@@ -179,20 +148,8 @@ message McpResult {
   }
 }
 
-// Result shape carried by a completed tool call inside conversation history.
-// Distinct from McpResult, which the exec channel uses for live submissions.
-message McpToolResult {
-  oneof result {
-    McpSuccess success = 1;
-    McpError error = 2;
-    McpRejected rejected = 3;
-  }
-}
-
 message McpToolCall {
   McpArgs args = 1;
-  McpToolResult result = 2;
-  optional string description = 3;
 }
 
 message ToolCall {

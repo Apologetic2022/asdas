@@ -255,11 +255,88 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		actionText = resumeContinuationPrompt
 	}
 
-	// History goes into conversation turns, not extra root-prompt rows: only
-	// the turn list sits inside the region upstream covers with its prompt
-	// cache, so replaying history as root rows re-bills it every request.
-	turnIDs, systemRows := buildConversationTurns(blobStore, historyMsgs)
-	rootIDs := append([][]byte{systemBlob}, systemRows...)
+	// Track tool names so tool-result parts can include toolName (cursor2api).
+	toolNames := map[string]string{}
+	rootIDs := [][]byte{systemBlob}
+	for _, msg := range historyMsgs {
+		switch msg.Role {
+		case "user":
+			if strings.TrimSpace(msg.Content) == "" {
+				continue
+			}
+			rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "text", "text": msg.Content},
+				},
+			})))
+		case "assistant":
+			if strings.TrimSpace(msg.Content) == "" && len(msg.ToolCalls) == 0 {
+				continue
+			}
+			content := make([]map[string]any, 0, 1+len(msg.ToolCalls))
+			if strings.TrimSpace(msg.Content) != "" {
+				content = append(content, map[string]any{
+					"type": "text",
+					"text": msg.Content,
+				})
+			}
+			for _, tc := range msg.ToolCalls {
+				if strings.TrimSpace(tc.ID) != "" && strings.TrimSpace(tc.Name) != "" {
+					toolNames[tc.ID] = tc.Name
+				}
+				args := any(tc.Arguments)
+				if args == nil {
+					args = map[string]any{}
+				}
+				content = append(content, map[string]any{
+					"type":       "tool-call",
+					"toolCallId": tc.ID,
+					// History rows use the wire name the tool is advertised
+					// under so the model links past calls to a callable tool.
+					"toolName": wireToolName(tc.Name),
+					"args":     args,
+				})
+			}
+			if len(content) == 0 {
+				continue
+			}
+			rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
+				"role":    "assistant",
+				"content": content,
+			})))
+		case "tool":
+			if strings.TrimSpace(msg.ToolCallID) == "" {
+				continue
+			}
+			toolName := strings.TrimSpace(msg.Name)
+			if toolName == "" {
+				toolName = toolNames[msg.ToolCallID]
+			}
+			resultPart := map[string]any{
+				"type":       "tool-result",
+				"toolName":   wireToolName(toolName),
+				"toolCallId": msg.ToolCallID,
+				"result":     msg.Content,
+				"toolKind":   "mcp",
+			}
+			rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
+				"role": "tool",
+				"id":   msg.ToolCallID,
+				"content": []map[string]any{
+					resultPart,
+				},
+			})))
+		case "system":
+			if strings.TrimSpace(msg.Content) == "" {
+				continue
+			}
+			rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
+				"role":    "system",
+				"content": msg.Content,
+			})))
+		}
+	}
 
 	if directive := toolChoiceDirective(choice); directive != "" {
 		rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
@@ -318,7 +395,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 	}
 	run := &agentv1.AgentRunRequest{
 		ConversationId:             &conversationID,
-		ConversationState:          &agentv1.ConversationStateStructure{RootPromptMessagesJson: rootIDs, Turns: turnIDs},
+		ConversationState:          &agentv1.ConversationStateStructure{RootPromptMessagesJson: rootIDs},
 		ModelDetails:               details,
 		RequestedModel:             toRequestedModelProto(selection),
 		ClientSupportsInlineImages: &supportsImages,
@@ -327,7 +404,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 				UserMessageAction: &agentv1.UserMessageAction{
 					UserMessage: &agentv1.UserMessage{
 						Text:      actionText,
-						MessageId: stableMessageID(actionText),
+						MessageId: uuid.NewString(),
 					},
 				},
 			},

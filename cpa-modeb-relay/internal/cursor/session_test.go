@@ -1,16 +1,10 @@
 package cursor
 
 import (
-	"bytes"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
-	"sort"
 	"strings"
 	"testing"
-
-	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 func TestExtractToolResultsTrailingOnly(t *testing.T) {
@@ -49,51 +43,7 @@ func TestBuildRunRequestIncludesMcpTools(t *testing.T) {
 	}
 }
 
-// decodedTurn is a conversation turn resolved back out of the blob store.
-type decodedTurn struct {
-	userText string
-	steps    []*agentv1.ConversationStep
-}
-
-// decodeTurns walks ConversationState.turns and resolves every blob reference
-// so tests can assert on the history the server will actually see.
-func decodeTurns(t *testing.T, msg *agentv1.AgentClientMessage, blobs map[string][]byte) []decodedTurn {
-	t.Helper()
-	fetch := func(id []byte) []byte {
-		data, ok := blobs[hex.EncodeToString(id)]
-		if !ok {
-			t.Fatalf("blob %x referenced but not stored", id)
-		}
-		return data
-	}
-	var out []decodedTurn
-	for _, turnID := range msg.GetRunRequest().GetConversationState().GetTurns() {
-		var structure agentv1.ConversationTurnStructure
-		if err := proto.Unmarshal(fetch(turnID), &structure); err != nil {
-			t.Fatalf("decode turn: %v", err)
-		}
-		agentTurn := structure.GetAgentConversationTurn()
-		if agentTurn == nil {
-			t.Fatal("turn is not an agent conversation turn")
-		}
-		var user agentv1.UserMessage
-		if err := proto.Unmarshal(fetch(agentTurn.GetUserMessage()), &user); err != nil {
-			t.Fatalf("decode turn user message: %v", err)
-		}
-		decoded := decodedTurn{userText: user.GetText()}
-		for _, stepID := range agentTurn.GetSteps() {
-			var step agentv1.ConversationStep
-			if err := proto.Unmarshal(fetch(stepID), &step); err != nil {
-				t.Fatalf("decode step: %v", err)
-			}
-			decoded.steps = append(decoded.steps, &step)
-		}
-		out = append(out, decoded)
-	}
-	return out
-}
-
-func TestBuildRunRequestHistoryUsesConversationTurns(t *testing.T) {
+func TestBuildRunRequestNativeToolJSON(t *testing.T) {
 	msg, blobs, _, err := buildRunRequest("default", []ChatMessage{
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "thinking", ToolCalls: []ToolCall{
@@ -108,44 +58,42 @@ func TestBuildRunRequestHistoryUsesConversationTurns(t *testing.T) {
 	if msg.GetRunRequest() == nil {
 		t.Fatal("missing run request")
 	}
-
-	turns := decodeTurns(t, msg, blobs)
-	if len(turns) != 1 {
-		t.Fatalf("expected the completed turn only, got %d", len(turns))
+	var sawToolCall, sawToolResult bool
+	for _, data := range blobs {
+		var payload map[string]any
+		if err := json.Unmarshal(data, &payload); err != nil {
+			continue
+		}
+		role, _ := payload["role"].(string)
+		content, _ := payload["content"].([]any)
+		switch role {
+		case "assistant":
+			for _, part := range content {
+				m, _ := part.(map[string]any)
+				if m["type"] == "tool-call" && m["toolCallId"] == "c1" {
+					sawToolCall = true
+				}
+			}
+			if _, ok := payload["tool_calls"]; ok {
+				t.Fatalf("expected Cursor-native tool-call parts, not OpenAI tool_calls: %#v", payload)
+			}
+		case "tool":
+			if payload["id"] != "c1" {
+				continue
+			}
+			for _, part := range content {
+				m, _ := part.(map[string]any)
+				if m["type"] == "tool-result" && m["toolCallId"] == "c1" {
+					sawToolResult = true
+				}
+			}
+			if _, ok := payload["tool_call_id"]; ok {
+				t.Fatalf("expected Cursor-native tool id/content, not tool_call_id: %#v", payload)
+			}
+		}
 	}
-	if turns[0].userText != "hi" {
-		t.Fatalf("turn user text = %q", turns[0].userText)
-	}
-	if len(turns[0].steps) != 2 {
-		t.Fatalf("expected assistant text + tool call steps, got %d", len(turns[0].steps))
-	}
-	if got := turns[0].steps[0].GetAssistantMessage().GetText(); got != "thinking" {
-		t.Fatalf("assistant step text = %q", got)
-	}
-	call := turns[0].steps[1].GetToolCall()
-	if call.GetToolCallId() != "c1" {
-		t.Fatalf("tool call id = %q", call.GetToolCallId())
-	}
-	mcp := call.GetMcpToolCall()
-	if mcp.GetArgs().GetToolName() != "get_weather" {
-		t.Fatalf("tool name = %q", mcp.GetArgs().GetToolName())
-	}
-	if city := mcp.GetArgs().GetArgs()["city"].GetStringValue(); city != "NY" {
-		t.Fatalf("tool args city = %q", city)
-	}
-	content := mcp.GetResult().GetSuccess().GetContent()
-	if len(content) != 1 || content[0].GetText().GetText() != `{"ok":true}` {
-		t.Fatalf("tool result not carried inline: %#v", content)
-	}
-
-	// The in-flight message drives the action rather than becoming a turn.
-	if action := msg.GetRunRequest().GetAction().GetUserMessageAction().GetUserMessage().GetText(); action != "again" {
-		t.Fatalf("action text = %q", action)
-	}
-	// History must not be duplicated into the root prompt; only system rows
-	// belong there, and re-sending it would double the billed prompt.
-	if roots := msg.GetRunRequest().GetConversationState().GetRootPromptMessagesJson(); len(roots) != 1 {
-		t.Fatalf("expected only the base system row in the root prompt, got %d", len(roots))
+	if !sawToolCall || !sawToolResult {
+		t.Fatalf("native tool history missing call=%v result=%v", sawToolCall, sawToolResult)
 	}
 }
 
@@ -164,82 +112,18 @@ func TestBuildRunRequestResumeCarriesTrailingToolResults(t *testing.T) {
 	if action != resumeContinuationPrompt {
 		t.Fatalf("expected continuation prompt action, got %q", action)
 	}
-	turns := decodeTurns(t, msg, blobs)
-	if len(turns) != 1 {
-		t.Fatalf("expected one replayed turn, got %d", len(turns))
-	}
-	if len(turns[0].steps) != 1 {
-		t.Fatalf("expected the tool call step, got %d", len(turns[0].steps))
-	}
-	result := turns[0].steps[0].GetToolCall().GetMcpToolCall().GetResult().GetSuccess().GetContent()
-	if len(result) != 1 || result[0].GetText().GetText() != `{"temp":21}` {
-		t.Fatalf("trailing tool result missing from rebuilt history: %#v", result)
-	}
-}
-
-func TestBuildConversationTurnsSplitsOnUserMessages(t *testing.T) {
-	blobs := map[string][]byte{}
-	turns, systemRows := buildConversationTurns(blobs, []ChatMessage{
-		{Role: "system", Content: "be terse"},
-		{Role: "user", Content: "one"},
-		{Role: "assistant", Content: "first"},
-		{Role: "user", Content: "two"},
-		{Role: "assistant", Content: "second"},
-	})
-	if len(turns) != 2 {
-		t.Fatalf("expected one turn per user message, got %d", len(turns))
-	}
-	if len(systemRows) != 1 {
-		t.Fatalf("system rows stay in the root prompt, got %d", len(systemRows))
-	}
-}
-
-func TestBuildRunRequestIsByteStable(t *testing.T) {
-	// Blob ids are content hashes, so any per-request nondeterminism (protobuf
-	// map ordering, generated ids) moves the whole history off the cached
-	// prefix and re-bills the transcript.
-	history := []ChatMessage{
-		{Role: "system", Content: "be terse"},
-		{Role: "user", Content: "weather in NY?"},
-		{Role: "assistant", Content: "checking", ToolCalls: []ToolCall{{
-			ID:   "c1",
-			Name: "get_weather",
-			Arguments: map[string]any{
-				"city": "NY", "units": "metric", "days": 3.0,
-				"detail": "full", "lang": "en", "extra": "x",
-			},
-		}}},
-		{Role: "tool", ToolCallID: "c1", Name: "get_weather", Content: `{"temp":21}`},
-		{Role: "user", Content: "and tomorrow?"},
-	}
-	var first []byte
-	for i := 0; i < 8; i++ {
-		msg, blobs, _, err := buildRunRequest("default", history, nil, ToolChoice{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		// The conversation state and every blob it resolves to make up the
-		// prompt; the surrounding request metadata does not.
-		encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(msg.GetRunRequest().GetConversationState())
-		if err != nil {
-			t.Fatal(err)
-		}
-		keys := make([]string, 0, len(blobs))
-		for key := range blobs {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			encoded = append(encoded, key...)
-			encoded = append(encoded, blobs[key]...)
-		}
-		if i == 0 {
-			first = encoded
+	sawResult := false
+	for _, data := range blobs {
+		var payload map[string]any
+		if json.Unmarshal(data, &payload) != nil {
 			continue
 		}
-		if !bytes.Equal(first, encoded) {
-			t.Fatalf("prompt content differs between builds on attempt %d", i+1)
+		if payload["role"] == "tool" && payload["id"] == "c9" {
+			sawResult = true
 		}
+	}
+	if !sawResult {
+		t.Fatal("trailing tool result missing from rebuilt history")
 	}
 }
 
