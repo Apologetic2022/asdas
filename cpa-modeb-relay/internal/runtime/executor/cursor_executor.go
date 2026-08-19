@@ -138,7 +138,17 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	result, err := cursorlib.RunChat(ctx, creds, upstreamModel, messages, tools, sessOpts)
 	if err != nil {
-		return resp, err
+		fallback := cursorlib.AutoSwitchModelFromError(err)
+		if fallback == "" || ctx.Err() != nil {
+			return resp, err
+		}
+		// Upstream hit the per-model usage limit and named a switch target;
+		// mirror the official client and rerun on that model.
+		log.Warnf("cursor: model %s usage-limited; retrying with upstream-suggested %s", upstreamModel, fallback)
+		result, err = cursorlib.RunChat(ctx, creds, fallback, messages, tools, sessOpts)
+		if err != nil {
+			return resp, err
+		}
 	}
 	if sessOpts.ToolChoice.ForcesToolCall() && len(result.ToolCalls) == 0 && ctx.Err() == nil {
 		// The directive is advisory; a run that ignored it gets one retry
@@ -356,6 +366,21 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				session = rebuilt
 				finishReason = "stop"
 				errIter = iterate()
+			}
+		}
+		if errIter != nil && !contentEmitted && ctx.Err() == nil {
+			if fallback := cursorlib.AutoSwitchModelFromError(errIter); fallback != "" {
+				// Per-model usage limit: rerun on the upstream-suggested model,
+				// matching the official client's silent switch.
+				log.Warnf("cursor: model %s usage-limited on stream; retrying with upstream-suggested %s", upstreamModel, fallback)
+				_ = session.Close()
+				if retry, errRetry := cursorlib.StartSession(ctx, creds, fallback, messages, tools, sessOpts); errRetry == nil {
+					session = retry
+					buffered = nil
+					buffering = sessOpts.ToolChoice.ForcesToolCall()
+					finishReason = "stop"
+					errIter = iterate()
+				}
 			}
 		}
 		if errIter == nil && sessOpts.ToolChoice.ForcesToolCall() && toolIndex == 0 && ctx.Err() == nil {

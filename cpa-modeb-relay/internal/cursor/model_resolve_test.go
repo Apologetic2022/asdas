@@ -1,6 +1,9 @@
 package cursor
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestResolveRequestedModelUsesCatalogParams(t *testing.T) {
 	RememberCatalog([]CatalogModel{{
@@ -116,5 +119,18 @@ func TestResolveRequestedModelCanonicalizesClaudeAlias(t *testing.T) {
 	selThinking := ResolveRequestedModel("claude-4.5-sonnet-thinking")
 	if selThinking.PublicID != "claude-sonnet-4-5" {
 		t.Fatalf("thinking alias PublicID = %q, want claude-sonnet-4-5", selThinking.PublicID)
+	}
+}
+
+func TestAutoSwitchModelFromError(t *testing.T) {
+	err := fmt.Errorf(`cursor connect end-stream error: {"code":"resource_exhausted","message":"Error","details":[{"debug":{"error":"ERROR_RATE_LIMITED_CHANGEABLE","details":{"additionalInfo":{"autoSwitchToModel":"grok-4.6"}}}}]}`)
+	if got := AutoSwitchModelFromError(err); got != "grok-4.6" {
+		t.Fatalf("AutoSwitchModelFromError = %q, want grok-4.6", got)
+	}
+	if got := AutoSwitchModelFromError(fmt.Errorf("dial tcp: i/o timeout")); got != "" {
+		t.Fatalf("unrelated error should yield empty, got %q", got)
+	}
+	if got := AutoSwitchModelFromError(nil); got != "" {
+		t.Fatalf("nil error should yield empty, got %q", got)
 	}
 }

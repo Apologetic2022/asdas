@@ -39,6 +39,29 @@ var cursorSuffixTokens = map[string]struct{}{
 // probes) sends the Anthropic-style form, so both must resolve.
 var claudeClientAliasRe = regexp.MustCompile(`^claude-(\d+)(?:[.-](\d+))?-(opus|sonnet|haiku)(?:-(.+))?$`)
 
+// autoSwitchModelRe extracts the upstream-suggested fallback model from a
+// resource_exhausted run error payload.
+var autoSwitchModelRe = regexp.MustCompile(`"autoSwitchToModel"\s*:\s*"([^"]+)"`)
+
+// AutoSwitchModelFromError returns the model Cursor upstream suggests
+// switching to when a run is rejected with ERROR_RATE_LIMITED_CHANGEABLE
+// ("Other Models usage limit reached"), or "" when the error is unrelated.
+// The official Cursor client silently switches to that model; the gateway
+// mirrors this so per-model usage limits do not surface as hard failures.
+func AutoSwitchModelFromError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "resource_exhausted") && !strings.Contains(msg, "RATE_LIMITED") {
+		return ""
+	}
+	if m := autoSwitchModelRe.FindStringSubmatch(msg); m != nil {
+		return strings.TrimSpace(m[1])
+	}
+	return ""
+}
+
 // CanonicalizeModelID maps Anthropic-style claude aliases onto the Cursor
 // catalog id form. Any other id passes through unchanged.
 func CanonicalizeModelID(id string) string {
