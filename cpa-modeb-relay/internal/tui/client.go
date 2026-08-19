@@ -306,6 +306,67 @@ func (c *Client) GetCodexKeys() ([]map[string]any, error) {
 	return c.getWrappedKeyList("/v0/management/codex-api-key", "codex-api-key")
 }
 
+// GetCursorKeys fetches Cursor API keys.
+func (c *Client) GetCursorKeys() ([]map[string]any, error) {
+	return c.getWrappedKeyList("/v0/management/cursor-api-key", "cursor-api-key")
+}
+
+// AddCursorKey appends a Cursor API key, keeping the existing entries intact.
+func (c *Client) AddCursorKey(apiKey string) error {
+	existing, err := c.GetCursorKeys()
+	if err != nil {
+		return err
+	}
+	entries := make([]map[string]any, 0, len(existing)+1)
+	for _, entry := range existing {
+		entries = append(entries, stripAuthIndex(entry))
+	}
+	entries = append(entries, map[string]any{"api-key": apiKey})
+	body, err := json.Marshal(entries)
+	if err != nil {
+		return err
+	}
+	_, err = c.put("/v0/management/cursor-api-key", strings.NewReader(string(body)))
+	return err
+}
+
+// EditCursorKey replaces the Cursor API key stored at the given index.
+func (c *Client) EditCursorKey(index int, apiKey string) error {
+	body, err := json.Marshal(map[string]any{
+		"index": index,
+		"value": map[string]any{"api-key": apiKey},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = c.patch("/v0/management/cursor-api-key", strings.NewReader(string(body)))
+	return err
+}
+
+// DeleteCursorKey removes the Cursor API key stored at the given index.
+func (c *Client) DeleteCursorKey(index int) error {
+	_, code, err := c.doRequest("DELETE", fmt.Sprintf("/v0/management/cursor-api-key?index=%d", index), nil)
+	if err != nil {
+		return err
+	}
+	if code >= 400 {
+		return fmt.Errorf("delete failed (HTTP %d)", code)
+	}
+	return nil
+}
+
+// stripAuthIndex drops the read-only auth-index field so a list can be sent back unchanged.
+func stripAuthIndex(entry map[string]any) map[string]any {
+	out := make(map[string]any, len(entry))
+	for k, v := range entry {
+		if k == "auth-index" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // GetVertexKeys fetches Vertex API keys.
 func (c *Client) GetVertexKeys() ([]map[string]any, error) {
 	return c.getWrappedKeyList("/v0/management/vertex-api-key", "vertex-api-key")

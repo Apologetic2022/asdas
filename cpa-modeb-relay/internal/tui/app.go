@@ -206,15 +206,19 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		typing := a.activeTabIsTyping()
 		switch msg.String() {
 		case "ctrl+c":
 			return a, tea.Quit
 		case "q":
 			// Only quit if not in logs tab (where 'q' might be useful)
-			if !a.logsEnabled || a.activeTab != tabLogs {
+			if !typing && (!a.logsEnabled || a.activeTab != tabLogs) {
 				return a, tea.Quit
 			}
 		case "L":
+			if typing {
+				break
+			}
 			ToggleLocale()
 			a.refreshTabs()
 			return a.broadcastToAllTabs(localeChangedMsg{})
@@ -275,6 +279,22 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // localeChangedMsg is broadcast to all tabs when the user toggles locale.
 type localeChangedMsg struct{}
+
+// activeTabIsTyping reports whether the active tab has a focused text input, so
+// single-letter global shortcuts do not swallow characters typed into a field.
+func (a *App) activeTabIsTyping() bool {
+	switch a.activeTab {
+	case tabConfig:
+		return a.config.editing
+	case tabAuthFiles:
+		return a.auth.editing
+	case tabAPIKeys:
+		return a.keys.editing || a.keys.adding
+	case tabOAuth:
+		return a.oauth.inputActive
+	}
+	return false
+}
 
 func (a *App) refreshTabs() {
 	names := TabNames()

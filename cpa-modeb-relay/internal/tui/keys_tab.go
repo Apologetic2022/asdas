@@ -11,6 +11,13 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// Interactive sections of the keys tab, cycled with Tab.
+const (
+	keysSectionAccess = iota
+	keysSectionCursor
+	keysSectionCount
+)
+
 // keysTabModel displays and manages API keys.
 type keysTabModel struct {
 	client       *Client
@@ -20,21 +27,26 @@ type keysTabModel struct {
 	interactions []map[string]any
 	claude       []map[string]any
 	codex        []map[string]any
+	cursorKeys   []map[string]any
 	vertex       []map[string]any
 	openai       []map[string]any
 	err          error
 	width        int
 	height       int
 	ready        bool
+	section      int
 	cursor       int
+	cursorKeyIdx int
 	confirm      int // -1 = no deletion pending
+	confirmSect  int
 	status       string
 
 	// Editing / Adding
-	editing   bool
-	adding    bool
-	editIdx   int
-	editInput textinput.Model
+	editing     bool
+	adding      bool
+	editIdx     int
+	editSection int
+	editInput   textinput.Model
 }
 
 type keysDataMsg struct {
@@ -43,6 +55,7 @@ type keysDataMsg struct {
 	interactions []map[string]any
 	claude       []map[string]any
 	codex        []map[string]any
+	cursorKeys   []map[string]any
 	vertex       []map[string]any
 	openai       []map[string]any
 	err          error
@@ -80,6 +93,7 @@ func (m keysTabModel) fetchKeys() tea.Msg {
 	result.interactions, _ = m.client.GetInteractionsKeys()
 	result.claude, _ = m.client.GetClaudeKeys()
 	result.codex, _ = m.client.GetCodexKeys()
+	result.cursorKeys, _ = m.client.GetCursorKeys()
 	result.vertex, _ = m.client.GetVertexKeys()
 	result.openai, _ = m.client.GetOpenAICompat()
 	return result
@@ -100,10 +114,14 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 			m.interactions = msg.interactions
 			m.claude = msg.claude
 			m.codex = msg.codex
+			m.cursorKeys = msg.cursorKeys
 			m.vertex = msg.vertex
 			m.openai = msg.openai
 			if m.cursor >= len(m.keys) {
 				m.cursor = max(0, len(m.keys)-1)
+			}
+			if m.cursorKeyIdx >= len(m.cursorKeys) {
+				m.cursorKeyIdx = max(0, len(m.cursorKeys)-1)
 			}
 		}
 		m.viewport.SetContent(m.renderContent())
@@ -134,12 +152,18 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 				}
 				isAdding := m.adding
 				editIdx := m.editIdx
+				editSection := m.editSection
 				m.editing = false
 				m.adding = false
 				m.editInput.Blur()
 				if isAdding {
 					return m, func() tea.Msg {
-						err := m.client.AddAPIKey(value)
+						var err error
+						if editSection == keysSectionCursor {
+							err = m.client.AddCursorKey(value)
+						} else {
+							err = m.client.AddAPIKey(value)
+						}
 						if err != nil {
 							return keyActionMsg{err: err}
 						}
@@ -147,7 +171,12 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 					}
 				}
 				return m, func() tea.Msg {
-					err := m.client.EditAPIKey(editIdx, value)
+					var err error
+					if editSection == keysSectionCursor {
+						err = m.client.EditCursorKey(editIdx, value)
+					} else {
+						err = m.client.EditAPIKey(editIdx, value)
+					}
 					if err != nil {
 						return keyActionMsg{err: err}
 					}
@@ -172,9 +201,15 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 			switch msg.String() {
 			case "y", "Y":
 				idx := m.confirm
+				confirmSect := m.confirmSect
 				m.confirm = -1
 				return m, func() tea.Msg {
-					err := m.client.DeleteAPIKey(idx)
+					var err error
+					if confirmSect == keysSectionCursor {
+						err = m.client.DeleteCursorKey(idx)
+					} else {
+						err = m.client.DeleteAPIKey(idx)
+					}
 					if err != nil {
 						return keyActionMsg{err: err}
 					}
@@ -190,15 +225,21 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 
 		// ---- Normal mode ----
 		switch msg.String() {
+		case "s", "S":
+			// Move focus to the next interactive section
+			m.section = (m.section + 1) % keysSectionCount
+			m.confirm = -1
+			m.viewport.SetContent(m.renderContent())
+			return m, nil
 		case "j", "down":
-			if len(m.keys) > 0 {
-				m.cursor = (m.cursor + 1) % len(m.keys)
+			if n := m.focusedLen(); n > 0 {
+				m.setFocusedIdx((m.focusedIdx() + 1) % n)
 				m.viewport.SetContent(m.renderContent())
 			}
 			return m, nil
 		case "k", "up":
-			if len(m.keys) > 0 {
-				m.cursor = (m.cursor - 1 + len(m.keys)) % len(m.keys)
+			if n := m.focusedLen(); n > 0 {
+				m.setFocusedIdx((m.focusedIdx() - 1 + n) % n)
 				m.viewport.SetContent(m.renderContent())
 			}
 			return m, nil
@@ -206,18 +247,23 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 			// Add new key
 			m.adding = true
 			m.editing = false
+			m.editSection = m.section
 			m.editInput.SetValue("")
 			m.editInput.Prompt = T("new_key_prompt")
+			if m.section == keysSectionCursor {
+				m.editInput.Prompt = T("new_cursor_key_prompt")
+			}
 			m.editInput.Focus()
 			m.viewport.SetContent(m.renderContent())
 			return m, textinput.Blink
 		case "e":
 			// Edit selected key
-			if m.cursor < len(m.keys) {
+			if m.focusedIdx() < m.focusedLen() {
 				m.editing = true
 				m.adding = false
-				m.editIdx = m.cursor
-				m.editInput.SetValue(m.keys[m.cursor])
+				m.editIdx = m.focusedIdx()
+				m.editSection = m.section
+				m.editInput.SetValue(m.focusedKey())
 				m.editInput.Prompt = T("edit_key_prompt")
 				m.editInput.Focus()
 				m.viewport.SetContent(m.renderContent())
@@ -226,15 +272,16 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 			return m, nil
 		case "d":
 			// Delete selected key
-			if m.cursor < len(m.keys) {
-				m.confirm = m.cursor
+			if m.focusedIdx() < m.focusedLen() {
+				m.confirm = m.focusedIdx()
+				m.confirmSect = m.section
 				m.viewport.SetContent(m.renderContent())
 			}
 			return m, nil
 		case "c":
 			// Copy selected key to clipboard
-			if m.cursor < len(m.keys) {
-				key := m.keys[m.cursor]
+			if m.focusedIdx() < m.focusedLen() {
+				key := m.focusedKey()
 				if err := clipboard.WriteAll(key); err != nil {
 					m.status = errorStyle.Render(T("copy_failed") + ": " + err.Error())
 				} else {
@@ -256,6 +303,45 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
 	return m, cmd
+}
+
+// focusedLen returns the number of rows in the focused section.
+func (m keysTabModel) focusedLen() int {
+	if m.section == keysSectionCursor {
+		return len(m.cursorKeys)
+	}
+	return len(m.keys)
+}
+
+// focusedIdx returns the selected row index within the focused section.
+func (m keysTabModel) focusedIdx() int {
+	if m.section == keysSectionCursor {
+		return m.cursorKeyIdx
+	}
+	return m.cursor
+}
+
+func (m *keysTabModel) setFocusedIdx(idx int) {
+	if m.section == keysSectionCursor {
+		m.cursorKeyIdx = idx
+		return
+	}
+	m.cursor = idx
+}
+
+// focusedKey returns the raw key value of the selected row, or "" when empty.
+func (m keysTabModel) focusedKey() string {
+	idx := m.focusedIdx()
+	if m.section == keysSectionCursor {
+		if idx < len(m.cursorKeys) {
+			return getString(m.cursorKeys[idx], "api-key")
+		}
+		return ""
+	}
+	if idx < len(m.keys) {
+		return m.keys[idx]
+	}
+	return ""
 }
 
 func (m *keysTabModel) SetSize(w, h int) {
@@ -296,7 +382,7 @@ func (m keysTabModel) renderContent() string {
 	}
 
 	// ━━━ Access API Keys (interactive) ━━━
-	sb.WriteString(tableHeaderStyle.Render(fmt.Sprintf("  %s (%d)", T("access_keys"), len(m.keys))))
+	sb.WriteString(tableHeaderStyle.Render(m.sectionHeader(keysSectionAccess, T("access_keys"), len(m.keys))))
 	sb.WriteString("\n")
 
 	if len(m.keys) == 0 {
@@ -305,40 +391,33 @@ func (m keysTabModel) renderContent() string {
 	}
 
 	for i, key := range m.keys {
-		cursor := "  "
-		rowStyle := lipgloss.NewStyle()
-		if i == m.cursor {
-			cursor = "▸ "
-			rowStyle = lipgloss.NewStyle().Bold(true)
-		}
+		m.renderInteractiveRow(&sb, keysSectionAccess, i, maskKey(key), key)
+	}
+	m.renderAddInput(&sb, keysSectionAccess)
 
-		row := fmt.Sprintf("%s%d. %s", cursor, i+1, maskKey(key))
-		sb.WriteString(rowStyle.Render(row))
+	sb.WriteString("\n")
+
+	// ━━━ Cursor API Keys (interactive) ━━━
+	sb.WriteString(tableHeaderStyle.Render(m.sectionHeader(keysSectionCursor, T("cursor_keys"), len(m.cursorKeys))))
+	sb.WriteString("\n")
+
+	if len(m.cursorKeys) == 0 {
+		sb.WriteString(subtitleStyle.Render(T("no_cursor_keys")))
 		sb.WriteString("\n")
-
-		// Delete confirmation
-		if m.confirm == i {
-			sb.WriteString(warningStyle.Render(fmt.Sprintf("    "+T("confirm_delete_key"), maskKey(key))))
-			sb.WriteString("\n")
-		}
-
-		// Edit input
-		if m.editing && m.editIdx == i {
-			sb.WriteString(m.editInput.View())
-			sb.WriteString("\n")
-			sb.WriteString(helpStyle.Render(T("enter_save_esc")))
-			sb.WriteString("\n")
-		}
 	}
 
-	// Add input
-	if m.adding {
-		sb.WriteString("\n")
-		sb.WriteString(m.editInput.View())
-		sb.WriteString("\n")
-		sb.WriteString(helpStyle.Render(T("enter_add")))
-		sb.WriteString("\n")
+	for i, entry := range m.cursorKeys {
+		apiKey := getString(entry, "api-key")
+		info := maskKey(apiKey)
+		if prefix := getString(entry, "prefix"); prefix != "" {
+			info += " (prefix: " + prefix + ")"
+		}
+		if baseURL := getString(entry, "base-url"); baseURL != "" {
+			info += " → " + baseURL
+		}
+		m.renderInteractiveRow(&sb, keysSectionCursor, i, info, apiKey)
 	}
+	m.renderAddInput(&sb, keysSectionCursor)
 
 	sb.WriteString("\n")
 
@@ -373,6 +452,51 @@ func (m keysTabModel) renderContent() string {
 	}
 
 	return sb.String()
+}
+
+// sectionHeader marks the section that currently owns the selection.
+func (m keysTabModel) sectionHeader(section int, title string, count int) string {
+	marker := "  "
+	if m.section == section {
+		marker = "▌ "
+	}
+	return fmt.Sprintf("%s%s (%d)", marker, title, count)
+}
+
+// renderInteractiveRow draws one selectable row plus its inline delete/edit prompts.
+func (m keysTabModel) renderInteractiveRow(sb *strings.Builder, section, idx int, display, raw string) {
+	pointer := "  "
+	rowStyle := lipgloss.NewStyle()
+	if m.section == section && m.focusedIdx() == idx {
+		pointer = "▸ "
+		rowStyle = lipgloss.NewStyle().Bold(true)
+	}
+	sb.WriteString(rowStyle.Render(fmt.Sprintf("%s%d. %s", pointer, idx+1, display)))
+	sb.WriteString("\n")
+
+	if m.confirm == idx && m.confirmSect == section {
+		sb.WriteString(warningStyle.Render(fmt.Sprintf("    "+T("confirm_delete_key"), maskKey(raw))))
+		sb.WriteString("\n")
+	}
+
+	if m.editing && m.editSection == section && m.editIdx == idx {
+		sb.WriteString(m.editInput.View())
+		sb.WriteString("\n")
+		sb.WriteString(helpStyle.Render(T("enter_save_esc")))
+		sb.WriteString("\n")
+	}
+}
+
+// renderAddInput draws the "new key" prompt when it belongs to the given section.
+func (m keysTabModel) renderAddInput(sb *strings.Builder, section int) {
+	if !m.adding || m.editSection != section {
+		return
+	}
+	sb.WriteString("\n")
+	sb.WriteString(m.editInput.View())
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render(T("enter_add")))
+	sb.WriteString("\n")
 }
 
 func renderSection(sb *strings.Builder, title string, count int) {
