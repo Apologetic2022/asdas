@@ -200,7 +200,10 @@ for d in (d1, d2, d3):
     ud = d.get("usage", {})
     cts.append(((ud.get("prompt_tokens", 0)), (ud.get("prompt_tokens_details") or {}).get("cached_tokens", 0)))
 show("D1 turn2 cache hit (cached_tokens>0)", cts[1][1] > 0, f"turn1={cts[0]} turn2={cts[1]} turn3={cts[2]} (prompt,cached)")
-show("D2 turn3 cache hit sustained", cts[2][1] > 0 and cts[2][1] >= cts[1][1], f"turn2_cached={cts[1][1]} turn3_cached={cts[2][1]}")
+# Only assert the cache is still live on turn 3, not that cached_tokens grew:
+# upstream reports cache hits in prefix blocks, and a longer/shorter turn-2 reply
+# shifts the cacheable prefix, so the count legitimately moves in either direction.
+show("D2 turn3 cache hit sustained", cts[2][1] > 0, f"turn2_cached={cts[1][1]} turn3_cached={cts[2][1]}")
 show("D3 all turns usage sane", all(usage_sane(d.get("usage", {})) for d in (d1, d2, d3)),
      f"usages={[d.get('usage', {}).get('prompt_tokens') for d in (d1, d2, d3)]}")
 
