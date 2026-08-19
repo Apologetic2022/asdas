@@ -38,7 +38,11 @@ sudo PORT=8318 SERVICE_NAME=cliproxyapi-2 CONFIG_DIR=/etc/cliproxyapi-2 \
 
 ## 配置 Cursor 凭据
 
-拿到 Cursor 控制台签发的 `crsr_...` User API Key 后，三种方式任选其一，效果相同（都会写进 `config.yaml` 的 `cursor-api-key` 块，服务监听到文件变化后热重载，不需要重启）：
+拿到 Cursor 控制台签发的 `crsr_...` User API Key 后，四种方式任选其一，效果相同（都会写进 `config.yaml` 的 `cursor-api-key` 块，服务监听到文件变化后热重载，不需要重启）：
+
+**Web 控制面板**
+
+打开 `http://<host>:8317/management.html`，用管理密钥登录后，点左上角的「管理 Cursor API Key」按钮，在弹出的对话框里「新增 Key」。上游面板本身没有 Cursor 分区，这个按钮由本 fork 在下发页面时注入，走的还是下面那套管理 API。列表里的 Key 会掩码显示，编辑时留空即保留原值；「停用」写入 `disabled: true`，凭据留在配置里但不再参与调度。
 
 **命令行**
 
@@ -57,7 +61,7 @@ curl -X PUT http://127.0.0.1:8317/v0/management/cursor-api-key \
   -d '[{"api-key":"crsr_...","prefix":"cursor"}]'
 ```
 
-同一路由还支持 `GET` 查看、`PATCH` 增量更新、`DELETE` 删除。
+同一路由还支持 `GET` 查看、`POST` 追加单个 Key（不用回传已有列表）、`PATCH` 按 `index` 增量更新、`DELETE` 删除。
 
 **TUI**
 
