@@ -129,7 +129,11 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, err
 	}
 	tools := extractTools(body)
-	sessOpts := cursorlib.SessionOptions{AuthID: authID(auth), ToolChoice: extractToolChoice(body)}
+	sessOpts := cursorlib.SessionOptions{
+		AuthID:       authID(auth),
+		ToolChoice:   extractToolChoice(body),
+		PromptTokens: cursorlib.EstimatePromptTokens(messages, tools),
+	}
 
 	creds, err := e.ensureCredentials(ctx, auth)
 	if err != nil {
@@ -160,22 +164,8 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			log.Warnf("cursor: retry did not satisfy tool_choice %s; returning text response", toolChoiceLabel(sessOpts.ToolChoice))
 		}
 	}
-	if result.InputTokens == 0 && result.OutputTokens == 0 {
-		// Upstream usage rides on TurnEnded, which does not exist yet when a
-		// segment pauses for client tools; estimate so usage is never zero.
-		result.InputTokens = estimateCursorPromptTokens(messages, tools)
-		result.OutputTokens = estimateCursorCompletionTokens(result)
-	}
-
 	outPayload := buildOpenAIChatCompletion(req.Model, result)
-	reporter.Publish(ctx, usage.Detail{
-		InputTokens:     result.InputTokens,
-		OutputTokens:    result.OutputTokens,
-		CachedTokens:    result.CacheReadTokens,
-		CacheReadTokens: result.CacheReadTokens,
-		ReasoningTokens: result.ReasoningTokens,
-		TotalTokens:     result.InputTokens + result.OutputTokens,
-	})
+	reporter.Publish(ctx, usageDetail(result.Tokens))
 
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, outPayload, &param)
@@ -206,7 +196,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 	tools := extractTools(body)
-	sessOpts := cursorlib.SessionOptions{AuthID: authID(auth), ToolChoice: extractToolChoice(body)}
+	sessOpts := cursorlib.SessionOptions{
+		AuthID:       authID(auth),
+		ToolChoice:   extractToolChoice(body),
+		PromptTokens: cursorlib.EstimatePromptTokens(messages, tools),
+	}
 
 	creds, err := e.ensureCredentials(ctx, auth)
 	if err != nil {
@@ -226,7 +220,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var param any
 		toolIndex := 0
 		finishReason := "stop"
-		var usageFinal cursorlib.StreamEvent
+		var segment cursorlib.TokenUsage
 
 		emitLine := func(line []byte) bool {
 			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, line, &param)
@@ -255,17 +249,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 
 		contentEmitted := false
-		outputChars := 0
 		emitEvent := func(ev cursorlib.StreamEvent) error {
 			var delta map[string]any
 			switch ev.Type {
 			case "text_delta":
 				contentEmitted = true
-				outputChars += len(ev.Text)
 				delta = map[string]any{"content": ev.Text}
 			case "thinking_delta":
 				contentEmitted = true
-				outputChars += len(ev.Text)
 				delta = map[string]any{"reasoning_content": ev.Text}
 			case "tool_call":
 				if ev.ToolCall == nil {
@@ -276,7 +267,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if args == nil {
 					args = []byte("{}")
 				}
-				outputChars += len(ev.ToolCall.Name) + len(args) + 16
 				delta = map[string]any{
 					"tool_calls": []map[string]any{
 						{
@@ -292,15 +282,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 				toolIndex++
 			case "usage_final":
-				usageFinal = ev
-				reporter.Publish(ctx, usage.Detail{
-					InputTokens:     ev.InputTokens,
-					OutputTokens:    ev.OutputTokens,
-					CachedTokens:    ev.CacheReadTokens,
-					CacheReadTokens: ev.CacheReadTokens,
-					ReasoningTokens: ev.ReasoningTokens,
-					TotalTokens:     ev.InputTokens + ev.OutputTokens,
-				})
+				// A segment can report more than once when a late TurnEnded
+				// for the previous one lands after a resume; the session
+				// already reduced each to its own slice of the run.
+				segment.InputTokens += ev.InputTokens
+				segment.OutputTokens += ev.OutputTokens
+				segment.CacheReadTokens += ev.CacheReadTokens
+				segment.CacheWriteTokens += ev.CacheWriteTokens
+				segment.ReasoningTokens += ev.ReasoningTokens
 				return nil
 			case "error":
 				return fmt.Errorf("%s", ev.Message)
@@ -438,27 +427,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if !emitLine([]byte("data: " + string(endChunk))) {
 			return
 		}
-		if usageFinal.Type != "usage_final" {
-			// The run is paused for client tools, so no TurnEnded usage exists
-			// yet; estimate so streaming clients still receive token counts.
-			usageFinal = cursorlib.StreamEvent{
-				Type:         "usage_final",
-				InputTokens:  estimateCursorPromptTokens(messages, tools),
-				OutputTokens: estimateTokensFromChars(outputChars),
-			}
-			reporter.Publish(ctx, usage.Detail{
-				InputTokens:  usageFinal.InputTokens,
-				OutputTokens: usageFinal.OutputTokens,
-				TotalTokens:  usageFinal.InputTokens + usageFinal.OutputTokens,
-			})
-		}
+		reporter.Publish(ctx, usageDetail(segment))
 		usageChunk, _ := json.Marshal(map[string]any{
 			"id":      completionID,
 			"object":  "chat.completion.chunk",
 			"created": created,
 			"model":   req.Model,
 			"choices": []map[string]any{},
-			"usage":   openAIUsagePayload(usageFinal.InputTokens, usageFinal.OutputTokens, usageFinal.CacheReadTokens, usageFinal.ReasoningTokens),
+			"usage":   openAIUsagePayload(segment),
 		})
 		if !emitLine([]byte("data: " + string(usageChunk))) {
 			return
@@ -482,7 +458,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, opts cursorlib.SessionOptions) (*cursorlib.Session, bool, error) {
 	results := cursorlib.TrailingToolResults(messages)
 	if len(results) > 0 {
-		session, err := cursorlib.ResumeSession(results)
+		session, err := cursorlib.ResumeSession(results, opts)
 		if err == nil {
 			return session, true, nil
 		}
@@ -548,68 +524,35 @@ func toolChoiceLabel(choice cursorlib.ToolChoice) string {
 	return fmt.Sprintf("%q", choice.Mode)
 }
 
-// estimateTokensFromChars approximates a token count from a character count
-// (~4 characters per token, the usual heuristic for latin-heavy prompts).
-func estimateTokensFromChars(chars int) int64 {
-	if chars <= 0 {
-		return 0
+// usageDetail renders a segment for the statistics store, which keeps the
+// disjoint Anthropic-style split that Cursor reports and totals it itself.
+func usageDetail(tokens cursorlib.TokenUsage) usage.Detail {
+	return usage.Detail{
+		InputTokens:         tokens.InputTokens,
+		OutputTokens:        tokens.OutputTokens,
+		CachedTokens:        tokens.CacheReadTokens,
+		CacheReadTokens:     tokens.CacheReadTokens,
+		CacheCreationTokens: tokens.CacheWriteTokens,
+		ReasoningTokens:     tokens.ReasoningTokens,
+		TotalTokens:         tokens.PromptTokens() + tokens.OutputTokens,
 	}
-	tokens := int64(chars / 4)
-	if tokens < 1 {
-		tokens = 1
-	}
-	return tokens
 }
 
-// estimateCursorPromptTokens approximates prompt tokens for a run whose
-// pre-tool segment ended before upstream TurnEnded usage exists.
-func estimateCursorPromptTokens(messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition) int64 {
-	chars := 0
-	for i := range messages {
-		chars += len(messages[i].Role) + len(messages[i].Content) + 8
-		for j := range messages[i].ToolCalls {
-			chars += len(messages[i].ToolCalls[j].Name) + 16
-			if b, err := json.Marshal(messages[i].ToolCalls[j].Arguments); err == nil {
-				chars += len(b)
-			}
-		}
-	}
-	for i := range tools {
-		chars += len(tools[i].Name) + len(tools[i].Description) + 16
-		if b, err := json.Marshal(tools[i].Parameters); err == nil {
-			chars += len(b)
-		}
-	}
-	tokens := estimateTokensFromChars(chars)
-	if tokens < 1 {
-		tokens = 1
-	}
-	return tokens
-}
-
-// estimateCursorCompletionTokens approximates completion tokens from the
-// collected segment output.
-func estimateCursorCompletionTokens(result *cursorlib.ChatResult) int64 {
-	chars := len(result.Text) + len(result.Thinking)
-	for i := range result.ToolCalls {
-		chars += len(result.ToolCalls[i].Name) + 16
-		if b, err := json.Marshal(result.ToolCalls[i].Arguments); err == nil {
-			chars += len(b)
-		}
-	}
-	return estimateTokensFromChars(chars)
-}
-
-func openAIUsagePayload(input, output, cacheRead, reasoning int64) map[string]any {
+// openAIUsagePayload renders a segment on the wire. OpenAI's prompt_tokens is
+// the whole prompt with cached_tokens a subset of it, so Cursor's disjoint
+// counters have to be summed; forwarding its input_tokens as prompt_tokens hid
+// the cached prefix entirely and let cached_tokens exceed the prompt.
+func openAIUsagePayload(tokens cursorlib.TokenUsage) map[string]any {
+	prompt := tokens.PromptTokens()
 	return map[string]any{
-		"prompt_tokens":     input,
-		"completion_tokens": output,
-		"total_tokens":      input + output,
+		"prompt_tokens":     prompt,
+		"completion_tokens": tokens.OutputTokens,
+		"total_tokens":      prompt + tokens.OutputTokens,
 		"prompt_tokens_details": map[string]any{
-			"cached_tokens": cacheRead,
+			"cached_tokens": tokens.CacheReadTokens,
 		},
 		"completion_tokens_details": map[string]any{
-			"reasoning_tokens": reasoning,
+			"reasoning_tokens": tokens.ReasoningTokens,
 		},
 	}
 }
@@ -883,7 +826,7 @@ func buildOpenAIChatCompletion(model string, result *cursorlib.ChatResult) []byt
 				"finish_reason": finish,
 			},
 		},
-		"usage": openAIUsagePayload(result.InputTokens, result.OutputTokens, result.CacheReadTokens, result.ReasoningTokens),
+		"usage": openAIUsagePayload(result.Tokens),
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {

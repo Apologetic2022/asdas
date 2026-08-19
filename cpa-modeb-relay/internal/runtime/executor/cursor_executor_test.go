@@ -50,3 +50,36 @@ func TestTrailingToolCallIDs(t *testing.T) {
 		t.Fatalf("plain request should have no trailing ids, got %#v", ids)
 	}
 }
+
+func TestOpenAIUsagePayloadCountsTheCachedPrefixInThePrompt(t *testing.T) {
+	tokens := cursorlib.TokenUsage{
+		InputTokens:      2000,
+		OutputTokens:     48,
+		CacheReadTokens:  130000,
+		CacheWriteTokens: 250,
+		ReasoningTokens:  16,
+	}
+
+	payload := openAIUsagePayload(tokens)
+	if got := payload["prompt_tokens"].(int64); got != 132250 {
+		t.Fatalf("prompt tokens = %d, want the fresh read plus both cached parts", got)
+	}
+	if got := payload["total_tokens"].(int64); got != 132298 {
+		t.Fatalf("total tokens = %d, want 132298", got)
+	}
+	details := payload["prompt_tokens_details"].(map[string]any)
+	if got := details["cached_tokens"].(int64); got != 130000 {
+		t.Fatalf("cached tokens = %d, want 130000", got)
+	}
+
+	detail := usageDetail(tokens)
+	if detail.InputTokens != 2000 {
+		t.Fatalf("detail input = %d, want only the fresh read", detail.InputTokens)
+	}
+	if detail.CacheReadTokens != 130000 || detail.CacheCreationTokens != 250 {
+		t.Fatalf("detail cache split = %d/%d, want 130000/250", detail.CacheReadTokens, detail.CacheCreationTokens)
+	}
+	if detail.TotalTokens != 132298 {
+		t.Fatalf("detail total = %d, want 132298", detail.TotalTokens)
+	}
+}

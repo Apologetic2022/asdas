@@ -67,6 +67,10 @@ type SessionOptions struct {
 	AuthID string
 	// ToolChoice is the OpenAI tool_choice constraint for the run.
 	ToolChoice ToolChoice
+	// PromptTokens is the caller's estimate of this request's prompt size.
+	// It is what a segment is billed from when it pauses for client tools,
+	// because Cursor withholds usage until the whole run ends.
+	PromptTokens int64
 }
 
 // Session is a live Agent Connect run that can pause for client tools.
@@ -98,21 +102,23 @@ type Session struct {
 	turnEndedSeen      bool
 	swallowTurnEnd     bool
 	contentSinceResume bool
+
+	usage         runUsage
+	promptTokens  int64
+	segmentBilled TokenUsage
+	outputChars   int
 }
 
 // ChatResult is the collected text response from one Agent segment / run.
 type ChatResult struct {
-	Text             string
-	Thinking         string
-	ToolCalls        []ToolCall
-	FinishReason     string
-	ConversationID   string
-	SessionID        string
-	InputTokens      int64
-	OutputTokens     int64
-	CacheReadTokens  int64
-	CacheWriteTokens int64
-	ReasoningTokens  int64
+	Text           string
+	Thinking       string
+	ToolCalls      []ToolCall
+	FinishReason   string
+	ConversationID string
+	SessionID      string
+	// Tokens is the usage attributable to this segment alone.
+	Tokens TokenUsage
 }
 
 // StartSession opens a new Agent run for the given messages/tools.
@@ -181,6 +187,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		cancel:         cancel,
 		lastActivity:   time.Now(),
 		manager:        DefaultSessionManager(),
+		promptTokens:   opts.PromptTokens,
 	}
 	session.manager.Register(session)
 	go session.heartbeatLoop(runCtx)
@@ -232,12 +239,52 @@ func (s *Session) touch() {
 	s.mu.Unlock()
 }
 
-// markContent records that the current segment produced model output; used to
-// distinguish a real TurnEnded from a stale pre-tool one after a resume.
-func (s *Session) markContent() {
+// markOutput records that the current segment produced model output; used to
+// distinguish a real TurnEnded from a stale pre-tool one after a resume, and
+// to size the segment's completion when Cursor reports no usage for it.
+func (s *Session) markOutput(chars int) {
 	s.mu.Lock()
 	s.contentSinceResume = true
+	s.outputChars += chars
 	s.mu.Unlock()
+}
+
+// setPromptTokens updates the run's prompt size for a resumed segment, whose
+// request carries the history grown by the previous segment's tool results.
+func (s *Session) setPromptTokens(promptTokens int64) {
+	if promptTokens <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.promptTokens = promptTokens
+	s.mu.Unlock()
+}
+
+// endSegment closes a segment, billing it from an estimate when Cursor
+// reported nothing for it (the run is still open, waiting on client tools).
+func (s *Session) endSegment(reason string) {
+	s.mu.Lock()
+	var segment TokenUsage
+	if s.segmentBilled.Empty() {
+		segment = s.usage.estimate(s.promptTokens, estimateTokensFromChars(s.outputChars))
+		s.segmentBilled.add(segment)
+	}
+	s.mu.Unlock()
+	if !segment.Empty() {
+		s.emit(usageEvent(segment))
+	}
+	s.emit(StreamEvent{Type: "segment_end", Reason: reason})
+}
+
+func usageEvent(u TokenUsage) StreamEvent {
+	return StreamEvent{
+		Type:             "usage_final",
+		InputTokens:      u.InputTokens,
+		OutputTokens:     u.OutputTokens,
+		CacheReadTokens:  u.CacheReadTokens,
+		CacheWriteTokens: u.CacheWriteTokens,
+		ReasoningTokens:  u.ReasoningTokens,
+	}
 }
 
 func (s *Session) heartbeatLoop(ctx context.Context) {
@@ -375,7 +422,7 @@ func (s *Session) readLoop(ctx context.Context) {
 			}
 		}
 		s.beginWaitingTools()
-		s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
+		s.endSegment("tool_calls")
 	}
 }
 
@@ -401,7 +448,7 @@ func (s *Session) processChunk(decoder *Decoder, chunk readChunk) (endForTools b
 						return false, true
 					}
 				}
-				s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
+				s.endSegment("stop")
 				_ = s.Close()
 				return false, true
 			}
@@ -421,7 +468,7 @@ func (s *Session) processChunk(decoder *Decoder, chunk readChunk) (endForTools b
 		}
 	}
 	if chunk.err == io.EOF {
-		s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
+		s.endSegment("stop")
 		_ = s.Close()
 		return false, true
 	}
@@ -516,11 +563,16 @@ func (s *Session) CollectSegment(ctx context.Context) (*ChatResult, error) {
 					result.ToolCalls = append(result.ToolCalls, *ev.ToolCall)
 				}
 			case "usage_final":
-				result.InputTokens = ev.InputTokens
-				result.OutputTokens = ev.OutputTokens
-				result.CacheReadTokens = ev.CacheReadTokens
-				result.CacheWriteTokens = ev.CacheWriteTokens
-				result.ReasoningTokens = ev.ReasoningTokens
+				// A segment can report more than once when a late TurnEnded
+				// for the previous one lands after a resume; the run ledger
+				// already reduced each to its own slice of the run.
+				result.Tokens.add(TokenUsage{
+					InputTokens:      ev.InputTokens,
+					OutputTokens:     ev.OutputTokens,
+					CacheReadTokens:  ev.CacheReadTokens,
+					CacheWriteTokens: ev.CacheWriteTokens,
+					ReasoningTokens:  ev.ReasoningTokens,
+				})
 			case "error":
 				return nil, fmt.Errorf("cursor: %s", ev.Message)
 			case "segment_end":
@@ -605,6 +657,8 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 	s.swallowTurnEnd = !s.turnEndedSeen
 	s.turnEndedSeen = false
 	s.contentSinceResume = false
+	s.segmentBilled = TokenUsage{}
+	s.outputChars = 0
 	s.mu.Unlock()
 	s.resumeReading()
 	return nil
@@ -673,27 +727,29 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 	case *agentv1.AgentServerMessage_InteractionUpdate:
 		switch u := m.InteractionUpdate.Message.(type) {
 		case *agentv1.InteractionUpdate_TextDelta:
-			s.markContent()
-			s.emit(StreamEvent{Type: "text_delta", Text: u.TextDelta.GetText()})
+			text := u.TextDelta.GetText()
+			s.markOutput(len(text))
+			s.emit(StreamEvent{Type: "text_delta", Text: text})
 		case *agentv1.InteractionUpdate_ThinkingDelta:
-			s.markContent()
-			s.emit(StreamEvent{Type: "thinking_delta", Text: u.ThinkingDelta.GetText()})
+			text := u.ThinkingDelta.GetText()
+			s.markOutput(len(text))
+			s.emit(StreamEvent{Type: "thinking_delta", Text: text})
 		case *agentv1.InteractionUpdate_TurnEnded:
-			ev := StreamEvent{Type: "usage_final"}
+			total := TokenUsage{}
 			if u.TurnEnded.InputTokens != nil {
-				ev.InputTokens = *u.TurnEnded.InputTokens
+				total.InputTokens = *u.TurnEnded.InputTokens
 			}
 			if u.TurnEnded.OutputTokens != nil {
-				ev.OutputTokens = *u.TurnEnded.OutputTokens
+				total.OutputTokens = *u.TurnEnded.OutputTokens
 			}
 			if u.TurnEnded.CacheReadTokens != nil {
-				ev.CacheReadTokens = *u.TurnEnded.CacheReadTokens
+				total.CacheReadTokens = *u.TurnEnded.CacheReadTokens
 			}
 			if u.TurnEnded.CacheWriteTokens != nil {
-				ev.CacheWriteTokens = *u.TurnEnded.CacheWriteTokens
+				total.CacheWriteTokens = *u.TurnEnded.CacheWriteTokens
 			}
 			if u.TurnEnded.ReasoningTokens != nil {
-				ev.ReasoningTokens = *u.TurnEnded.ReasoningTokens
+				total.ReasoningTokens = *u.TurnEnded.ReasoningTokens
 			}
 			s.mu.Lock()
 			pendingCount := len(s.pending)
@@ -703,6 +759,11 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			if pendingCount > 0 || waiting {
 				s.turnEndedSeen = true
 			}
+			// TurnEnded carries the run's cumulative counters, so only the
+			// part no estimate has already covered belongs to this segment.
+			segment := s.usage.upstream(total, s.promptTokens)
+			s.segmentBilled.add(segment)
+			ev := usageEvent(segment)
 			s.mu.Unlock()
 			if pendingCount > 0 || waiting {
 				// cursor2api: some transports emit turn_ended for the pre-tool
@@ -720,7 +781,7 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 				return false, nil
 			}
 			s.emit(ev)
-			s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
+			s.endSegment("stop")
 			go func() { _ = s.Close() }()
 		case *agentv1.InteractionUpdate_ToolCallStarted,
 			*agentv1.InteractionUpdate_PartialToolCall,
@@ -820,7 +881,7 @@ func (s *Session) handleMcpArgs(req *agentv1.ExecServerMessage, args *agentv1.Mc
 	if s.manager != nil {
 		s.manager.BindPending(callID, s)
 	}
-	s.markContent()
+	s.markOutput(toolCallChars(call))
 	s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
 	return true, nil
 }
@@ -968,7 +1029,7 @@ func buildMcpToolDefinitions(tools []ToolDefinition) []*agentv1.McpToolDefinitio
 // RunChat performs a text/tool Cursor Agent segment and returns the collected result.
 func RunChat(ctx context.Context, creds AccountCredentials, model string, messages []ChatMessage, tools []ToolDefinition, opts SessionOptions) (*ChatResult, error) {
 	if results := extractToolResults(messages); len(results) > 0 {
-		result, err := resumeWithToolResults(ctx, results)
+		result, err := resumeWithToolResults(ctx, results, opts)
 		if err == nil {
 			return result, nil
 		}
@@ -996,8 +1057,8 @@ func RunChat(ctx context.Context, creds AccountCredentials, model string, messag
 
 // resumeWithToolResults feeds trailing tool results into the live session that
 // requested them and collects the follow-up segment.
-func resumeWithToolResults(ctx context.Context, results []ToolResult) (*ChatResult, error) {
-	session, err := ResumeSession(results)
+func resumeWithToolResults(ctx context.Context, results []ToolResult, opts SessionOptions) (*ChatResult, error) {
+	session, err := ResumeSession(results, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1022,11 +1083,12 @@ func TrailingToolResults(messages []ChatMessage) []ToolResult {
 // and submits them so the run continues. Client-rewritten tool_call_ids are
 // normalized back to the upstream pending ids before submission. The session
 // is closed on submit failure so callers can rebuild a fresh run from history.
-func ResumeSession(results []ToolResult) (*Session, error) {
+func ResumeSession(results []ToolResult, opts SessionOptions) (*Session, error) {
 	session, normalized, err := DefaultSessionManager().ResolveForToolResults(results)
 	if err != nil {
 		return nil, err
 	}
+	session.setPromptTokens(opts.PromptTokens)
 	if err = session.SubmitToolResults(normalized); err != nil {
 		_ = session.Close()
 		return nil, err
