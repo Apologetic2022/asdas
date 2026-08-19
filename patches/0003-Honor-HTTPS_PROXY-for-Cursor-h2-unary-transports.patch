@@ -1,0 +1,172 @@
+From bc642b8eb17752536d32b72b5ffbccb081ea1353 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 04:53:04 +0000
+Subject: [PATCH 3/4] Honor HTTPS_PROXY for Cursor h2/unary transports
+
+The Agent Connect bidi stream and unary RPCs dialed upstream directly,
+bypassing the environment proxy. On deployments where gateway egress is
+kernel-blocked outside a loopback CONNECT proxy, every Cursor call timed
+out. Tunnel TLS through the env-configured CONNECT proxy when present.
+
+Co-authored-by: Apologetic2022 <Apologetic2022@users.noreply.github.com>
+---
+ internal/cursor/dial.go  | 97 ++++++++++++++++++++++++++++++++++++++++
+ internal/cursor/h2.go    |  6 +--
+ internal/cursor/unary.go |  6 +--
+ 3 files changed, 99 insertions(+), 10 deletions(-)
+ create mode 100644 cpa-modeb-relay/internal/cursor/dial.go
+
+diff --git a/internal/cursor/dial.go b/internal/cursor/dial.go
+new file mode 100644
+index 0000000..bdab67d
+--- /dev/null
++++ b/internal/cursor/dial.go
+@@ -0,0 +1,97 @@
++package cursor
++
++import (
++	"bufio"
++	"context"
++	"crypto/tls"
++	"encoding/base64"
++	"fmt"
++	"net"
++	"net/http"
++	"net/url"
++	"time"
++)
++
++// dialTLSViaEnvProxy opens a TLS connection to addr, tunneling through the
++// HTTPS_PROXY/HTTP_PROXY CONNECT proxy when one is configured for the target.
++// Deployments that block direct egress (relay-egress-guard) route all Cursor
++// traffic through a loopback CONNECT proxy this way.
++func dialTLSViaEnvProxy(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
++	proxyURL, err := http.ProxyFromEnvironment(&http.Request{URL: &url.URL{Scheme: "https", Host: addr}})
++	if err != nil || proxyURL == nil {
++		d := &tls.Dialer{Config: cfg}
++		return d.DialContext(ctx, network, addr)
++	}
++
++	proxyAddr := proxyURL.Host
++	if proxyURL.Port() == "" {
++		port := "80"
++		if proxyURL.Scheme == "https" {
++			port = "443"
++		}
++		proxyAddr = net.JoinHostPort(proxyURL.Hostname(), port)
++	}
++	var dialer net.Dialer
++	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
++	if err != nil {
++		return nil, fmt.Errorf("cursor: dial proxy %s: %w", proxyAddr, err)
++	}
++	if deadline, ok := ctx.Deadline(); ok {
++		_ = conn.SetDeadline(deadline)
++	} else {
++		_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
++	}
++
++	connectReq := &http.Request{
++		Method: http.MethodConnect,
++		URL:    &url.URL{Opaque: addr},
++		Host:   addr,
++		Header: make(http.Header),
++	}
++	if user := proxyURL.User; user != nil {
++		password, _ := user.Password()
++		token := base64.StdEncoding.EncodeToString([]byte(user.Username() + ":" + password))
++		connectReq.Header.Set("Proxy-Authorization", "Basic "+token)
++	}
++	if err = connectReq.Write(conn); err != nil {
++		_ = conn.Close()
++		return nil, fmt.Errorf("cursor: proxy CONNECT write: %w", err)
++	}
++	br := bufio.NewReader(conn)
++	resp, err := http.ReadResponse(br, connectReq)
++	if err != nil {
++		_ = conn.Close()
++		return nil, fmt.Errorf("cursor: proxy CONNECT read: %w", err)
++	}
++	_ = resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		_ = conn.Close()
++		return nil, fmt.Errorf("cursor: proxy CONNECT %s: %s", addr, resp.Status)
++	}
++	var tunnel net.Conn = conn
++	if br.Buffered() > 0 {
++		tunnel = &bufferedConn{Conn: conn, reader: br}
++	}
++	_ = conn.SetDeadline(time.Time{})
++
++	tlsConn := tls.Client(tunnel, cfg)
++	if err = tlsConn.HandshakeContext(ctx); err != nil {
++		_ = tlsConn.Close()
++		return nil, fmt.Errorf("cursor: tls handshake via proxy: %w", err)
++	}
++	return tlsConn, nil
++}
++
++// bufferedConn drains bytes the CONNECT response reader may have buffered
++// before handing the stream to TLS.
++type bufferedConn struct {
++	net.Conn
++	reader *bufio.Reader
++}
++
++func (c *bufferedConn) Read(p []byte) (int, error) {
++	if c.reader != nil && c.reader.Buffered() > 0 {
++		return c.reader.Read(p)
++	}
++	return c.Conn.Read(p)
++}
+diff --git a/internal/cursor/h2.go b/internal/cursor/h2.go
+index ad18925..a6026a6 100644
+--- a/internal/cursor/h2.go
++++ b/internal/cursor/h2.go
+@@ -5,7 +5,6 @@ import (
+ 	"crypto/tls"
+ 	"fmt"
+ 	"io"
+-	"net"
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
+@@ -49,10 +48,7 @@ func OpenAgentRun(ctx context.Context, baseURL string, headers map[string]string
+ 	req.ProtoMajor = 2
+ 
+ 	transport := &http2.Transport{
+-		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+-			d := &tls.Dialer{Config: cfg}
+-			return d.DialContext(ctx, network, addr)
+-		},
++		DialTLSContext: dialTLSViaEnvProxy,
+ 		TLSClientConfig: &tls.Config{
+ 			MinVersion: tls.VersionTLS12,
+ 			NextProtos: []string{"h2", "http/1.1"},
+diff --git a/internal/cursor/unary.go b/internal/cursor/unary.go
+index 96a7af9..4fab3a8 100644
+--- a/internal/cursor/unary.go
++++ b/internal/cursor/unary.go
+@@ -7,7 +7,6 @@ import (
+ 	"crypto/tls"
+ 	"fmt"
+ 	"io"
+-	"net"
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
+@@ -54,10 +53,7 @@ func UnaryPOSTWithHeader(ctx context.Context, baseURL, path string, headers map[
+ 	httpReq.ProtoMajor = 2
+ 
+ 	transport := &http2.Transport{
+-		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+-			d := &tls.Dialer{Config: cfg}
+-			return d.DialContext(ctx, network, addr)
+-		},
++		DialTLSContext: dialTLSViaEnvProxy,
+ 		TLSClientConfig: &tls.Config{
+ 			MinVersion: tls.VersionTLS12,
+ 			NextProtos: []string{"h2", "http/1.1"},
+-- 
+2.43.0
+

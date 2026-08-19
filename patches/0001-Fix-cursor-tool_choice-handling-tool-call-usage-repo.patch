@@ -1,0 +1,1104 @@
+From 2d2e1bcb4c2bf951b2f220b1d888026f4bc69e53 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 04:39:49 +0000
+Subject: [PATCH 1/4] Fix cursor tool_choice handling, tool-call usage
+ reporting, and session/cache affinity
+
+- tool_choice was dropped in the OpenAI->cursor request conversion: parse
+  string and object forms (auto/none/required/any and forced function,
+  including Claude-style {type:tool}), narrow the advertised tool set, and
+  inject an explicit system directive since Agent Connect has no native
+  tool_choice field. Warn when a forced tool call is not satisfied.
+- Responses with tool_calls reported usage.prompt_tokens=0: TurnEnded arriving
+  while client tools are pending had its token counts discarded. Emit the
+  usage event before segment_end and swallow the stale pre-tool TurnEnded
+  after a resume so it cannot prematurely end the next segment.
+- Surface cached/reasoning token details in non-stream usage and emit a final
+  usage chunk on streamed responses.
+- Pin tool-result continuation requests to the auth that owns the live Cursor
+  session (sticky auth hint consulted by all selectors) so account rotation
+  cannot break the session or throw away the provider prompt cache.
+- Rebuild the run from full history (including trailing tool results) when the
+  live bidi stream died while waiting for tool results, instead of failing
+  the request.
+
+Co-authored-by: Apologetic2022 <Apologetic2022@users.noreply.github.com>
+---
+ internal/cursor/agent.go                      |  76 +++-
+ internal/cursor/model_resolve_test.go         |   2 +-
+ internal/cursor/session.go                    | 137 +++++--
+ internal/cursor/session_test.go               |  71 +++-
+ internal/runtime/executor/cursor_executor.go  | 335 ++++++++++++------
+ .../runtime/executor/cursor_executor_test.go  |  52 +++
+ sdk/cliproxy/auth/selector.go                 |  68 +++-
+ 7 files changed, 612 insertions(+), 129 deletions(-)
+ create mode 100644 cpa-modeb-relay/internal/runtime/executor/cursor_executor_test.go
+
+diff --git a/internal/cursor/agent.go b/internal/cursor/agent.go
+index 7cc0960..adae688 100644
+--- a/internal/cursor/agent.go
++++ b/internal/cursor/agent.go
+@@ -22,6 +22,51 @@ type ChatMessage struct {
+ 	ToolCalls  []ToolCall
+ }
+ 
++// ToolChoice captures the OpenAI tool_choice constraint for one request.
++// Mode is one of "", "auto", "none", "required", "function".
++// FunctionName is set when Mode is "function".
++type ToolChoice struct {
++	Mode         string
++	FunctionName string
++}
++
++// ForcesToolCall reports whether the constraint demands at least one tool call.
++func (c ToolChoice) ForcesToolCall() bool {
++	return c.Mode == "required" || c.Mode == "function"
++}
++
++// ApplyToolChoice narrows the advertised tool set according to the constraint.
++// "none" removes all tools; a forced function keeps only the named tool when present.
++func ApplyToolChoice(tools []ToolDefinition, choice ToolChoice) []ToolDefinition {
++	switch choice.Mode {
++	case "none":
++		return nil
++	case "function":
++		for i := range tools {
++			if tools[i].Name == choice.FunctionName {
++				return tools[i : i+1]
++			}
++		}
++	}
++	return tools
++}
++
++// toolChoiceDirective renders the constraint as an explicit system instruction.
++// Cursor's Agent Connect protocol has no native tool_choice field, so the
++// requirement is enforced through the conversation state instead.
++func toolChoiceDirective(choice ToolChoice) string {
++	switch choice.Mode {
++	case "required":
++		return "Tool call required: you MUST respond by invoking one of the provided tools. " +
++			"Do not reply with plain text. If information seems missing, pick the most relevant tool " +
++			"and supply reasonable arguments."
++	case "function":
++		return fmt.Sprintf("Tool call required: you MUST respond by invoking the tool named %q. "+
++			"Do not reply with plain text and do not invoke any other tool.", choice.FunctionName)
++	}
++	return ""
++}
++
+ // AccountCredentials are the fields required to open an Agent run.
+ type AccountCredentials struct {
+ 	AccessToken   string
+@@ -112,7 +157,14 @@ func storeBlob(store map[string][]byte, data []byte) []byte {
+ 	return id
+ }
+ 
+-func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
++// resumeContinuationPrompt drives a rebuilt run whose trailing history already
++// contains the client-supplied tool results (used when the original bidi
++// stream died while waiting for those results).
++const resumeContinuationPrompt = "Continue the conversation. The results of your earlier tool calls are " +
++	"already provided in the conversation history above. Use them to fulfill the user's most recent " +
++	"request. Call more tools if needed; otherwise answer the user directly."
++
++func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition, choice ToolChoice) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
+ 	selection := ResolveRequestedModel(model)
+ 	model = selection.ModelID
+ 	blobStore := map[string][]byte{}
+@@ -135,10 +187,21 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 		return nil, nil, "", fmt.Errorf("cursor: request has no user message")
+ 	}
+ 
++	// When assistant/tool rows trail the last user message the request is a
++	// tool-results continuation that must be replayed in a fresh run: keep the
++	// whole transcript as history and drive the run with a continuation prompt.
++	resume := historyEnd < len(messages)-1
++	historyMsgs := messages[:historyEnd]
++	actionText := activeUser.Content
++	if resume {
++		historyMsgs = messages
++		actionText = resumeContinuationPrompt
++	}
++
+ 	// Track tool names so tool-result parts can include toolName (cursor2api).
+ 	toolNames := map[string]string{}
+ 	rootIDs := [][]byte{systemBlob}
+-	for _, msg := range messages[:historyEnd] {
++	for _, msg := range historyMsgs {
+ 		switch msg.Role {
+ 		case "user":
+ 			if strings.TrimSpace(msg.Content) == "" {
+@@ -216,6 +279,13 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 		}
+ 	}
+ 
++	if directive := toolChoiceDirective(choice); directive != "" {
++		rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
++			"role":    "system",
++			"content": directive,
++		})))
++	}
++
+ 	conversationID := uuid.NewString()
+ 	// Desktop / cursor2api do not set exclude_workspace_context by default;
+ 	// forcing it true is rejected for many accounts ("Workspace context
+@@ -259,7 +329,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 			Action: &agentv1.ConversationAction_UserMessageAction{
+ 				UserMessageAction: &agentv1.UserMessageAction{
+ 					UserMessage: &agentv1.UserMessage{
+-						Text:      activeUser.Content,
++						Text:      actionText,
+ 						MessageId: uuid.NewString(),
+ 					},
+ 				},
+diff --git a/internal/cursor/model_resolve_test.go b/internal/cursor/model_resolve_test.go
+index aa3001b..3f120e0 100644
+--- a/internal/cursor/model_resolve_test.go
++++ b/internal/cursor/model_resolve_test.go
+@@ -55,7 +55,7 @@ func TestResolveRequestedModelSuffix(t *testing.T) {
+ func TestBuildRunRequestSendsParameters(t *testing.T) {
+ 	msg, _, _, err := buildRunRequest("gpt-5.4-thinking", []ChatMessage{
+ 		{Role: "user", Content: "hi"},
+-	}, nil)
++	}, nil, ToolChoice{})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index db37888..1756c99 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -11,6 +11,7 @@ import (
+ 
+ 	"github.com/google/uuid"
+ 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
++	log "github.com/sirupsen/logrus"
+ 	"google.golang.org/protobuf/proto"
+ )
+ 
+@@ -58,11 +59,21 @@ type pendingExec struct {
+ 	call    ToolCall
+ }
+ 
++// SessionOptions carries per-request modifiers for a Cursor Agent run.
++type SessionOptions struct {
++	// AuthID identifies the gateway credential that owns this run so that
++	// follow-up tool-result requests can be pinned to the same account.
++	AuthID string
++	// ToolChoice is the OpenAI tool_choice constraint for the run.
++	ToolChoice ToolChoice
++}
++
+ // Session is a live Agent Connect run that can pause for client tools.
+ type Session struct {
+ 	ID             string
+ 	ConversationID string
+ 	Model          string
++	AuthID         string
+ 
+ 	mu           sync.Mutex
+ 	stream       *BidiStream
+@@ -78,6 +89,14 @@ type Session struct {
+ 	cancel       context.CancelFunc
+ 	lastActivity time.Time
+ 	manager      *SessionManager
++
++	// turnEndedSeen records that the pre-tool segment already delivered its
++	// TurnEnded (and usage). When it did not, the TurnEnded that surfaces
++	// right after tool results are submitted belongs to the previous segment
++	// and must not terminate the new one (see handleServerMessage).
++	turnEndedSeen      bool
++	swallowTurnEnd     bool
++	contentSinceResume bool
+ }
+ 
+ // ChatResult is the collected text response from one Agent segment / run.
+@@ -96,12 +115,13 @@ type ChatResult struct {
+ }
+ 
+ // StartSession opens a new Agent run for the given messages/tools.
+-func StartSession(ctx context.Context, creds AccountCredentials, model string, messages []ChatMessage, tools []ToolDefinition) (*Session, error) {
++func StartSession(ctx context.Context, creds AccountCredentials, model string, messages []ChatMessage, tools []ToolDefinition, opts SessionOptions) (*Session, error) {
+ 	if strings.TrimSpace(creds.AccessToken) == "" {
+ 		return nil, fmt.Errorf("cursor: access_token is required")
+ 	}
++	tools = ApplyToolChoice(tools, opts.ToolChoice)
+ 	selection := ResolveRequestedModel(model)
+-	clientMsg, blobStore, conversationID, err := buildRunRequest(model, messages, tools)
++	clientMsg, blobStore, conversationID, err := buildRunRequest(model, messages, tools, opts.ToolChoice)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -138,6 +158,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 		ID:             uuid.NewString(),
+ 		ConversationID: conversationID,
+ 		Model:          selection.ModelID,
++		AuthID:         opts.AuthID,
+ 		stream:         stream,
+ 		blobStore:      blobStore,
+ 		tools:          append([]ToolDefinition(nil), tools...),
+@@ -174,6 +195,14 @@ func (s *Session) touch() {
+ 	s.mu.Unlock()
+ }
+ 
++// markContent records that the current segment produced model output; used to
++// distinguish a real TurnEnded from a stale pre-tool one after a resume.
++func (s *Session) markContent() {
++	s.mu.Lock()
++	s.contentSinceResume = true
++	s.mu.Unlock()
++}
++
+ func (s *Session) heartbeatLoop(ctx context.Context) {
+ 	ticker := time.NewTicker(5 * time.Second)
+ 	defer ticker.Stop()
+@@ -468,6 +497,13 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
+ 			s.manager.UnbindPending(result.ToolCallID)
+ 		}
+ 	}
++	s.mu.Lock()
++	// If the pre-tool segment never delivered its TurnEnded, the next one that
++	// surfaces after the resume belongs to that finished segment.
++	s.swallowTurnEnd = !s.turnEndedSeen
++	s.turnEndedSeen = false
++	s.contentSinceResume = false
++	s.mu.Unlock()
+ 	s.resumeReading()
+ 	return nil
+ }
+@@ -535,20 +571,12 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
+ 	case *agentv1.AgentServerMessage_InteractionUpdate:
+ 		switch u := m.InteractionUpdate.Message.(type) {
+ 		case *agentv1.InteractionUpdate_TextDelta:
++			s.markContent()
+ 			s.emit(StreamEvent{Type: "text_delta", Text: u.TextDelta.GetText()})
+ 		case *agentv1.InteractionUpdate_ThinkingDelta:
++			s.markContent()
+ 			s.emit(StreamEvent{Type: "thinking_delta", Text: u.ThinkingDelta.GetText()})
+ 		case *agentv1.InteractionUpdate_TurnEnded:
+-			// cursor2api: some transports emit turn_ended for the pre-tool
+-			// segment before mcp_result is returned. Keep the bidi run open
+-			// while client tools are still pending.
+-			s.mu.Lock()
+-			pendingCount := len(s.pending)
+-			waiting := s.waitingTools
+-			s.mu.Unlock()
+-			if pendingCount > 0 || waiting {
+-				return false, nil
+-			}
+ 			ev := StreamEvent{Type: "usage_final"}
+ 			if u.TurnEnded.InputTokens != nil {
+ 				ev.InputTokens = *u.TurnEnded.InputTokens
+@@ -565,6 +593,30 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
+ 			if u.TurnEnded.ReasoningTokens != nil {
+ 				ev.ReasoningTokens = *u.TurnEnded.ReasoningTokens
+ 			}
++			s.mu.Lock()
++			pendingCount := len(s.pending)
++			waiting := s.waitingTools
++			swallow := s.swallowTurnEnd && !s.contentSinceResume
++			s.swallowTurnEnd = false
++			if pendingCount > 0 || waiting {
++				s.turnEndedSeen = true
++			}
++			s.mu.Unlock()
++			if pendingCount > 0 || waiting {
++				// cursor2api: some transports emit turn_ended for the pre-tool
++				// segment before mcp_result is returned. Surface its usage so
++				// tool_calls responses carry token counts, but keep the bidi
++				// run open while client tools are still pending.
++				s.emit(ev)
++				return false, nil
++			}
++			if swallow {
++				// Late TurnEnded for the pre-tool segment that was still in
++				// flight when reading paused; it must not end the segment the
++				// client resumed with tool results.
++				s.emit(ev)
++				return false, nil
++			}
+ 			s.emit(ev)
+ 			s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
+ 			go func() { _ = s.Close() }()
+@@ -658,6 +710,7 @@ func (s *Session) handleMcpArgs(req *agentv1.ExecServerMessage, args *agentv1.Mc
+ 	if s.manager != nil {
+ 		s.manager.BindPending(callID, s)
+ 	}
++	s.markContent()
+ 	s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
+ 	return true, nil
+ }
+@@ -764,19 +817,20 @@ func buildMcpToolDefinitions(tools []ToolDefinition) []*agentv1.McpToolDefinitio
+ }
+ 
+ // RunChat performs a text/tool Cursor Agent segment and returns the collected result.
+-func RunChat(ctx context.Context, creds AccountCredentials, model string, messages []ChatMessage, tools []ToolDefinition) (*ChatResult, error) {
+-	results := extractToolResults(messages)
+-	if len(results) > 0 {
+-		session, err := DefaultSessionManager().ResolveForToolResults(results)
+-		if err != nil {
+-			return nil, err
++func RunChat(ctx context.Context, creds AccountCredentials, model string, messages []ChatMessage, tools []ToolDefinition, opts SessionOptions) (*ChatResult, error) {
++	if results := extractToolResults(messages); len(results) > 0 {
++		result, err := resumeWithToolResults(ctx, results)
++		if err == nil {
++			return result, nil
+ 		}
+-		if err = session.SubmitToolResults(results); err != nil {
+-			return nil, err
++		if ctx.Err() != nil {
++			return nil, ctx.Err()
+ 		}
+-		return session.CollectSegment(ctx)
++		// The live run is gone (idle stream torn down, gateway restart, …).
++		// Rebuild a fresh run whose history carries the tool results.
++		log.Warnf("cursor: resuming tool results failed (%v); rebuilding run from history", err)
+ 	}
+-	session, err := StartSession(ctx, creds, model, messages, tools)
++	session, err := StartSession(ctx, creds, model, messages, tools, opts)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -791,6 +845,45 @@ func RunChat(ctx context.Context, creds AccountCredentials, model string, messag
+ 	return result, nil
+ }
+ 
++// resumeWithToolResults feeds trailing tool results into the live session that
++// requested them and collects the follow-up segment.
++func resumeWithToolResults(ctx context.Context, results []ToolResult) (*ChatResult, error) {
++	session, err := ResumeSession(results)
++	if err != nil {
++		return nil, err
++	}
++	result, err := session.CollectSegment(ctx)
++	if err != nil {
++		_ = session.Close()
++		return nil, err
++	}
++	if result.FinishReason != "tool_calls" {
++		_ = session.Close()
++	}
++	return result, nil
++}
++
++// TrailingToolResults returns the tool results trailing the latest assistant
++// tool_calls message, or nil when the request is not a tool-results turn.
++func TrailingToolResults(messages []ChatMessage) []ToolResult {
++	return extractToolResults(messages)
++}
++
++// ResumeSession resolves the live session that owns the trailing tool results
++// and submits them so the run continues. The session is closed on submit
++// failure so callers can rebuild a fresh run from history.
++func ResumeSession(results []ToolResult) (*Session, error) {
++	session, err := DefaultSessionManager().ResolveForToolResults(results)
++	if err != nil {
++		return nil, err
++	}
++	if err = session.SubmitToolResults(results); err != nil {
++		_ = session.Close()
++		return nil, err
++	}
++	return session, nil
++}
++
+ func extractToolResults(messages []ChatMessage) []ToolResult {
+ 	// Only trailing tool messages after the latest assistant tool_calls are
+ 	// treated as a live round-trip resume; older history tool rows are ignored.
+diff --git a/internal/cursor/session_test.go b/internal/cursor/session_test.go
+index 28bedba..60f36f2 100644
+--- a/internal/cursor/session_test.go
++++ b/internal/cursor/session_test.go
+@@ -29,7 +29,7 @@ func TestBuildRunRequestIncludesMcpTools(t *testing.T) {
+ 		Name:        "get_weather",
+ 		Description: "weather",
+ 		Parameters:  map[string]any{"type": "object"},
+-	}})
++	}}, ToolChoice{})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -51,7 +51,7 @@ func TestBuildRunRequestNativeToolJSON(t *testing.T) {
+ 		}},
+ 		{Role: "tool", ToolCallID: "c1", Name: "get_weather", Content: `{"ok":true}`},
+ 		{Role: "user", Content: "again"},
+-	}, nil)
++	}, nil, ToolChoice{})
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -97,6 +97,73 @@ func TestBuildRunRequestNativeToolJSON(t *testing.T) {
+ 	}
+ }
+ 
++func TestBuildRunRequestResumeCarriesTrailingToolResults(t *testing.T) {
++	msg, blobs, _, err := buildRunRequest("default", []ChatMessage{
++		{Role: "user", Content: "weather in NY?"},
++		{Role: "assistant", Content: "", ToolCalls: []ToolCall{
++			{ID: "c9", Name: "get_weather", Arguments: map[string]any{"city": "NY"}},
++		}},
++		{Role: "tool", ToolCallID: "c9", Name: "get_weather", Content: `{"temp":21}`},
++	}, nil, ToolChoice{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	action := msg.GetRunRequest().GetAction().GetUserMessageAction().GetUserMessage().GetText()
++	if action != resumeContinuationPrompt {
++		t.Fatalf("expected continuation prompt action, got %q", action)
++	}
++	sawResult := false
++	for _, data := range blobs {
++		var payload map[string]any
++		if json.Unmarshal(data, &payload) != nil {
++			continue
++		}
++		if payload["role"] == "tool" && payload["id"] == "c9" {
++			sawResult = true
++		}
++	}
++	if !sawResult {
++		t.Fatal("trailing tool result missing from rebuilt history")
++	}
++}
++
++func TestBuildRunRequestToolChoiceDirective(t *testing.T) {
++	_, blobs, _, err := buildRunRequest("default", []ChatMessage{
++		{Role: "user", Content: "what's the weather?"},
++	}, []ToolDefinition{{Name: "get_weather"}}, ToolChoice{Mode: "required"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	found := false
++	for _, data := range blobs {
++		var payload map[string]any
++		if json.Unmarshal(data, &payload) != nil {
++			continue
++		}
++		if payload["role"] == "system" {
++			if content, _ := payload["content"].(string); strings.Contains(content, "Tool call required") {
++				found = true
++			}
++		}
++	}
++	if !found {
++		t.Fatal("tool_choice required directive missing from run request")
++	}
++}
++
++func TestApplyToolChoice(t *testing.T) {
++	tools := []ToolDefinition{{Name: "a"}, {Name: "b"}}
++	if got := ApplyToolChoice(tools, ToolChoice{Mode: "none"}); got != nil {
++		t.Fatalf("none should drop tools, got %#v", got)
++	}
++	if got := ApplyToolChoice(tools, ToolChoice{Mode: "function", FunctionName: "b"}); len(got) != 1 || got[0].Name != "b" {
++		t.Fatalf("function should narrow tools, got %#v", got)
++	}
++	if got := ApplyToolChoice(tools, ToolChoice{Mode: "required"}); len(got) != 2 {
++		t.Fatalf("required should keep tools, got %#v", got)
++	}
++}
++
+ func TestCookieJarRemembersSetCookie(t *testing.T) {
+ 	jar := &CookieJar{byHost: map[string]map[string]string{}}
+ 	hdr := make(http.Header)
+diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
+index 82385da..93757d6 100644
+--- a/internal/runtime/executor/cursor_executor.go
++++ b/internal/runtime/executor/cursor_executor.go
+@@ -7,6 +7,7 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/google/uuid"
+@@ -32,9 +33,69 @@ type CursorExecutor struct {
+ 
+ // NewCursorExecutor creates a Cursor executor.
+ func NewCursorExecutor(cfg *config.Config) *CursorExecutor {
++	registerCursorStickyHint()
+ 	return &CursorExecutor{cfg: cfg, svc: cursorauth.NewAuthService()}
+ }
+ 
++var cursorStickyHintOnce sync.Once
++
++// registerCursorStickyHint pins requests that carry trailing tool results to
++// the auth whose live Cursor session is waiting for those results. Without the
++// pin the selector may rotate to another account mid-conversation, which both
++// misattributes usage and throws away the provider prompt cache.
++func registerCursorStickyHint() {
++	cursorStickyHintOnce.Do(func() {
++		cliproxyauth.RegisterStickyAuthHint(func(_ http.Header, payload []byte) (string, bool) {
++			for _, id := range trailingToolCallIDs(payload) {
++				if session := cursorlib.DefaultSessionManager().LookupPending(id); session != nil && strings.TrimSpace(session.AuthID) != "" {
++					return session.AuthID, true
++				}
++			}
++			return "", false
++		})
++	})
++}
++
++// trailingToolCallIDs extracts the tool call ids of the trailing tool-result
++// rows of an OpenAI chat payload (role:"tool") or a Claude messages payload
++// (user content blocks of type "tool_result").
++func trailingToolCallIDs(payload []byte) []string {
++	arr := gjson.GetBytes(payload, "messages")
++	if !arr.IsArray() {
++		return nil
++	}
++	items := arr.Array()
++	var ids []string
++	for i := len(items) - 1; i >= 0; i-- {
++		item := items[i]
++		switch item.Get("role").String() {
++		case "tool":
++			if id := item.Get("tool_call_id").String(); id != "" {
++				ids = append(ids, id)
++				continue
++			}
++		case "user":
++			content := item.Get("content")
++			found := false
++			if content.IsArray() {
++				for _, part := range content.Array() {
++					if part.Get("type").String() == "tool_result" {
++						if id := part.Get("tool_use_id").String(); id != "" {
++							ids = append(ids, id)
++							found = true
++						}
++					}
++				}
++			}
++			if found {
++				continue
++			}
++		}
++		break
++	}
++	return ids
++}
++
+ // Identifier returns the executor identifier.
+ func (e *CursorExecutor) Identifier() string { return "cursor" }
+ 
+@@ -68,16 +129,20 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
+ 		return resp, err
+ 	}
+ 	tools := extractTools(body)
++	sessOpts := cursorlib.SessionOptions{AuthID: authID(auth), ToolChoice: extractToolChoice(body)}
+ 
+ 	creds, err := e.ensureCredentials(ctx, auth)
+ 	if err != nil {
+ 		return resp, err
+ 	}
+ 
+-	result, err := cursorlib.RunChat(ctx, creds, upstreamModel, messages, tools)
++	result, err := cursorlib.RunChat(ctx, creds, upstreamModel, messages, tools, sessOpts)
+ 	if err != nil {
+ 		return resp, err
+ 	}
++	if sessOpts.ToolChoice.ForcesToolCall() && len(result.ToolCalls) == 0 {
++		log.Warnf("cursor: run completed without satisfying tool_choice %s; returning text response", toolChoiceLabel(sessOpts.ToolChoice))
++	}
+ 
+ 	outPayload := buildOpenAIChatCompletion(req.Model, result)
+ 	reporter.Publish(ctx, usage.Detail{
+@@ -118,13 +183,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 		return nil, err
+ 	}
+ 	tools := extractTools(body)
++	sessOpts := cursorlib.SessionOptions{AuthID: authID(auth), ToolChoice: extractToolChoice(body)}
+ 
+ 	creds, err := e.ensureCredentials(ctx, auth)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	session, err := openCursorSession(ctx, creds, upstreamModel, messages, tools)
++	session, resumedLive, err := openCursorSession(ctx, creds, upstreamModel, messages, tools, sessOpts)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -165,73 +231,91 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 			return
+ 		}
+ 
+-		errIter := session.IterSegment(ctx, func(ev cursorlib.StreamEvent) error {
+-			var delta map[string]any
+-			switch ev.Type {
+-			case "text_delta":
+-				delta = map[string]any{"content": ev.Text}
+-			case "thinking_delta":
+-				delta = map[string]any{"reasoning_content": ev.Text}
+-			case "tool_call":
+-				if ev.ToolCall == nil {
++		contentEmitted := false
++		iterate := func() error {
++			return session.IterSegment(ctx, func(ev cursorlib.StreamEvent) error {
++				var delta map[string]any
++				switch ev.Type {
++				case "text_delta":
++					contentEmitted = true
++					delta = map[string]any{"content": ev.Text}
++				case "thinking_delta":
++					contentEmitted = true
++					delta = map[string]any{"reasoning_content": ev.Text}
++				case "tool_call":
++					if ev.ToolCall == nil {
++						return nil
++					}
++					contentEmitted = true
++					args, _ := json.Marshal(ev.ToolCall.Arguments)
++					if args == nil {
++						args = []byte("{}")
++					}
++					delta = map[string]any{
++						"tool_calls": []map[string]any{
++							{
++								"index": toolIndex,
++								"id":    ev.ToolCall.ID,
++								"type":  "function",
++								"function": map[string]any{
++									"name":      ev.ToolCall.Name,
++									"arguments": string(args),
++								},
++							},
++						},
++					}
++					toolIndex++
++				case "usage_final":
++					usageFinal = ev
++					reporter.Publish(ctx, usage.Detail{
++						InputTokens:     ev.InputTokens,
++						OutputTokens:    ev.OutputTokens,
++						CachedTokens:    ev.CacheReadTokens,
++						CacheReadTokens: ev.CacheReadTokens,
++						ReasoningTokens: ev.ReasoningTokens,
++						TotalTokens:     ev.InputTokens + ev.OutputTokens,
++					})
++					return nil
++				case "error":
++					return fmt.Errorf("%s", ev.Message)
++				case "segment_end":
++					if ev.Reason != "" {
++						finishReason = ev.Reason
++					}
++					return nil
++				default:
+ 					return nil
+ 				}
+-				args, _ := json.Marshal(ev.ToolCall.Arguments)
+-				if args == nil {
+-					args = []byte("{}")
++				if delta == nil {
++					return nil
+ 				}
+-				delta = map[string]any{
+-					"tool_calls": []map[string]any{
+-						{
+-							"index": toolIndex,
+-							"id":    ev.ToolCall.ID,
+-							"type":  "function",
+-							"function": map[string]any{
+-								"name":      ev.ToolCall.Name,
+-								"arguments": string(args),
+-							},
+-						},
++				chunk, _ := json.Marshal(map[string]any{
++					"id":      completionID,
++					"object":  "chat.completion.chunk",
++					"created": created,
++					"model":   req.Model,
++					"choices": []map[string]any{
++						{"index": 0, "delta": delta, "finish_reason": nil},
+ 					},
+-				}
+-				toolIndex++
+-			case "usage_final":
+-				usageFinal = ev
+-				reporter.Publish(ctx, usage.Detail{
+-					InputTokens:     ev.InputTokens,
+-					OutputTokens:    ev.OutputTokens,
+-					CachedTokens:    ev.CacheReadTokens,
+-					CacheReadTokens: ev.CacheReadTokens,
+-					ReasoningTokens: ev.ReasoningTokens,
+-					TotalTokens:     ev.InputTokens + ev.OutputTokens,
+ 				})
+-				return nil
+-			case "error":
+-				return fmt.Errorf("%s", ev.Message)
+-			case "segment_end":
+-				if ev.Reason != "" {
+-					finishReason = ev.Reason
++				if !emitLine([]byte("data: " + string(chunk))) {
++					return context.Canceled
+ 				}
+ 				return nil
+-			default:
+-				return nil
+-			}
+-			if delta == nil {
+-				return nil
+-			}
+-			chunk, _ := json.Marshal(map[string]any{
+-				"id":      completionID,
+-				"object":  "chat.completion.chunk",
+-				"created": created,
+-				"model":   req.Model,
+-				"choices": []map[string]any{
+-					{"index": 0, "delta": delta, "finish_reason": nil},
+-				},
+ 			})
+-			if !emitLine([]byte("data: " + string(chunk))) {
+-				return context.Canceled
++		}
++		errIter := iterate()
++		if errIter != nil && resumedLive && !contentEmitted && ctx.Err() == nil {
++			// The live run died before producing any output for the resumed
++			// segment (idle upstream teardown while waiting on tool results).
++			// Rebuild a fresh run carrying the tool results in history.
++			log.Warnf("cursor: resumed stream failed before output (%v); rebuilding run from history", errIter)
++			if rebuilt, errRebuild := cursorlib.StartSession(ctx, creds, upstreamModel, messages, tools, sessOpts); errRebuild == nil {
++				session = rebuilt
++				finishReason = "stop"
++				errIter = iterate()
+ 			}
+-			return nil
+-		})
++		}
+ 		if errIter != nil {
+ 			reporter.PublishFailure(ctx, errIter)
+ 			select {
+@@ -248,6 +332,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 		if finishReason != "tool_calls" {
+ 			_ = session.Close()
+ 		}
++		if sessOpts.ToolChoice.ForcesToolCall() && toolIndex == 0 {
++			log.Warnf("cursor: stream completed without satisfying tool_choice %s; returning text response", toolChoiceLabel(sessOpts.ToolChoice))
++		}
+ 
+ 		endChunk, _ := json.Marshal(map[string]any{
+ 			"id":      completionID,
+@@ -261,7 +348,19 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 		if !emitLine([]byte("data: " + string(endChunk))) {
+ 			return
+ 		}
+-		_ = usageFinal
++		if usageFinal.Type == "usage_final" {
++			usageChunk, _ := json.Marshal(map[string]any{
++				"id":      completionID,
++				"object":  "chat.completion.chunk",
++				"created": created,
++				"model":   req.Model,
++				"choices": []map[string]any{},
++				"usage":   openAIUsagePayload(usageFinal.InputTokens, usageFinal.OutputTokens, usageFinal.CacheReadTokens, usageFinal.ReasoningTokens),
++			})
++			if !emitLine([]byte("data: " + string(usageChunk))) {
++				return
++			}
++		}
+ 		doneChunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
+ 		for i := range doneChunks {
+ 			select {
+@@ -274,49 +373,91 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 	return &cliproxyexecutor.StreamResult{Chunks: out}, nil
+ }
+ 
+-func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition) (*cursorlib.Session, error) {
+-	results := trailingToolResults(messages)
++// openCursorSession returns a live session for the request. The second return
++// reports whether the session is a resumed live run (tool results were fed to
++// the original bidi stream), which makes an early failure eligible for a
++// rebuild from history.
++func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, opts cursorlib.SessionOptions) (*cursorlib.Session, bool, error) {
++	results := cursorlib.TrailingToolResults(messages)
+ 	if len(results) > 0 {
+-		session, err := cursorlib.DefaultSessionManager().ResolveForToolResults(results)
+-		if err != nil {
+-			return nil, err
++		session, err := cursorlib.ResumeSession(results)
++		if err == nil {
++			return session, true, nil
+ 		}
+-		if err = session.SubmitToolResults(results); err != nil {
+-			return nil, err
++		if ctx.Err() != nil {
++			return nil, false, ctx.Err()
+ 		}
+-		return session, nil
++		log.Warnf("cursor: resuming tool results failed (%v); rebuilding run from history", err)
+ 	}
+-	return cursorlib.StartSession(ctx, creds, model, messages, tools)
++	session, err := cursorlib.StartSession(ctx, creds, model, messages, tools, opts)
++	return session, false, err
+ }
+ 
+-func trailingToolResults(messages []cursorlib.ChatMessage) []cursorlib.ToolResult {
+-	start := -1
+-	for i := len(messages) - 1; i >= 0; i-- {
+-		switch messages[i].Role {
++func authID(auth *cliproxyauth.Auth) string {
++	if auth == nil {
++		return ""
++	}
++	return auth.ID
++}
++
++// extractToolChoice parses the OpenAI tool_choice field (string or object
++// form, plus the Claude-style {"type":"tool","name":…} passthrough).
++func extractToolChoice(body []byte) cursorlib.ToolChoice {
++	tc := gjson.GetBytes(body, "tool_choice")
++	if !tc.Exists() {
++		return cursorlib.ToolChoice{}
++	}
++	if tc.Type == gjson.String {
++		switch strings.ToLower(strings.TrimSpace(tc.String())) {
++		case "none":
++			return cursorlib.ToolChoice{Mode: "none"}
++		case "required", "any":
++			return cursorlib.ToolChoice{Mode: "required"}
++		case "auto", "":
++			return cursorlib.ToolChoice{Mode: "auto"}
++		}
++		return cursorlib.ToolChoice{}
++	}
++	if tc.IsObject() {
++		switch strings.ToLower(strings.TrimSpace(tc.Get("type").String())) {
++		case "function":
++			if name := strings.TrimSpace(tc.Get("function.name").String()); name != "" {
++				return cursorlib.ToolChoice{Mode: "function", FunctionName: name}
++			}
+ 		case "tool":
+-			start = i
+-			continue
+-		case "assistant":
+-			if len(messages[i].ToolCalls) > 0 && start >= 0 {
+-				out := make([]cursorlib.ToolResult, 0, len(messages)-start)
+-				for _, msg := range messages[start:] {
+-					if msg.Role != "tool" || strings.TrimSpace(msg.ToolCallID) == "" {
+-						continue
+-					}
+-					out = append(out, cursorlib.ToolResult{
+-						ToolCallID: msg.ToolCallID,
+-						Name:       msg.Name,
+-						Content:    msg.Content,
+-					})
+-				}
+-				return out
++			if name := strings.TrimSpace(tc.Get("name").String()); name != "" {
++				return cursorlib.ToolChoice{Mode: "function", FunctionName: name}
+ 			}
+-			return nil
+-		default:
+-			return nil
++		case "any", "required":
++			return cursorlib.ToolChoice{Mode: "required"}
++		case "none":
++			return cursorlib.ToolChoice{Mode: "none"}
++		case "auto":
++			return cursorlib.ToolChoice{Mode: "auto"}
+ 		}
+ 	}
+-	return nil
++	return cursorlib.ToolChoice{}
++}
++
++func toolChoiceLabel(choice cursorlib.ToolChoice) string {
++	if choice.Mode == "function" {
++		return fmt.Sprintf("function %q", choice.FunctionName)
++	}
++	return fmt.Sprintf("%q", choice.Mode)
++}
++
++func openAIUsagePayload(input, output, cacheRead, reasoning int64) map[string]any {
++	return map[string]any{
++		"prompt_tokens":     input,
++		"completion_tokens": output,
++		"total_tokens":      input + output,
++		"prompt_tokens_details": map[string]any{
++			"cached_tokens": cacheRead,
++		},
++		"completion_tokens_details": map[string]any{
++			"reasoning_tokens": reasoning,
++		},
++	}
+ }
+ 
+ // CountTokens returns a best-effort character-based estimate.
+@@ -531,11 +672,7 @@ func buildOpenAIChatCompletion(model string, result *cursorlib.ChatResult) []byt
+ 				"finish_reason": finish,
+ 			},
+ 		},
+-		"usage": map[string]any{
+-			"prompt_tokens":     result.InputTokens,
+-			"completion_tokens": result.OutputTokens,
+-			"total_tokens":      result.InputTokens + result.OutputTokens,
+-		},
++		"usage": openAIUsagePayload(result.InputTokens, result.OutputTokens, result.CacheReadTokens, result.ReasoningTokens),
+ 	}
+ 	b, err := json.Marshal(payload)
+ 	if err != nil {
+diff --git a/internal/runtime/executor/cursor_executor_test.go b/internal/runtime/executor/cursor_executor_test.go
+new file mode 100644
+index 0000000..3cedb70
+--- /dev/null
++++ b/internal/runtime/executor/cursor_executor_test.go
+@@ -0,0 +1,52 @@
++package executor
++
++import (
++	"testing"
++
++	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
++)
++
++func TestExtractToolChoice(t *testing.T) {
++	cases := []struct {
++		name    string
++		payload string
++		want    cursorlib.ToolChoice
++	}{
++		{"absent", `{}`, cursorlib.ToolChoice{}},
++		{"auto", `{"tool_choice":"auto"}`, cursorlib.ToolChoice{Mode: "auto"}},
++		{"none", `{"tool_choice":"none"}`, cursorlib.ToolChoice{Mode: "none"}},
++		{"required", `{"tool_choice":"required"}`, cursorlib.ToolChoice{Mode: "required"}},
++		{"any", `{"tool_choice":"any"}`, cursorlib.ToolChoice{Mode: "required"}},
++		{"function", `{"tool_choice":{"type":"function","function":{"name":"get_weather"}}}`, cursorlib.ToolChoice{Mode: "function", FunctionName: "get_weather"}},
++		{"claude-tool", `{"tool_choice":{"type":"tool","name":"get_weather"}}`, cursorlib.ToolChoice{Mode: "function", FunctionName: "get_weather"}},
++		{"claude-any", `{"tool_choice":{"type":"any"}}`, cursorlib.ToolChoice{Mode: "required"}},
++	}
++	for _, tc := range cases {
++		if got := extractToolChoice([]byte(tc.payload)); got != tc.want {
++			t.Errorf("%s: got %#v want %#v", tc.name, got, tc.want)
++		}
++	}
++}
++
++func TestTrailingToolCallIDs(t *testing.T) {
++	openai := []byte(`{"messages":[
++		{"role":"user","content":"hi"},
++		{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
++		{"role":"tool","tool_call_id":"c1","content":"ok"}
++	]}`)
++	if ids := trailingToolCallIDs(openai); len(ids) != 1 || ids[0] != "c1" {
++		t.Fatalf("openai trailing ids = %#v", ids)
++	}
++	claude := []byte(`{"messages":[
++		{"role":"user","content":"hi"},
++		{"role":"assistant","content":[{"type":"tool_use","id":"c2","name":"f","input":{}}]},
++		{"role":"user","content":[{"type":"tool_result","tool_use_id":"c2","content":"ok"}]}
++	]}`)
++	if ids := trailingToolCallIDs(claude); len(ids) != 1 || ids[0] != "c2" {
++		t.Fatalf("claude trailing ids = %#v", ids)
++	}
++	plain := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
++	if ids := trailingToolCallIDs(plain); len(ids) != 0 {
++		t.Fatalf("plain request should have no trailing ids, got %#v", ids)
++	}
++}
+diff --git a/sdk/cliproxy/auth/selector.go b/sdk/cliproxy/auth/selector.go
+index b761086..33317c5 100644
+--- a/sdk/cliproxy/auth/selector.go
++++ b/sdk/cliproxy/auth/selector.go
+@@ -22,6 +22,55 @@ import (
+ 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+ )
+ 
++// StickyAuthHintFunc resolves the auth ID that must serve a request, e.g. a
++// provider session that is still waiting on the request's tool results.
++// Implementations return ok=false when they have no opinion.
++type StickyAuthHintFunc func(headers http.Header, payload []byte) (authID string, ok bool)
++
++var (
++	stickyHintMu    sync.RWMutex
++	stickyAuthHints []StickyAuthHintFunc
++)
++
++// RegisterStickyAuthHint installs a provider-supplied hint consulted before
++// normal selection. Used to keep multi-turn tool conversations (and their
++// provider prompt cache) on the account that owns the live session.
++func RegisterStickyAuthHint(fn StickyAuthHintFunc) {
++	if fn == nil {
++		return
++	}
++	stickyHintMu.Lock()
++	stickyAuthHints = append(stickyAuthHints, fn)
++	stickyHintMu.Unlock()
++}
++
++// stickyHintedAuth returns the auth pinned by a registered hint when it is
++// present in the candidate list and not disabled.
++func stickyHintedAuth(opts cliproxyexecutor.Options, auths []*Auth) *Auth {
++	stickyHintMu.RLock()
++	hints := stickyAuthHints
++	stickyHintMu.RUnlock()
++	if len(hints) == 0 {
++		return nil
++	}
++	for _, hint := range hints {
++		id, ok := hint(opts.Headers, opts.OriginalRequest)
++		if !ok || id == "" {
++			continue
++		}
++		for _, candidate := range auths {
++			if candidate == nil || candidate.ID != id {
++				continue
++			}
++			if candidate.Disabled || candidate.Status == StatusDisabled {
++				continue
++			}
++			return candidate
++		}
++	}
++	return nil
++}
++
+ // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
+ type RoundRobinSelector struct {
+ 	mu      sync.Mutex
+@@ -255,7 +304,9 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
+ 
+ // Pick selects the next available auth for the provider in a round-robin manner.
+ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+-	_ = opts
++	if pinned := stickyHintedAuth(opts, auths); pinned != nil {
++		return pinned, nil
++	}
+ 	now := time.Now()
+ 	available, err := getAvailableAuths(auths, provider, model, now)
+ 	if err != nil {
+@@ -292,7 +343,9 @@ func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
+ 
+ // Pick selects the first available auth for the provider in a deterministic manner.
+ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+-	_ = opts
++	if pinned := stickyHintedAuth(opts, auths); pinned != nil {
++		return pinned, nil
++	}
+ 	now := time.Now()
+ 	available, err := getAvailableAuths(auths, provider, model, now)
+ 	if err != nil {
+@@ -417,6 +470,17 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
+ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+ 	entry := selectorLogEntry(ctx)
+ 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
++	if pinned := stickyHintedAuth(opts, auths); pinned != nil {
++		// A live provider session owns this request (e.g. pending tool
++		// results); rotating accounts here would break the session and drop
++		// the provider prompt cache. Refresh the session binding as well so
++		// later plain turns stay on the same account.
++		if primaryID != "" {
++			s.cache.Set(provider+"::"+primaryID+"::"+model, pinned.ID)
++		}
++		entry.Infof("session-affinity: provider session pin | auth=%s provider=%s model=%s", pinned.ID, provider, model)
++		return pinned, nil
++	}
+ 	if primaryID == "" {
+ 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
+ 		return s.fallback.Pick(ctx, provider, model, opts, auths)
+-- 
+2.43.0
+

@@ -1,0 +1,301 @@
+From 4789ecdba0b1bee42025129090755a67eee61fd2 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 04:50:04 +0000
+Subject: [PATCH 2/4] Add cursor-api-key config support (auth synthesis + JWT
+ exchange)
+
+The production gateway authenticates to Cursor with a user API key
+(cursor-api-key in config.yaml) that is exchanged for short-lived Agent
+Connect JWTs via /auth/exchange_user_api_key. The branch only supported
+file-based OAuth cursor auths, so the config entry registered no clients
+and every request failed with 'unknown provider for model'.
+
+- config: CursorKey entries under cursor-api-key
+- synthesizer: cursor:apikey auth entries carrying the key as attribute
+- model registration: exchange the key eagerly so the live AvailableModels
+  catalog (grok-4.5 etc.) registers instead of the builtin fallback
+- executor: keep the exchanged JWT fresh, re-exchanging before expiry
+
+Co-authored-by: Apologetic2022 <Apologetic2022@users.noreply.github.com>
+---
+ internal/config/config.go                    | 33 ++++++++++++
+ internal/runtime/executor/cursor_executor.go | 57 ++++++++++++++++++++
+ internal/watcher/synthesizer/config.go       | 55 +++++++++++++++++++
+ sdk/cliproxy/cursor_models.go                | 48 +++++++++++++++--
+ 4 files changed, 189 insertions(+), 4 deletions(-)
+
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 1b9d5a0..8d0f0aa 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -135,6 +135,10 @@ type Config struct {
+ 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
+ 	ClaudeKey []ClaudeKey `yaml:"claude-api-key" json:"claude-api-key"`
+ 
++	// CursorKey defines a list of Cursor API key configurations. Each key is
++	// exchanged for short-lived Agent Connect JWTs at runtime.
++	CursorKey []CursorKey `yaml:"cursor-api-key" json:"cursor-api-key"`
++
+ 	// ClaudeHeaderDefaults configures default header values for Claude API requests.
+ 	// These are used as fallbacks when the client does not send its own headers.
+ 	ClaudeHeaderDefaults ClaudeHeaderDefaults `yaml:"claude-header-defaults" json:"claude-header-defaults"`
+@@ -487,6 +491,35 @@ type ClaudeKey struct {
+ func (k ClaudeKey) GetAPIKey() string  { return k.APIKey }
+ func (k ClaudeKey) GetBaseURL() string { return k.BaseURL }
+ 
++// CursorKey represents the configuration for a Cursor API key credential.
++// The key (crsr_…) is exchanged for a short-lived Agent Connect JWT at
++// runtime via /auth/exchange_user_api_key.
++type CursorKey struct {
++	// APIKey is the Cursor user API key.
++	APIKey string `yaml:"api-key" json:"api-key"`
++
++	// Priority controls selection preference when multiple credentials match.
++	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
++
++	// Prefix optionally namespaces models for this credential.
++	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
++
++	// BaseURL overrides the Cursor API endpoint (default https://api2.cursor.sh).
++	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
++
++	// ProxyURL overrides the global proxy setting for this key if provided.
++	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
++
++	// ExcludedModels lists model IDs that should be excluded for this credential.
++	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
++
++	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
++	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
++}
++
++func (k CursorKey) GetAPIKey() string  { return k.APIKey }
++func (k CursorKey) GetBaseURL() string { return k.BaseURL }
++
+ // ClaudeModel describes a mapping between an alias and the actual upstream model name.
+ type ClaudeModel struct {
+ 	// Name is the upstream model identifier used when issuing requests.
+diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
+index 93757d6..2b6db3c 100644
+--- a/internal/runtime/executor/cursor_executor.go
++++ b/internal/runtime/executor/cursor_executor.go
+@@ -484,6 +484,9 @@ func (e *CursorExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
+ 
+ func (e *CursorExecutor) ensureCredentials(ctx context.Context, auth *cliproxyauth.Auth) (cursorlib.AccountCredentials, error) {
+ 	creds := cursorlib.CredentialsFromMetadata(authMetadata(auth))
++	if apiKey := cursorExecAPIKey(auth); apiKey != "" {
++		return e.ensureAPIKeyCredentials(ctx, auth, creds, apiKey)
++	}
+ 	if creds.AccessToken == "" {
+ 		return creds, fmt.Errorf("cursor: auth missing access_token")
+ 	}
+@@ -512,6 +515,60 @@ func (e *CursorExecutor) ensureCredentials(ctx context.Context, auth *cliproxyau
+ 	return creds, nil
+ }
+ 
++// ensureAPIKeyCredentials keeps a short-lived Agent Connect JWT fresh for a
++// config-provided Cursor user API key (exchanged via /auth/exchange_user_api_key).
++func (e *CursorExecutor) ensureAPIKeyCredentials(ctx context.Context, auth *cliproxyauth.Auth, creds cursorlib.AccountCredentials, apiKey string) (cursorlib.AccountCredentials, error) {
++	needsExchange := creds.AccessToken == ""
++	if !needsExchange {
++		if expired := stringFromMeta(authMetadata(auth), "expired"); expired != "" {
++			storage := &cursorauth.TokenStorage{AccessToken: creds.AccessToken, RefreshToken: apiKey, Expired: expired}
++			needsExchange = storage.NeedsRefresh()
++		} else if exp := cursorauth.TokenExpiry(creds.AccessToken); !exp.IsZero() && time.Now().After(exp) {
++			needsExchange = true
++		}
++	}
++	if !needsExchange {
++		return creds, nil
++	}
++	refreshed, err := e.svc.RefreshToken(ctx, apiKey, "", creds.BaseURL)
++	if err != nil {
++		if creds.AccessToken == "" {
++			return creds, fmt.Errorf("cursor: api key exchange failed: %w", err)
++		}
++		log.Warnf("cursor api key exchange failed, using existing token: %v", err)
++		return creds, nil
++	}
++	creds.AccessToken = refreshed.AccessToken
++	if auth != nil {
++		if auth.Metadata == nil {
++			auth.Metadata = map[string]any{}
++		}
++		auth.Metadata["access_token"] = refreshed.AccessToken
++		if !refreshed.ExpiresAt.IsZero() {
++			auth.Metadata["expired"] = refreshed.ExpiresAt.UTC().Format(time.RFC3339)
++		}
++	}
++	return creds, nil
++}
++
++// cursorExecAPIKey returns the configured Cursor user API key for an auth.
++func cursorExecAPIKey(auth *cliproxyauth.Auth) string {
++	if auth == nil {
++		return ""
++	}
++	if auth.Attributes != nil {
++		if key := strings.TrimSpace(auth.Attributes["api_key"]); key != "" {
++			return key
++		}
++	}
++	if auth.Metadata != nil {
++		if v, ok := auth.Metadata["api_key"].(string); ok {
++			return strings.TrimSpace(v)
++		}
++	}
++	return ""
++}
++
+ func authMetadata(auth *cliproxyauth.Auth) map[string]any {
+ 	if auth == nil {
+ 		return nil
+diff --git a/internal/watcher/synthesizer/config.go b/internal/watcher/synthesizer/config.go
+index a776b58..da91930 100644
+--- a/internal/watcher/synthesizer/config.go
++++ b/internal/watcher/synthesizer/config.go
+@@ -34,6 +34,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
+ 	out = append(out, s.synthesizeInteractionsKeys(ctx)...)
+ 	// Claude API Keys
+ 	out = append(out, s.synthesizeClaudeKeys(ctx)...)
++	// Cursor API Keys
++	out = append(out, s.synthesizeCursorKeys(ctx)...)
+ 	// Codex API Keys
+ 	out = append(out, s.synthesizeCodexKeys(ctx)...)
+ 	// OpenAI-compat
+@@ -168,6 +170,59 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
+ 	return out
+ }
+ 
++// synthesizeCursorKeys creates Auth entries for Cursor API keys. The key is
++// stored as an attribute; the executor exchanges it for a short-lived Agent
++// Connect JWT on demand.
++func (s *ConfigSynthesizer) synthesizeCursorKeys(ctx *SynthesisContext) []*coreauth.Auth {
++	cfg := ctx.Config
++	now := ctx.Now
++	idGen := ctx.IDGenerator
++
++	out := make([]*coreauth.Auth, 0, len(cfg.CursorKey))
++	for i := range cfg.CursorKey {
++		ck := cfg.CursorKey[i]
++		key := strings.TrimSpace(ck.APIKey)
++		if key == "" {
++			continue
++		}
++		base := strings.TrimSpace(ck.BaseURL)
++		id, token := idGen.Next("cursor:apikey", key, base)
++		attrs := map[string]string{
++			"source":  fmt.Sprintf("config:cursor[%s]", token),
++			"api_key": key,
++		}
++		if ck.Priority != 0 {
++			attrs["priority"] = strconv.Itoa(ck.Priority)
++		}
++		metadata := map[string]any{
++			"type":    "cursor",
++			"api_key": key,
++		}
++		if base != "" {
++			attrs["base_url"] = base
++			metadata["base_url"] = base
++		}
++		if ck.DisableCooling {
++			metadata["disable_cooling"] = true
++		}
++		a := &coreauth.Auth{
++			ID:         id,
++			Provider:   "cursor",
++			Label:      "cursor-apikey",
++			Prefix:     strings.TrimSpace(ck.Prefix),
++			Status:     coreauth.StatusActive,
++			ProxyURL:   strings.TrimSpace(ck.ProxyURL),
++			Attributes: attrs,
++			Metadata:   metadata,
++			CreatedAt:  now,
++			UpdatedAt:  now,
++		}
++		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
++		out = append(out, a)
++	}
++	return out
++}
++
+ // synthesizeCodexKeys creates Auth entries for Codex API keys.
+ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreauth.Auth {
+ 	cfg := ctx.Config
+diff --git a/sdk/cliproxy/cursor_models.go b/sdk/cliproxy/cursor_models.go
+index ddcbbab..7ee5dba 100644
+--- a/sdk/cliproxy/cursor_models.go
++++ b/sdk/cliproxy/cursor_models.go
+@@ -5,6 +5,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
+ 	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+ 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+@@ -15,13 +16,34 @@ func (s *Service) fetchCursorModelsForAuth(ctx context.Context, auth *coreauth.A
+ 	if auth == nil {
+ 		return nil
+ 	}
+-	creds := cursorlib.CredentialsFromMetadata(auth.Metadata)
+-	if strings.TrimSpace(creds.AccessToken) == "" {
+-		return nil
+-	}
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
++	creds := cursorlib.CredentialsFromMetadata(auth.Metadata)
++	if strings.TrimSpace(creds.AccessToken) == "" {
++		// API-key credentials have no stored token yet: exchange eagerly so
++		// the live model catalog (not just the builtin fallback) registers.
++		apiKey := cursorAuthAPIKey(auth)
++		if apiKey == "" {
++			return nil
++		}
++		exchangeCtx, cancelExchange := context.WithTimeout(ctx, 25*time.Second)
++		refreshed, err := cursorauth.NewAuthService().RefreshToken(exchangeCtx, apiKey, "", creds.BaseURL)
++		cancelExchange()
++		if err != nil {
++			log.WithError(err).Warn("cursor: api key exchange failed; using builtin model list")
++			return nil
++		}
++		if auth.Metadata == nil {
++			auth.Metadata = map[string]any{}
++		}
++		auth.Metadata["access_token"] = refreshed.AccessToken
++		if !refreshed.ExpiresAt.IsZero() {
++			auth.Metadata["expired"] = refreshed.ExpiresAt.UTC().Format(time.RFC3339)
++		}
++		creds = cursorlib.CredentialsFromMetadata(auth.Metadata)
++		log.Infof("cursor: exchanged api key for agent token (auth %s)", auth.ID)
++	}
+ 	fetchCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+ 	defer cancel()
+ 
+@@ -37,3 +59,21 @@ func (s *Service) fetchCursorModelsForAuth(ctx context.Context, auth *coreauth.A
+ 	log.Infof("cursor: AvailableModels loaded %d models for auth %s", len(models), auth.ID)
+ 	return cursorlib.CatalogToModelInfos(models)
+ }
++
++// cursorAuthAPIKey returns the configured Cursor user API key for an auth.
++func cursorAuthAPIKey(auth *coreauth.Auth) string {
++	if auth == nil {
++		return ""
++	}
++	if auth.Attributes != nil {
++		if key := strings.TrimSpace(auth.Attributes["api_key"]); key != "" {
++			return key
++		}
++	}
++	if auth.Metadata != nil {
++		if v, ok := auth.Metadata["api_key"].(string); ok {
++			return strings.TrimSpace(v)
++		}
++	}
++	return ""
++}
+-- 
+2.43.0
+
