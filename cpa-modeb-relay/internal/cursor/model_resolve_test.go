@@ -59,7 +59,7 @@ func TestResolveRequestedModelSuffix(t *testing.T) {
 func TestBuildRunRequestSendsParameters(t *testing.T) {
 	msg, _, _, err := buildRunRequest("gpt-5.4-thinking", []ChatMessage{
 		{Role: "user", Content: "hi"},
-	}, nil, ToolChoice{})
+	}, nil, SessionOptions{ToolChoice: ToolChoice{}})
 	if err != nil {
 		t.Fatal(err)
 	}
