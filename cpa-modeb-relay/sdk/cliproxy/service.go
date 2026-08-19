@@ -118,6 +118,16 @@ type Service struct {
 	homeLogForwarder  *logging.HomeAppLogForwarder
 	homePluginSyncMu  sync.Mutex
 	homePluginSyncKey string
+
+	// cursorCatalogStore caches the last AvailableModels response of every
+	// Cursor credential so an upstream outage cannot unregister live models.
+	cursorCatalogStore *cursorCatalogStore
+	cursorCatalogOnce  sync.Once
+
+	// cursorCatalogRetries owns the background pollers that recover a Cursor
+	// model catalog after a failed fetch.
+	cursorCatalogRetries *cursorCatalogRetries
+	cursorRetryOnce      sync.Once
 }
 
 const (
@@ -1860,6 +1870,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			s.authQueueStop()
 			s.authQueueStop = nil
 		}
+		s.stopCursorCatalogRetries()
 
 		if errShutdownPprof := s.shutdownPprof(ctx); errShutdownPprof != nil {
 			log.Errorf("failed to stop pprof server: %v", errShutdownPprof)

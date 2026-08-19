@@ -9,8 +9,8 @@ import (
 
 // ModelParameter is one Cursor RequestedModel.parameters entry.
 type ModelParameter struct {
-	ID    string
-	Value string
+	ID    string `json:"id"`
+	Value string `json:"value"`
 }
 
 // ModelSelection is the wire model id + catalog-style parameters for AgentRun.

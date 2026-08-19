@@ -89,11 +89,18 @@ func GetCursorModels() []*ModelInfo {
 
 // WithCursorBuiltins injects hard-coded Cursor Agent models that should not
 // disappear when upstream models.json has an empty cursor section.
+//
+// This list is only reached before any AvailableModels response has been seen,
+// so it just has to cover the models clients routinely ask for; the live
+// catalog replaces it entirely once one fetch succeeds.
 func WithCursorBuiltins(models []*ModelInfo) []*ModelInfo {
 	return upsertModelInfos(models,
 		cursorBuiltinModel("default", "Cursor Default", "Cursor Agent default model selector."),
 		cursorBuiltinModel("claude-4.6-sonnet", "Claude 4.6 Sonnet", "Cursor Agent Claude 4.6 Sonnet."),
+		cursorBuiltinModel("claude-opus-5", "Claude Opus 5", "Cursor Agent Claude Opus 5."),
 		cursorBuiltinModel("gpt-5.4", "GPT-5.4", "Cursor Agent GPT-5.4."),
+		cursorBuiltinModel("grok-4.5", "Grok 4.5", "Cursor Agent Grok 4.5."),
+		cursorBuiltinModel("grok-4.6", "Grok 4.6", "Cursor Agent Grok 4.6."),
 	)
 }
 

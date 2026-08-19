@@ -22,24 +22,24 @@ const (
 
 // CatalogModel is one account-visible Cursor model from AvailableModels.
 type CatalogModel struct {
-	ID           string
-	DisplayName  string
-	DisplayModel string
-	Aliases      []string
-	Thinking     bool
-	SupportsImg  bool
-	MaxMode      bool
-	ContextLimit int
-	Parameters   []ModelParameter
+	ID           string           `json:"id"`
+	DisplayName  string           `json:"display_name,omitempty"`
+	DisplayModel string           `json:"display_model,omitempty"`
+	Aliases      []string         `json:"aliases,omitempty"`
+	Thinking     bool             `json:"thinking,omitempty"`
+	SupportsImg  bool             `json:"supports_img,omitempty"`
+	MaxMode      bool             `json:"max_mode,omitempty"`
+	ContextLimit int              `json:"context_limit,omitempty"`
+	Parameters   []ModelParameter `json:"parameters,omitempty"`
 	// WireID is the Agent-accepted model id from GetUsableModels (often a
 	// variant string like cursor-grok-4.5-high-fast). Empty means public ID.
-	WireID string
+	WireID string `json:"wire_id,omitempty"`
 }
 
 type catalogCache struct {
 	mu      sync.RWMutex
 	byModel map[string]CatalogModel
-	usable  []usableModel
+	usable  []UsableModel
 	fetched time.Time
 }
 
@@ -63,16 +63,71 @@ func RememberCatalog(models []CatalogModel) {
 	globalCatalogCache.fetched = time.Now()
 }
 
-func rememberUsableModels(usable []usableModel) {
+func rememberUsableModels(usable []UsableModel) {
 	globalCatalogCache.mu.Lock()
 	defer globalCatalogCache.mu.Unlock()
-	globalCatalogCache.usable = append([]usableModel(nil), usable...)
+	globalCatalogCache.usable = append([]UsableModel(nil), usable...)
 }
 
-func cachedUsableModels() []usableModel {
+// CatalogSnapshot is a serializable copy of a fetched Cursor model catalog.
+// AvailableModels is only reachable through the account's upstream, so the
+// last good response is kept to survive an upstream outage.
+type CatalogSnapshot struct {
+	FetchedAt time.Time      `json:"fetched_at"`
+	Models    []CatalogModel `json:"models"`
+	Usable    []UsableModel  `json:"usable,omitempty"`
+}
+
+// SnapshotCatalog returns the models and Agent wire ids currently cached for
+// ResolveRequestedModel, or nil when nothing has been fetched yet.
+func SnapshotCatalog(models []CatalogModel) *CatalogSnapshot {
+	if len(models) == 0 {
+		return nil
+	}
+	globalCatalogCache.mu.RLock()
+	usable := append([]UsableModel(nil), globalCatalogCache.usable...)
+	fetched := globalCatalogCache.fetched
+	globalCatalogCache.mu.RUnlock()
+	if fetched.IsZero() {
+		fetched = time.Now()
+	}
+	return &CatalogSnapshot{
+		FetchedAt: fetched,
+		Models:    append([]CatalogModel(nil), models...),
+		Usable:    usable,
+	}
+}
+
+// RestoreCatalog re-seeds the resolver cache from a snapshot so that a run
+// dispatched while AvailableModels is unreachable still resolves the wire ids
+// and variant parameters the account last advertised. Models fetched live
+// always win: entries are merged, and the usable list is only adopted when the
+// process has none.
+func RestoreCatalog(snapshot *CatalogSnapshot) {
+	if snapshot == nil || len(snapshot.Models) == 0 {
+		return
+	}
+	globalCatalogCache.mu.Lock()
+	for _, model := range snapshot.Models {
+		id := strings.ToLower(strings.TrimSpace(model.ID))
+		if id == "" {
+			continue
+		}
+		if _, ok := globalCatalogCache.byModel[id]; ok {
+			continue
+		}
+		globalCatalogCache.byModel[id] = model
+	}
+	if len(globalCatalogCache.usable) == 0 && len(snapshot.Usable) > 0 {
+		globalCatalogCache.usable = append([]UsableModel(nil), snapshot.Usable...)
+	}
+	globalCatalogCache.mu.Unlock()
+}
+
+func cachedUsableModels() []UsableModel {
 	globalCatalogCache.mu.RLock()
 	defer globalCatalogCache.mu.RUnlock()
-	return append([]usableModel(nil), globalCatalogCache.usable...)
+	return append([]UsableModel(nil), globalCatalogCache.usable...)
 }
 
 func catalogEntry(modelID string) (CatalogModel, bool) {
@@ -146,13 +201,14 @@ func FetchAvailableModels(ctx context.Context, creds AccountCredentials) ([]Cata
 	return models, nil
 }
 
-type usableModel struct {
-	ID          string
-	DisplayName string
-	Aliases     []string
+// UsableModel is one Agent-accepted model id from GetUsableModels.
+type UsableModel struct {
+	ID          string   `json:"id"`
+	DisplayName string   `json:"display_name,omitempty"`
+	Aliases     []string `json:"aliases,omitempty"`
 }
 
-func fetchUsableModels(ctx context.Context, baseURL string, headers map[string]string, jar *CookieJar) ([]usableModel, error) {
+func fetchUsableModels(ctx context.Context, baseURL string, headers map[string]string, jar *CookieJar) ([]UsableModel, error) {
 	paths := []string{usableModelsAiServicePath, usableModelsAgentServicePath}
 	var lastErr error
 	for i, path := range paths {
@@ -170,13 +226,13 @@ func fetchUsableModels(ctx context.Context, baseURL string, headers map[string]s
 		if jar != nil {
 			jar.RememberResponse(baseURL, respHdr)
 		}
-		out := make([]usableModel, 0, len(resp.GetModels()))
+		out := make([]UsableModel, 0, len(resp.GetModels()))
 		for _, model := range resp.GetModels() {
 			id := strings.TrimSpace(model.GetModelId())
 			if id == "" {
 				continue
 			}
-			out = append(out, usableModel{
+			out = append(out, UsableModel{
 				ID:          id,
 				DisplayName: strings.TrimSpace(model.GetDisplayName()),
 				Aliases:     append([]string(nil), model.GetAliases()...),
@@ -187,7 +243,7 @@ func fetchUsableModels(ctx context.Context, baseURL string, headers map[string]s
 	return nil, lastErr
 }
 
-func attachWireIDs(models []CatalogModel, usable []usableModel) {
+func attachWireIDs(models []CatalogModel, usable []UsableModel) {
 	if len(models) == 0 || len(usable) == 0 {
 		return
 	}
@@ -196,7 +252,7 @@ func attachWireIDs(models []CatalogModel, usable []usableModel) {
 	}
 }
 
-func matchUsableWireID(model CatalogModel, usable []usableModel) string {
+func matchUsableWireID(model CatalogModel, usable []UsableModel) string {
 	publicID := strings.TrimSpace(model.ID)
 	if publicID == "" {
 		return ""
