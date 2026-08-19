@@ -20,6 +20,11 @@ import (
 // assistant prose becomes an AssistantMessage step and every function call
 // becomes an McpToolCall step carrying its result inline.
 
+// Blob ids are content hashes, so a turn only lands on the cached prefix when
+// it serializes to the same bytes every time. Go randomizes protobuf map order
+// by default, which would give McpArgs.Args a fresh encoding per request.
+var deterministicProto = proto.MarshalOptions{Deterministic: true}
+
 // stableMessageID derives a message id from the message text so a replayed
 // history row keeps the id the action carried when it was first sent.
 func stableMessageID(text string) string {
@@ -52,7 +57,7 @@ func (b *turnBuilder) addStep(step *agentv1.ConversationStep) {
 		// empty-prompted turn rather than dropping it.
 		b.start("")
 	}
-	payload, err := proto.Marshal(step)
+	payload, err := deterministicProto.Marshal(step)
 	if err != nil {
 		return
 	}
@@ -67,14 +72,14 @@ func (b *turnBuilder) flush() {
 	if strings.TrimSpace(b.userText) == "" && len(b.steps) == 0 {
 		return
 	}
-	userPayload, err := proto.Marshal(&agentv1.UserMessage{
+	userPayload, err := deterministicProto.Marshal(&agentv1.UserMessage{
 		Text:      b.userText,
 		MessageId: stableMessageID(b.userText),
 	})
 	if err != nil {
 		return
 	}
-	turnPayload, err := proto.Marshal(&agentv1.ConversationTurnStructure{
+	turnPayload, err := deterministicProto.Marshal(&agentv1.ConversationTurnStructure{
 		Turn: &agentv1.ConversationTurnStructure_AgentConversationTurn{
 			AgentConversationTurn: &agentv1.AgentConversationTurnStructure{
 				UserMessage: storeBlob(b.blobStore, userPayload),

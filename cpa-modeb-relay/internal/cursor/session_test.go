@@ -1,9 +1,11 @@
 package cursor
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strings"
 	"testing"
 
@@ -33,7 +35,7 @@ func TestBuildRunRequestIncludesMcpTools(t *testing.T) {
 		Name:        "get_weather",
 		Description: "weather",
 		Parameters:  map[string]any{"type": "object"},
-	}}, SessionOptions{ToolChoice: ToolChoice{}})
+	}}, ToolChoice{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +101,7 @@ func TestBuildRunRequestHistoryUsesConversationTurns(t *testing.T) {
 		}},
 		{Role: "tool", ToolCallID: "c1", Name: "get_weather", Content: `{"ok":true}`},
 		{Role: "user", Content: "again"},
-	}, nil, SessionOptions{ToolChoice: ToolChoice{}})
+	}, nil, ToolChoice{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +156,7 @@ func TestBuildRunRequestResumeCarriesTrailingToolResults(t *testing.T) {
 			{ID: "c9", Name: "get_weather", Arguments: map[string]any{"city": "NY"}},
 		}},
 		{Role: "tool", ToolCallID: "c9", Name: "get_weather", Content: `{"temp":21}`},
-	}, nil, SessionOptions{ToolChoice: ToolChoice{}})
+	}, nil, ToolChoice{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,43 +194,59 @@ func TestBuildConversationTurnsSplitsOnUserMessages(t *testing.T) {
 	}
 }
 
-func TestBuildRunRequestReusesConversationIDAcrossTurns(t *testing.T) {
+func TestBuildRunRequestIsByteStable(t *testing.T) {
+	// Blob ids are content hashes, so any per-request nondeterminism (protobuf
+	// map ordering, generated ids) moves the whole history off the cached
+	// prefix and re-bills the transcript.
 	history := []ChatMessage{
-		{Role: "user", Content: "one"},
-		{Role: "assistant", Content: "first"},
+		{Role: "system", Content: "be terse"},
+		{Role: "user", Content: "weather in NY?"},
+		{Role: "assistant", Content: "checking", ToolCalls: []ToolCall{{
+			ID:   "c1",
+			Name: "get_weather",
+			Arguments: map[string]any{
+				"city": "NY", "units": "metric", "days": 3.0,
+				"detail": "full", "lang": "en", "extra": "x",
+			},
+		}}},
+		{Role: "tool", ToolCallID: "c1", Name: "get_weather", Content: `{"temp":21}`},
+		{Role: "user", Content: "and tomorrow?"},
 	}
-	_, _, first, err := buildRunRequest("default", append(history, ChatMessage{Role: "user", Content: "two"}), nil, SessionOptions{AuthID: "acct-a"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	next := append(history,
-		ChatMessage{Role: "user", Content: "two"},
-		ChatMessage{Role: "assistant", Content: "second"},
-		ChatMessage{Role: "user", Content: "three"},
-	)
-	_, _, second, err := buildRunRequest("default", next, nil, SessionOptions{AuthID: "acct-a"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first != second {
-		t.Fatalf("follow-up turn changed conversation id: %s -> %s", first, second)
-	}
-
-	// A different credential cannot reach the first account's prompt cache, so
-	// it must not inherit its conversation id.
-	_, _, other, err := buildRunRequest("default", next, nil, SessionOptions{AuthID: "acct-b"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if other == second {
-		t.Fatal("conversation id leaked across credentials")
+	var first []byte
+	for i := 0; i < 8; i++ {
+		msg, blobs, _, err := buildRunRequest("default", history, nil, ToolChoice{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The conversation state and every blob it resolves to make up the
+		// prompt; the surrounding request metadata does not.
+		encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(msg.GetRunRequest().GetConversationState())
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys := make([]string, 0, len(blobs))
+		for key := range blobs {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			encoded = append(encoded, key...)
+			encoded = append(encoded, blobs[key]...)
+		}
+		if i == 0 {
+			first = encoded
+			continue
+		}
+		if !bytes.Equal(first, encoded) {
+			t.Fatalf("prompt content differs between builds on attempt %d", i+1)
+		}
 	}
 }
 
 func TestBuildRunRequestToolChoiceDirective(t *testing.T) {
 	_, blobs, _, err := buildRunRequest("default", []ChatMessage{
 		{Role: "user", Content: "what's the weather?"},
-	}, []ToolDefinition{{Name: "get_weather"}}, SessionOptions{ToolChoice: ToolChoice{Mode: "required"}})
+	}, []ToolDefinition{{Name: "get_weather"}}, ToolChoice{Mode: "required"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +323,7 @@ func TestFromProtobufValueKeepsStringsVerbatim(t *testing.T) {
 func TestBuildRunRequestMcpOnlyDirective(t *testing.T) {
 	msg, blobs, _, err := buildRunRequest("default", []ChatMessage{
 		{Role: "user", Content: "list the workspace"},
-	}, []ToolDefinition{{Name: "Task"}, {Name: "Bash"}}, SessionOptions{ToolChoice: ToolChoice{}})
+	}, []ToolDefinition{{Name: "Task"}, {Name: "Bash"}}, ToolChoice{})
 	if err != nil {
 		t.Fatal(err)
 	}

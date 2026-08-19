@@ -122,7 +122,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 	}
 	tools = ApplyToolChoice(tools, opts.ToolChoice)
 	selection := ResolveRequestedModel(model)
-	clientMsg, blobStore, conversationID, err := buildRunRequest(model, messages, tools, opts)
+	clientMsg, blobStore, conversationID, err := buildRunRequest(model, messages, tools, opts.ToolChoice)
 	if err != nil {
 		return nil, err
 	}

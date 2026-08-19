@@ -7,7 +7,8 @@ PROXY='http://apologetic_0V4Iz:D6W+FpaVJ_ue6qu_@127.0.0.1:18006'
 pkill -f 'cachetest/cpa-' 2>/dev/null
 sleep 1
 cd "$HOME/cachetest" || exit 1
-HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" https_proxy="$PROXY" http_proxy="$PROXY" \
+CURSOR_DISABLE_CONV_REUSE="${CURSOR_DISABLE_CONV_REUSE:-}" \
+  HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" https_proxy="$PROXY" http_proxy="$PROXY" \
   NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
   nohup "./$BIN" -config "$HOME/cachetest/config.yaml" >"$HOME/cachetest/$BIN.out" 2>&1 &
 sleep 5

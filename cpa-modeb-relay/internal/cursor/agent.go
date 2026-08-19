@@ -221,8 +221,7 @@ const resumeContinuationPrompt = "Continue the conversation. The results of your
 	"already provided in the conversation history above. Use them to fulfill the user's most recent " +
 	"request. Call more tools if needed; otherwise answer the user directly."
 
-func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition, opts SessionOptions) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
-	choice := opts.ToolChoice
+func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition, choice ToolChoice) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
 	selection := ResolveRequestedModel(model)
 	model = selection.ModelID
 	blobStore := map[string][]byte{}
@@ -262,11 +261,6 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 	turnIDs, systemRows := buildConversationTurns(blobStore, historyMsgs)
 	rootIDs := append([][]byte{systemBlob}, systemRows...)
 
-	// Fingerprint the conversation before the directive rows are appended:
-	// directives sit after the system rows, so they shift as the prompt grows
-	// and would break the prefix relationship between successive turns.
-	cacheIDs := append(append([][]byte(nil), rootIDs...), turnIDs...)
-
 	if directive := toolChoiceDirective(choice); directive != "" {
 		rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
 			"role":    "system",
@@ -289,10 +283,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		actionText = actionText + "\n\n[Tool constraint: " + directive + "]"
 	}
 
-	// Reuse the conversation id of the longest known ancestor turn so upstream
-	// can serve this prompt's head from its cache. Scoped per credential and
-	// model because the provider cache is not shared across either.
-	conversationID := defaultConversationRegistry.resolve(opts.AuthID+"\x00"+selection.ModelID, cacheIDs)
+	conversationID := uuid.NewString()
 	// Desktop / cursor2api do not set exclude_workspace_context by default;
 	// forcing it true is rejected for many accounts ("Workspace context
 	// exclusion is not allowed…").
