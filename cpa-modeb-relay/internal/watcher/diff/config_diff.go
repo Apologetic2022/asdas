@@ -265,6 +265,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if o.DisableCooling != n.DisableCooling {
 				changes = append(changes, fmt.Sprintf("cursor[%d].disable-cooling: %t -> %t", i, o.DisableCooling, n.DisableCooling))
 			}
+			if o.Disabled != n.Disabled {
+				changes = append(changes, fmt.Sprintf("cursor[%d].disabled: %t -> %t", i, o.Disabled, n.Disabled))
+			}
 		}
 	}
 

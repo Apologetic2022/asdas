@@ -181,6 +181,9 @@ func (s *ConfigSynthesizer) synthesizeCursorKeys(ctx *SynthesisContext) []*corea
 	out := make([]*coreauth.Auth, 0, len(cfg.CursorKey))
 	for i := range cfg.CursorKey {
 		ck := cfg.CursorKey[i]
+		if ck.Disabled {
+			continue
+		}
 		key := strings.TrimSpace(ck.APIKey)
 		if key == "" {
 			continue

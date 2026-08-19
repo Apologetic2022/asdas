@@ -734,3 +734,53 @@ func TestConfigSynthesizer_AllProviders(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigSynthesizer_CursorKeysSkipDisabled(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			CursorKey: []config.CursorKey{
+				{APIKey: "crsr_off", Disabled: true},
+				{APIKey: "crsr_on"},
+			},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auths = %d, want only the enabled key", len(auths))
+	}
+	if got := auths[0].Attributes["api_key"]; got != "crsr_on" {
+		t.Fatalf("api_key = %q, want %q", got, "crsr_on")
+	}
+}
+
+func TestConfigSynthesizer_CursorKeyIDsSurviveDisablingAnother(t *testing.T) {
+	build := func(cfg *config.Config) map[string]string {
+		auths, err := NewConfigSynthesizer().Synthesize(&SynthesisContext{
+			Config:      cfg,
+			Now:         time.Now(),
+			IDGenerator: NewStableIDGenerator(),
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		out := make(map[string]string, len(auths))
+		for _, a := range auths {
+			out[a.Attributes["api_key"]] = a.ID
+		}
+		return out
+	}
+
+	before := build(&config.Config{CursorKey: []config.CursorKey{{APIKey: "crsr_a"}, {APIKey: "crsr_b"}}})
+	after := build(&config.Config{CursorKey: []config.CursorKey{{APIKey: "crsr_a", Disabled: true}, {APIKey: "crsr_b"}}})
+
+	if before["crsr_b"] == "" || before["crsr_b"] != after["crsr_b"] {
+		t.Fatalf("auth ID for the untouched key changed: %q -> %q", before["crsr_b"], after["crsr_b"])
+	}
+}

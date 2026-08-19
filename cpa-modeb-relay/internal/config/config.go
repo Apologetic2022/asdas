@@ -515,6 +515,9 @@ type CursorKey struct {
 
 	// DisableCooling disables auth/model cooldown scheduling for this credential when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// Disabled keeps the credential in the configuration but excludes it from auth synthesis.
+	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 }
 
 func (k CursorKey) GetAPIKey() string  { return k.APIKey }
