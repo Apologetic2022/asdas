@@ -2,8 +2,11 @@ package cursor
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
 const (
@@ -80,41 +83,81 @@ func (m *SessionManager) LookupPending(toolCallID string) *Session {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	session := m.pending[toolCallID]
+	canonical := m.canonicalPendingIDLocked(toolCallID)
+	if canonical == "" {
+		return nil
+	}
+	session := m.pending[canonical]
 	if session != nil {
 		session.touch()
 	}
 	return session
 }
 
-// ResolveForToolResults finds the single live session that owns all results.
-func (m *SessionManager) ResolveForToolResults(results []ToolResult) (*Session, error) {
+// canonicalPendingIDLocked maps a client-supplied tool_call_id to the pending
+// id the upstream run is waiting on. Anthropic-protocol responses carry a
+// sanitized copy of the id and agent CLIs commonly prefix their own call ids
+// around it (e.g. "call-<uuid>-13_<original>"), so an exact match is tried
+// first and containment of the original or its sanitized form second.
+func (m *SessionManager) canonicalPendingIDLocked(clientID string) string {
+	if clientID == "" {
+		return ""
+	}
+	if _, ok := m.pending[clientID]; ok {
+		return clientID
+	}
+	const minMatchLen = 8 // avoid accidental containment of short ids
+	best := ""
+	for pid := range m.pending {
+		if len(pid) < minMatchLen {
+			continue
+		}
+		if strings.Contains(clientID, pid) || strings.Contains(clientID, util.SanitizeClaudeToolID(pid)) {
+			if len(pid) > len(best) {
+				best = pid
+			}
+		}
+	}
+	return best
+}
+
+// ResolveForToolResults finds the single live session that owns all results
+// and returns the results rewritten to the upstream pending ids so they can
+// be submitted directly.
+func (m *SessionManager) ResolveForToolResults(results []ToolResult) (*Session, []ToolResult, error) {
 	if len(results) == 0 {
-		return nil, fmt.Errorf("cursor: no tool results")
+		return nil, nil, fmt.Errorf("cursor: no tool results")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var owner *Session
-	for _, result := range results {
+	normalized := make([]ToolResult, len(results))
+	for i, result := range results {
 		if result.ToolCallID == "" {
-			return nil, fmt.Errorf("cursor: tool result missing tool_call_id")
+			return nil, nil, fmt.Errorf("cursor: tool result missing tool_call_id")
 		}
-		session := m.pending[result.ToolCallID]
+		canonical := m.canonicalPendingIDLocked(result.ToolCallID)
+		if canonical == "" {
+			return nil, nil, fmt.Errorf("cursor: unknown or expired tool_call_id %s", result.ToolCallID)
+		}
+		session := m.pending[canonical]
 		if session == nil {
-			return nil, fmt.Errorf("cursor: unknown or expired tool_call_id %s", result.ToolCallID)
+			return nil, nil, fmt.Errorf("cursor: unknown or expired tool_call_id %s", result.ToolCallID)
 		}
+		normalized[i] = result
+		normalized[i].ToolCallID = canonical
 		if owner == nil {
 			owner = session
 			continue
 		}
 		if owner.ID != session.ID {
-			return nil, fmt.Errorf("cursor: tool results belong to different sessions")
+			return nil, nil, fmt.Errorf("cursor: tool results belong to different sessions")
 		}
 	}
 	if owner != nil {
 		owner.touch()
 	}
-	return owner, nil
+	return owner, normalized, nil
 }
 
 // Remove drops a session and all of its pending indexes.

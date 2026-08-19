@@ -187,3 +187,121 @@ func TestProtobufValueRoundTrip(t *testing.T) {
 		t.Fatal("empty roundtrip")
 	}
 }
+
+func TestFromProtobufValueKeepsStringsVerbatim(t *testing.T) {
+	// Strings that look like JSON must NOT be re-parsed: "true" is a shell
+	// command, "{\"a\":1}" is a file body, "123" is a literal string arg.
+	for _, s := range []string{"true", "false", "null", "123", `{"a":1}`, `[1,2]`, "ls -la"} {
+		v, err := toProtobufValue(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := fromProtobufValue(v)
+		got, ok := out.(string)
+		if !ok || got != s {
+			t.Fatalf("string %q corrupted to %#v", s, out)
+		}
+	}
+}
+
+func TestBuildRunRequestMcpOnlyDirective(t *testing.T) {
+	msg, blobs, _, err := buildRunRequest("default", []ChatMessage{
+		{Role: "user", Content: "list the workspace"},
+	}, []ToolDefinition{{Name: "Task"}, {Name: "Bash"}}, ToolChoice{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, data := range blobs {
+		var payload map[string]any
+		if json.Unmarshal(data, &payload) != nil {
+			continue
+		}
+		if payload["role"] == "system" {
+			if content, _ := payload["content"].(string); strings.Contains(content, "ONLY tools available") &&
+				strings.Contains(content, "mcp_Task") && strings.Contains(content, "mcp_Bash") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("mcp-only tool directive missing from run request")
+	}
+	action := msg.GetRunRequest().GetAction().GetUserMessageAction().GetUserMessage().GetText()
+	if !strings.Contains(action, "Tool constraint") {
+		t.Fatalf("action text missing tool constraint: %q", action)
+	}
+}
+
+func TestCanonicalPendingIDFuzzyMatch(t *testing.T) {
+	m := NewSessionManager()
+	sess := &Session{ID: "s1", manager: m}
+	orig := "fc_ownxAbq-3LYxF7-a2d74f5f8eac5702_0"
+	m.BindPending(orig, sess)
+
+	// Exact.
+	if got := m.LookupPending(orig); got != sess {
+		t.Fatal("exact lookup failed")
+	}
+	// Client-side rewrite (ZCode style: prefix + original).
+	rewritten := "call-80338b6a-2b74-4b47-bd1c-3d18fae36cdd-13_" + orig
+	if got := m.LookupPending(rewritten); got != sess {
+		t.Fatal("rewritten id lookup failed")
+	}
+	// Unrelated id must not match.
+	if got := m.LookupPending("call-ffff-1_fc_other_9"); got != nil {
+		t.Fatal("unrelated id must not match")
+	}
+
+	owner, normalized, err := m.ResolveForToolResults([]ToolResult{{ToolCallID: rewritten, Content: "ok"}})
+	if err != nil || owner != sess {
+		t.Fatalf("resolve failed: %v", err)
+	}
+	if normalized[0].ToolCallID != orig {
+		t.Fatalf("expected normalization to %q, got %q", orig, normalized[0].ToolCallID)
+	}
+}
+
+func TestUnknownProtoFieldNumbers(t *testing.T) {
+	// field 99, varint 1: tag = 99<<3 | 0 = 0x318 → bytes 0x98 0x06, value 0x01
+	raw := []byte{0x98, 0x06, 0x01}
+	fields := unknownProtoFieldNumbers(raw)
+	if len(fields) != 1 || fields[0] != 99 {
+		t.Fatalf("expected [99], got %v", fields)
+	}
+}
+
+func TestWireToolNamePrefixesNativeCollisions(t *testing.T) {
+	cases := map[string]string{
+		"Task":        "mcp_Task",
+		"task":        "mcp_task",
+		"Bash":        "mcp_Bash",
+		"Glob":        "mcp_Glob",
+		"Grep":        "mcp_Grep",
+		"Read":        "mcp_Read",
+		"Write":       "mcp_Write",
+		"TodoWrite":   "mcp_TodoWrite",
+		"WebFetch":    "mcp_WebFetch",
+		"get_weather": "get_weather",
+		"MyCustom":    "MyCustom",
+	}
+	for in, want := range cases {
+		if got := wireToolName(in); got != want {
+			t.Fatalf("wireToolName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestIndexToolsMapsWireAndClientNames(t *testing.T) {
+	tools := []ToolDefinition{{Name: "Task"}, {Name: "get_weather"}}
+	idx := indexTools(tools)
+	if idx["Task"] == nil || idx["mcp_Task"] == nil || idx["Task"] != idx["mcp_Task"] {
+		t.Fatalf("wire alias not indexed: %#v", idx)
+	}
+	if idx["get_weather"] == nil {
+		t.Fatal("plain tool missing from index")
+	}
+	if idx["mcp_Task"].Name != "Task" {
+		t.Fatalf("client name must be preserved, got %q", idx["mcp_Task"].Name)
+	}
+}

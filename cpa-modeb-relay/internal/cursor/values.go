@@ -27,28 +27,12 @@ func fromProtobufValue(v *structpb.Value) any {
 	if err = json.Unmarshal(raw, &decoded); err != nil {
 		return v.AsInterface()
 	}
-	if s, ok := decoded.(string); ok {
-		trimmed := trimSpaceJSON(s)
-		if trimmed == "" {
-			return s
-		}
-		var nested any
-		if json.Unmarshal([]byte(trimmed), &nested) == nil {
-			return nested
-		}
-	}
+	// String values are returned verbatim. Re-parsing strings that merely
+	// look like JSON corrupts legitimate tool arguments: a shell command
+	// "true" became a boolean and a JSON document passed as a write-file
+	// content string became an object, which then failed the client tool's
+	// schema validation ("no exec result" from the caller's perspective).
 	return decoded
-}
-
-func trimSpaceJSON(s string) string {
-	start, end := 0, len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\n' || s[start] == '\r' || s[start] == '\t') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\n' || s[end-1] == '\r' || s[end-1] == '\t') {
-		end--
-	}
-	return s[start:end]
 }
 
 func decodeMcpArguments(args *agentv1.McpArgs) map[string]any {

@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
 	log "github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -131,12 +132,6 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 	}
 
 	profile := ProfileFromCredentials(creds)
-	requestID := uuid.NewString()
-	headers, err := profile.Headers(creds.AccessToken, requestID, "")
-	if err != nil {
-		return nil, err
-	}
-	headers["x-original-request-id"] = requestID
 
 	// Detach the Agent H2 stream from the inbound HTTP request context.
 	// Tool round-trips span multiple client requests; cancelling with the
@@ -145,7 +140,23 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		return nil, err
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
-	stream, err := OpenAgentRun(runCtx, creds.BaseURL, headers, first)
+	openRun := func() (*BidiStream, error) {
+		requestID := uuid.NewString()
+		headers, errHdr := profile.Headers(creds.AccessToken, requestID, "")
+		if errHdr != nil {
+			return nil, errHdr
+		}
+		headers["x-original-request-id"] = requestID
+		return OpenAgentRun(runCtx, creds.BaseURL, headers, first)
+	}
+	stream, err := openRun()
+	if err != nil && isTransientRunOpenError(err) && ctx.Err() == nil {
+		// Cursor's edge occasionally answers a run open with a bare 502/503;
+		// a single quick retry rides it out instead of failing the request.
+		log.Warnf("cursor: agent run open failed transiently (%v); retrying once", err)
+		time.Sleep(500 * time.Millisecond)
+		stream, err = openRun()
+	}
 	if err != nil {
 		cancel()
 		return nil, err
@@ -177,6 +188,26 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 	return session, nil
 }
 
+// isTransientRunOpenError reports whether an agent run open failure is worth
+// one immediate retry (upstream edge 5xx or a broken connection attempt).
+func isTransientRunOpenError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, marker := range []string{
+		"cursor agent run HTTP 502",
+		"cursor agent run HTTP 503",
+		"cursor agent run HTTP 504",
+		"cursor h2 open:",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func indexTools(tools []ToolDefinition) map[string]*ToolDefinition {
 	out := make(map[string]*ToolDefinition, len(tools))
 	for i := range tools {
@@ -184,7 +215,13 @@ func indexTools(tools []ToolDefinition) map[string]*ToolDefinition {
 		if name == "" {
 			continue
 		}
+		// Index by both the client name and the wire name the tool was
+		// advertised under; emitted tool_call events always carry the
+		// client name (tools[i].Name).
 		out[name] = &tools[i]
+		if wire := wireToolName(name); wire != name {
+			out[wire] = &tools[i]
+		}
 	}
 	return out
 }
@@ -230,6 +267,18 @@ func (s *Session) heartbeatLoop(ctx context.Context) {
 	}
 }
 
+// readChunk is one raw read from the Agent H2 response body.
+type readChunk struct {
+	data []byte
+	err  error
+}
+
+// parallelToolGrace is how long the read loop keeps draining after the first
+// client tool call before pausing the segment. Parallel tool calls are sent
+// back-to-back by the upstream agent; without the grace window only the first
+// one would surface in the current segment.
+const parallelToolGrace = 120 * time.Millisecond
+
 func (s *Session) readLoop(ctx context.Context) {
 	defer close(s.events)
 	decoder := NewDecoder()
@@ -240,12 +289,33 @@ func (s *Session) readLoop(ctx context.Context) {
 			decoder.SetCompression(enc)
 		}
 	}
-	readBuf := make([]byte, 32*1024)
+
+	// A dedicated goroutine performs the blocking body reads so the consumer
+	// loop can bound waits (parallel tool-call drain) without losing data.
+	reads := make(chan readChunk, 4)
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			n, errRead := s.stream.Read(buf)
+			chunk := readChunk{err: errRead}
+			if n > 0 {
+				chunk.data = append([]byte(nil), buf[:n]...)
+			}
+			select {
+			case reads <- chunk:
+			case <-ctx.Done():
+				return
+			}
+			if errRead != nil {
+				return
+			}
+		}
+	}()
+
 	for {
 		s.mu.Lock()
 		waiting := s.waitingTools
 		closed := s.closed
-		stream := s.stream
 		pauseCh := s.pauseCh
 		s.mu.Unlock()
 		if closed {
@@ -272,62 +342,94 @@ func (s *Session) readLoop(ctx context.Context) {
 			}
 		}
 
-		n, errRead := stream.Read(readBuf)
-		if n > 0 {
-			envelopes, errFeed := decoder.Feed(readBuf[:n])
-			if errFeed != nil {
-				s.fail(errFeed)
-				return
+		var chunk readChunk
+		select {
+		case <-ctx.Done():
+			continue
+		case chunk = <-reads:
+		}
+		endForTools, done := s.processChunk(decoder, chunk)
+		if done {
+			return
+		}
+		if !endForTools {
+			continue
+		}
+		// First client tool call of the segment: keep draining briefly so
+		// parallel tool calls issued together surface in the same segment.
+		timer := time.NewTimer(parallelToolGrace)
+	drain:
+		for {
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				break drain
+			case <-timer.C:
+				break drain
+			case chunk = <-reads:
+				_, done = s.processChunk(decoder, chunk)
+				if done {
+					timer.Stop()
+					return
+				}
 			}
-			endForTools := false
-			for _, env := range envelopes {
-				if env.EndStream() {
-					if len(env.Payload) > 0 {
-						var trailer struct {
-							Error json.RawMessage `json:"error"`
-						}
-						_ = json.Unmarshal(env.Payload, &trailer)
-						if len(trailer.Error) > 0 && string(trailer.Error) != "null" {
-							s.fail(fmt.Errorf("cursor connect end-stream error: %s", string(trailer.Error)))
-							return
-						}
+		}
+		s.beginWaitingTools()
+		s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
+	}
+}
+
+// processChunk feeds one raw read into the Connect decoder and dispatches the
+// complete envelopes. It reports whether the segment paused for client tools
+// and whether the read loop is finished.
+func (s *Session) processChunk(decoder *Decoder, chunk readChunk) (endForTools bool, done bool) {
+	if len(chunk.data) > 0 {
+		envelopes, errFeed := decoder.Feed(chunk.data)
+		if errFeed != nil {
+			s.fail(errFeed)
+			return false, true
+		}
+		for _, env := range envelopes {
+			if env.EndStream() {
+				if len(env.Payload) > 0 {
+					var trailer struct {
+						Error json.RawMessage `json:"error"`
 					}
-					s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
-					_ = s.Close()
-					return
+					_ = json.Unmarshal(env.Payload, &trailer)
+					if len(trailer.Error) > 0 && string(trailer.Error) != "null" {
+						s.fail(fmt.Errorf("cursor connect end-stream error: %s", string(trailer.Error)))
+						return false, true
+					}
 				}
-				serverMsg := &agentv1.AgentServerMessage{}
-				if err := proto.Unmarshal(env.Payload, serverMsg); err != nil {
-					s.fail(fmt.Errorf("cursor decode server message: %w", err))
-					return
-				}
-				pause, err := s.handleServerMessage(serverMsg)
-				if err != nil {
-					s.fail(err)
-					return
-				}
-				if pause {
-					endForTools = true
-				}
+				s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
+				_ = s.Close()
+				return false, true
 			}
-			if endForTools {
-				s.beginWaitingTools()
-				s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
+			serverMsg := &agentv1.AgentServerMessage{}
+			if err := proto.Unmarshal(env.Payload, serverMsg); err != nil {
+				s.fail(fmt.Errorf("cursor decode server message: %w", err))
+				return false, true
 			}
-		}
-		if errRead == io.EOF {
-			s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
-			_ = s.Close()
-			return
-		}
-		if errRead != nil {
-			s.fail(errRead)
-			return
-		}
-		if n == 0 {
-			time.Sleep(10 * time.Millisecond)
+			pause, err := s.handleServerMessage(serverMsg)
+			if err != nil {
+				s.fail(err)
+				return false, true
+			}
+			if pause {
+				endForTools = true
+			}
 		}
 	}
+	if chunk.err == io.EOF {
+		s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
+		_ = s.Close()
+		return false, true
+	}
+	if chunk.err != nil {
+		s.fail(chunk.err)
+		return false, true
+	}
+	return endForTools, false
 }
 
 func (s *Session) beginWaitingTools() {
@@ -640,7 +742,15 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 func (s *Session) handleExec(req *agentv1.ExecServerMessage) (bool, error) {
 	switch m := req.Message.(type) {
 	case nil:
-		return false, sendExecStreamClose(s.stream, req.Id)
+		// The agent harness asked the client to execute one of Cursor's
+		// built-in tools (task, shell, read_file, list_dir, …) whose exec
+		// variant is not part of the trimmed MVP proto, so the oneof decoded
+		// to nil. Closing the exec stream silently makes the model see the
+		// opaque "No exec result" failure; answer with an instructive error
+		// instead so the model reroutes to the declared MCP tools.
+		fields := unknownProtoFieldNumbers(req.ProtoReflect().GetUnknown())
+		log.Warnf("cursor: rejecting built-in tool exec request (unknown exec variant, proto fields %v); steering model to MCP tools %v", fields, s.availableToolNames())
+		return false, s.throwExec(req, s.nativeToolUnavailableMessage())
 	case *agentv1.ExecServerMessage_RequestContextArgs:
 		result := &agentv1.RequestContextResult{
 			Result: &agentv1.RequestContextResult_Success{
@@ -748,11 +858,12 @@ func (s *Session) lookupTool(name, provider string) *ToolDefinition {
 	return nil
 }
 
+// availableToolNames returns the wire names the model can actually call.
 func (s *Session) availableToolNames() []string {
 	names := make([]string, 0, len(s.tools))
 	for _, t := range s.tools {
 		if t.Name != "" {
-			names = append(names, t.Name)
+			names = append(names, wireToolName(t.Name))
 		}
 	}
 	return names
@@ -767,12 +878,32 @@ func (s *Session) requestContext() *agentv1.RequestContext {
 }
 
 func rejectUnsupportedExec(stream *BidiStream, req *agentv1.ExecServerMessage) error {
+	return throwExecOnStream(stream, req.Id, "No handler for Cursor exec message")
+}
+
+// nativeToolUnavailableMessage tells the model why a built-in tool failed and
+// which tools it must use instead.
+func (s *Session) nativeToolUnavailableMessage() string {
+	names := s.availableToolNames()
+	if len(names) == 0 {
+		return "This built-in tool is not available in this environment. Answer the user directly without tools."
+	}
+	return "This built-in tool is not available in this environment. Do not retry it. " +
+		"Use ONLY these MCP tools instead: " + strings.Join(names, ", ") + "."
+}
+
+// throwExec reports a client-side exec failure with a model-readable reason.
+func (s *Session) throwExec(req *agentv1.ExecServerMessage, message string) error {
+	return throwExecOnStream(s.stream, req.Id, message)
+}
+
+func throwExecOnStream(stream *BidiStream, id uint32, message string) error {
 	code := "exec_variant_unsupported"
 	control := &agentv1.ExecClientControlMessage{
 		Message: &agentv1.ExecClientControlMessage_Throw{
 			Throw: &agentv1.ExecClientThrow{
-				Id:        req.Id,
-				Error:     "No handler for Cursor exec message",
+				Id:        id,
+				Error:     message,
 				ErrorCode: &code,
 			},
 		},
@@ -787,7 +918,22 @@ func rejectUnsupportedExec(stream *BidiStream, req *agentv1.ExecServerMessage) e
 	if err = stream.WriteEnvelope(payload, false); err != nil {
 		return err
 	}
-	return sendExecStreamClose(stream, req.Id)
+	return sendExecStreamClose(stream, id)
+}
+
+// unknownProtoFieldNumbers lists the field numbers present in a message's
+// unknown-fields blob (used to identify trimmed-away exec variants in logs).
+func unknownProtoFieldNumbers(raw []byte) []int {
+	var fields []int
+	for len(raw) > 0 {
+		num, _, n := protowire.ConsumeField(raw)
+		if n < 0 {
+			break
+		}
+		fields = append(fields, int(num))
+		raw = raw[n:]
+	}
+	return fields
 }
 
 func buildMcpToolDefinitions(tools []ToolDefinition) []*agentv1.McpToolDefinition {
@@ -797,6 +943,9 @@ func buildMcpToolDefinitions(tools []ToolDefinition) []*agentv1.McpToolDefinitio
 		if name == "" {
 			continue
 		}
+		// Advertise under the wire name so calls cannot bind to a Cursor
+		// built-in tool of the same name (which this gateway cannot execute).
+		wire := wireToolName(name)
 		schema := tool.Parameters
 		if schema == nil {
 			schema = map[string]any{"type": "object", "properties": map[string]any{}}
@@ -806,11 +955,11 @@ func buildMcpToolDefinitions(tools []ToolDefinition) []*agentv1.McpToolDefinitio
 			value, _ = toProtobufValue(map[string]any{"type": "object"})
 		}
 		out = append(out, &agentv1.McpToolDefinition{
-			Name:               name,
+			Name:               wire,
 			Description:        tool.Description,
 			InputSchema:        value,
 			ProviderIdentifier: MCPProviderIdentifier,
-			ToolName:           name,
+			ToolName:           wire,
 		})
 	}
 	return out
@@ -870,14 +1019,15 @@ func TrailingToolResults(messages []ChatMessage) []ToolResult {
 }
 
 // ResumeSession resolves the live session that owns the trailing tool results
-// and submits them so the run continues. The session is closed on submit
-// failure so callers can rebuild a fresh run from history.
+// and submits them so the run continues. Client-rewritten tool_call_ids are
+// normalized back to the upstream pending ids before submission. The session
+// is closed on submit failure so callers can rebuild a fresh run from history.
 func ResumeSession(results []ToolResult) (*Session, error) {
-	session, err := DefaultSessionManager().ResolveForToolResults(results)
+	session, normalized, err := DefaultSessionManager().ResolveForToolResults(results)
 	if err != nil {
 		return nil, err
 	}
-	if err = session.SubmitToolResults(results); err != nil {
+	if err = session.SubmitToolResults(normalized); err != nil {
 		_ = session.Close()
 		return nil, err
 	}

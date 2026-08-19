@@ -67,6 +67,63 @@ func toolChoiceDirective(choice ToolChoice) string {
 	return ""
 }
 
+// nativeAgentToolNames are the lowercase names of Cursor's built-in agent
+// tools. A client MCP tool whose name matches one of these (case-insensitive)
+// is advertised under a prefixed wire name so the model cannot bind the call
+// to the unusable built-in of the same name.
+var nativeAgentToolNames = map[string]bool{
+	"task": true, "shell": true, "bash": true, "terminal": true, "run_terminal_cmd": true,
+	"read_file": true, "read": true, "list_dir": true, "ls": true,
+	"glob": true, "glob_file_search": true, "file_search": true, "codebase_search": true,
+	"grep": true, "grep_search": true, "search": true, "search_replace": true,
+	"edit": true, "edit_file": true, "write": true, "create_file": true, "delete_file": true,
+	"todo_write": true, "todowrite": true, "todo": true,
+	"web_search": true, "websearch": true, "web_fetch": true, "webfetch": true, "fetch": true,
+	"read_lints": true, "create_diagram": true, "update_memory": true, "fetch_rules": true,
+	"apply_patch": true,
+}
+
+// mcpWireNamePrefix namespaces colliding MCP tool names on the Cursor wire.
+const mcpWireNamePrefix = "mcp_"
+
+// wireToolName returns the name a client tool is advertised under to the
+// upstream agent harness.
+func wireToolName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if nativeAgentToolNames[strings.ToLower(trimmed)] {
+		return mcpWireNamePrefix + trimmed
+	}
+	return trimmed
+}
+
+// mcpOnlyToolDirective forbids Cursor's built-in agent tools when the client
+// declared its own toolset. The built-ins execute through exec variants this
+// headless gateway does not implement, so any call to them fails with
+// "No exec result" on the client side.
+func mcpOnlyToolDirective(tools []ToolDefinition) string {
+	names := make([]string, 0, len(tools))
+	for i := range tools {
+		name := strings.TrimSpace(tools[i].Name)
+		if name == "" {
+			continue
+		}
+		wire := wireToolName(name)
+		if wire != name {
+			names = append(names, fmt.Sprintf("%s (use this whenever %s is needed)", wire, name))
+		} else {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return "The ONLY tools available in this session are these MCP tools: " +
+		strings.Join(names, ", ") + ". " +
+		"Cursor built-in tools (task, shell, terminal commands, read_file, list_dir, glob, grep, " +
+		"search, edit_file, write, todo, web fetch/search, subagents) are NOT available here and " +
+		"every call to them fails. Never call built-in tools; always use the MCP tools listed above."
+}
+
 // AccountCredentials are the fields required to open an Agent run.
 type AccountCredentials struct {
 	AccessToken   string
@@ -235,8 +292,10 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 				content = append(content, map[string]any{
 					"type":       "tool-call",
 					"toolCallId": tc.ID,
-					"toolName":   tc.Name,
-					"args":       args,
+					// History rows use the wire name the tool is advertised
+					// under so the model links past calls to a callable tool.
+					"toolName": wireToolName(tc.Name),
+					"args":     args,
 				})
 			}
 			if len(content) == 0 {
@@ -256,7 +315,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 			}
 			resultPart := map[string]any{
 				"type":       "tool-result",
-				"toolName":   toolName,
+				"toolName":   wireToolName(toolName),
 				"toolCallId": msg.ToolCallID,
 				"result":     msg.Content,
 				"toolKind":   "mcp",
@@ -287,6 +346,18 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		// Agent scaffolding can drown out system rows, so repeat the
 		// constraint on the user action itself; models weight it heavily.
 		actionText = actionText + "\n\n[Response constraint: " + directive + "]"
+	}
+
+	if directive := mcpOnlyToolDirective(tools); directive != "" {
+		// The Cursor agent harness also advertises its built-in tools (task,
+		// shell, read_file, list_dir, glob, grep, …). This headless gateway
+		// cannot execute them — the model would see "No exec result" — so
+		// steer the model to the declared MCP tools on the first attempt.
+		rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
+			"role":    "system",
+			"content": directive,
+		})))
+		actionText = actionText + "\n\n[Tool constraint: " + directive + "]"
 	}
 
 	conversationID := uuid.NewString()
