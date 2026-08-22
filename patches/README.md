@@ -129,3 +129,53 @@ Serving Read from the headless workspace was tried and reverted.
 `ReadSuccess_Data` is the reference-image channel, and putting a text file
 through it made the provider reject the turn with a 400 on every attempt, so
 Read still serves only the reference images attached to the request.
+
+## Against the cache-fields patch (base `d0979e4d`)
+
+`cursor-system-prompt-and-usage-split.patch`
+
+Apply last. The patches above kept treating the usage numbers as basically
+right and the tool surface as basically working. Both assumptions were wrong,
+and one defect underneath them explains most of what the panel showed.
+
+**The client's system message was thrown away.** It was emitted as a system row
+in the prompt blobs, and the harness discards those. Measured on the gateway: an
+11,380-token system block produced a prompt of 18,747 tokens, the size of the
+harness alone, and the model answered *"I don't have any information about an
+access code"* for a secret sent one line earlier. The same content moved into
+the user message reported 38,404 tokens and answered correctly. So every caller
+that puts context in a system message — which is every agent client — lost it,
+was billed as if it had never sent it, and had the largest cacheable block of
+its prompt left out of the conversation. That is why so many rows showed no
+cache activity at all: there was nothing substantial there to cache.
+
+The `modeb-relay` lineage already knew this. `2d1bc` mirrors its tool_choice
+directive onto the user action with the note *"agent scaffolding can drown out
+system rows, so repeat the constraint on the user action itself"*. That
+workaround was never carried across, and the gateway relied on system rows
+alone. Client instructions now travel as a user turn, kept in history order so
+they stay inside the cacheable prefix; the short built-in tool constraint is
+repeated on the user action, which is always read. After the fix the same probe
+reports a 30,324-token prompt and returns the secret.
+
+**The four usage columns double-counted.** The statistics store treats input,
+output, cache read and cache creation as disjoint and totals them by addition —
+`TotalTokens = input + output + cache read + cache creation` everywhere else in
+the repository. The ledger patch put Cursor's `input_tokens`, which is the whole
+prompt with the cache counters as subsets, straight into `InputTokens`, so the
+cached tokens were counted once at the full input rate and again as cache. The
+wire payload keeps OpenAI's inclusive shape; only the statistics detail splits
+the cached part back out. This is structurally what `modeb-relay` did, and
+reconciles it with the inclusive reading of the raw frames noted above.
+
+**Write and Read disagreed about the workspace.** The previous patch made Write
+honest about failures but left it succeeding for files that no reader is
+attached to, while Read answered file-not-found — so a run wrote a file, failed
+to read it back, and reported the workspace as having lost it. Only generated
+images and attached reference images are backed here. Everything else now gets
+the same actionable refusal as Shell and Glob, naming the tools that do work,
+so the tool surface is at least coherent.
+
+Verify with `tests/usage_four_fields_probe.py`, which reconstructs the panel's
+four columns from the wire and fails if they do not add up, and with
+`tests/builtin_tools_probe.py`.

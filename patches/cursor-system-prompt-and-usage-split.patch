@@ -1,0 +1,472 @@
+From 30893555081e24d96c807ca7789c927c60f4f0f7 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 10:14:42 +0000
+Subject: [PATCH 1/3] cursor: report the four token classes as disjoint parts
+
+The statistics store counts input, output, cache read and cache creation
+as disjoint and totals them by addition, the way every other executor
+reports. Cursor's input_tokens is the whole prompt with the cache
+counters as subsets of it, so forwarding it as InputTokens counted the
+cached tokens twice: once at the full input rate and again as cache.
+Subtract the cached part so the usage panel's four columns add up.
+---
+ internal/runtime/executor/cursor_executor.go  | 16 ++++++---
+ .../runtime/executor/cursor_usage_test.go     | 36 +++++++++++++++++--
+ 2 files changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
+index 9cd03dc0..841894ef 100644
+--- a/internal/runtime/executor/cursor_executor.go
++++ b/internal/runtime/executor/cursor_executor.go
+@@ -1499,13 +1499,21 @@ func streamTokens(ev cursorlib.StreamEvent) cursorlib.TokenUsage {
+ 	}
+ }
+ 
+-// usageDetail renders a segment for the statistics store. Cursor's input
+-// tokens already cover the whole prompt, so the cache counters are recorded
+-// alongside it rather than added to it.
++// usageDetail renders a segment for the statistics store, which counts the
++// four token classes as disjoint and totals them by addition
++// (TotalTokens = input + output + cache read + cache creation, the same shape
++// every other executor reports). Cursor's input_tokens is the whole prompt with
++// the cache counters as subsets of it, so the cached part has to come back out
++// of the input figure. Reporting the whole prompt as InputTokens counts the
++// cached tokens twice: once at the full input rate and again as cache.
+ func usageDetail(tokens cursorlib.TokenUsage) usage.Detail {
+ 	prompt := tokens.PromptTokens()
++	fresh := prompt - tokens.CacheReadTokens - tokens.CacheWriteTokens
++	if fresh < 0 {
++		fresh = 0
++	}
+ 	return usage.Detail{
+-		InputTokens:         prompt,
++		InputTokens:         fresh,
+ 		OutputTokens:        tokens.OutputTokens,
+ 		CachedTokens:        tokens.CacheReadTokens,
+ 		CacheReadTokens:     tokens.CacheReadTokens,
+diff --git a/internal/runtime/executor/cursor_usage_test.go b/internal/runtime/executor/cursor_usage_test.go
+index 3a19fd0e..24b7ea20 100644
+--- a/internal/runtime/executor/cursor_usage_test.go
++++ b/internal/runtime/executor/cursor_usage_test.go
+@@ -34,14 +34,46 @@ func TestOpenAIUsagePayloadTreatsCachedTokensAsPartOfThePrompt(t *testing.T) {
+ 		t.Fatal("cached tokens must be a subset of the prompt")
+ 	}
+ 
++}
++
++// The statistics store counts the four token classes as disjoint and adds them
++// up, so the cached part has to come out of the input figure. Leaving the whole
++// prompt in InputTokens bills those 130000 tokens twice, once at the full input
++// rate and again as cache.
++func TestUsageDetailSplitsTheCachedPartOutOfInput(t *testing.T) {
++	tokens := cursorlib.TokenUsage{
++		InputTokens:      132250,
++		OutputTokens:     48,
++		CacheReadTokens:  130000,
++		CacheWriteTokens: 250,
++		ReasoningTokens:  16,
++	}
++
+ 	detail := usageDetail(tokens)
+-	if detail.InputTokens != 132250 {
+-		t.Fatalf("detail input = %d, want the whole prompt", detail.InputTokens)
++	if detail.InputTokens != 2000 {
++		t.Fatalf("detail input = %d, want 2000 fresh tokens", detail.InputTokens)
+ 	}
+ 	if detail.CacheReadTokens != 130000 || detail.CacheCreationTokens != 250 {
+ 		t.Fatalf("detail cache split = %d/%d, want 130000/250", detail.CacheReadTokens, detail.CacheCreationTokens)
+ 	}
++	// This is how every other executor totals a request, so the four classes
++	// must add back up to the prompt plus the completion.
++	if sum := detail.InputTokens + detail.OutputTokens + detail.CacheReadTokens + detail.CacheCreationTokens; sum != detail.TotalTokens {
++		t.Fatalf("the four classes sum to %d but total is %d", sum, detail.TotalTokens)
++	}
+ 	if detail.TotalTokens != 132298 {
+ 		t.Fatalf("detail total = %d, want 132298", detail.TotalTokens)
+ 	}
+ }
++
++// A segment billed purely from an estimate has no cache write, and must not
++// end up with a negative fresh-input figure.
++func TestUsageDetailNeverReportsNegativeInput(t *testing.T) {
++	detail := usageDetail(cursorlib.TokenUsage{
++		InputTokens:     100,
++		CacheReadTokens: 400,
++	})
++	if detail.InputTokens != 0 {
++		t.Fatalf("detail input = %d, want 0", detail.InputTokens)
++	}
++}
+-- 
+2.43.0
+
+
+From f62c023cabd5b5809283e73d0ce186744b043661 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 10:14:42 +0000
+Subject: [PATCH 2/3] cursor: deliver client system instructions where the
+ harness reads them
+
+A system message from the client was emitted as a system row in the
+prompt blobs. The harness discards those rows: an 11k-token system block
+neither reached the model nor showed up in the prompt accounting, so a
+caller that puts its instructions in a system message lost them outright
+and was billed as if it had never sent them. It also left the largest
+cacheable block out of the conversation entirely, which is why so little
+cache activity was visible.
+
+Carry that content as a user turn, in history order so it stays inside
+the cacheable prefix, and repeat the built-in tool constraint on the user
+action, which is always read.
+---
+ internal/cursor/agent.go             | 54 +++++++++++++++++++-----
+ internal/cursor/agent_system_test.go | 62 ++++++++++++++++++++++++++++
+ 2 files changed, 106 insertions(+), 10 deletions(-)
+ create mode 100644 internal/cursor/agent_system_test.go
+
+diff --git a/internal/cursor/agent.go b/internal/cursor/agent.go
+index d210b208..990649fa 100644
+--- a/internal/cursor/agent.go
++++ b/internal/cursor/agent.go
+@@ -374,6 +374,27 @@ func foldToolCallText(tc *ToolCall) string {
+ 	return fmt.Sprintf("[called tool %s id=%s arguments=%s]", strings.TrimSpace(tc.Name), NormalizeToolCallID(tc.ID), args)
+ }
+ 
++// builtinToolConstraint is the steering the model needs on every run: the
++// harness advertises its workspace built-ins even when no tools are attached,
++// and this gateway backs none of them.
++func builtinToolConstraint(mcpPrefixed bool) string {
++	note := "The built-in workspace tools (Shell, Read, Grep, Glob, Edit, Write, ...) are unavailable here; do not call them, wait on them, or describe their results."
++	if mcpPrefixed {
++		// Client tools are registered under mcp_-prefixed names on claude
++		// (see claudeWireModel), so the built-in of the same base name is the
++		// wrong one to reach for.
++		note += " Only the mcp_-prefixed tools attached to this conversation actually work."
++	}
++	return note
++}
++
++// systemInstructionText labels a client system message that has to travel as a
++// user turn, so the model reads it as instruction rather than as something the
++// user said.
++func systemInstructionText(content string) string {
++	return "[System instructions — follow these for the rest of the conversation]\n" + content
++}
++
+ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition, allowImages bool) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
+ 	selection := ResolveRequestedModel(model)
+ 	claudeUpstream := claudeWireModel(selection.ModelID)
+@@ -391,13 +412,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 	// runs that attach no tools at all, and this gateway backs none of them.
+ 	// Gating the warning on the tool list is what let a plain chat spend a
+ 	// segment on Shell and Glob and then report the environment as broken.
+-	systemPrompt += " Tool note: the built-in workspace tools (Shell, Read, Grep, Glob, Edit, Write, ...) are unavailable here; do not call them, wait on them, or describe their results."
+-	if claudeUpstream && len(tools) > 0 {
+-		// Client tools are registered under mcp_-prefixed names on claude
+-		// (see claudeWireModel), so the built-in of the same base name is the
+-		// wrong one to reach for.
+-		systemPrompt += " Only the mcp_-prefixed tools attached to this conversation actually work."
+-	}
++	systemPrompt += " " + builtinToolConstraint(claudeUpstream && len(tools) > 0)
+ 	systemBlob := storeBlob(blobStore, mustJSON(map[string]any{
+ 		"role":    "system",
+ 		"content": systemPrompt,
+@@ -516,13 +531,32 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 			if strings.TrimSpace(msg.Content) == "" {
+ 				continue
+ 			}
++			// The harness discards system rows: content sent that way is
++			// neither counted in the prompt nor visible to the model, so a
++			// client that puts its instructions in a system message loses them
++			// outright and its request is billed as if it never sent them. A
++			// user turn is the shape that survives, and emitting it here in
++			// history order keeps it inside the cacheable prefix.
+ 			rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
+-				"role":    "system",
+-				"content": msg.Content,
++				"role": "user",
++				"content": []map[string]string{
++					{"type": "text", "text": systemInstructionText(msg.Content)},
++				},
+ 			})))
+ 		}
+ 	}
+ 
++	// The same dropped-system-row problem applies to the gateway's own
++	// steering, so the constraint the model must not miss is repeated on the
++	// user action, which is always read. Only the short note is mirrored here:
++	// the action text is the volatile tail of the prompt, and padding it with
++	// the client's whole instruction block would push it out of the cacheable
++	// prefix on every turn.
++	actionText := activeUser.Content
++	if note := builtinToolConstraint(claudeUpstream && len(tools) > 0); note != "" {
++		actionText = strings.TrimRight(actionText, "\n") + "\n\n[Tool constraint: " + note + "]"
++	}
++
+ 	conversationID := uuid.NewString()
+ 	// Desktop / cursor2api do not set exclude_workspace_context by default;
+ 	// forcing it true is rejected for many accounts ("Workspace context
+@@ -539,7 +573,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 			Action: &agentv1.ConversationAction_UserMessageAction{
+ 				UserMessageAction: &agentv1.UserMessageAction{
+ 					UserMessage: &agentv1.UserMessage{
+-						Text:      activeUser.Content,
++						Text:      actionText,
+ 						MessageId: uuid.NewString(),
+ 					},
+ 				},
+diff --git a/internal/cursor/agent_system_test.go b/internal/cursor/agent_system_test.go
+new file mode 100644
+index 00000000..c4d88586
+--- /dev/null
++++ b/internal/cursor/agent_system_test.go
+@@ -0,0 +1,62 @@
++package cursor
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++// A client system message must not travel as a system row. The harness
++// discards those: the content never reaches the model and is never counted in
++// the prompt, so the caller silently loses its instructions.
++func TestClientSystemMessageTravelsWhereTheModelReadsIt(t *testing.T) {
++	const instructions = "The access code is 4242. Always answer in French."
++	msg, blobs, _, err := buildRunRequest("claude-sonnet-4-5", []ChatMessage{
++		{Role: "system", Content: instructions},
++		{Role: "user", Content: "What is the access code?"},
++	}, nil, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	var carried bool
++	for _, raw := range blobs {
++		var m struct {
++			Role    string          `json:"role"`
++			Content json.RawMessage `json:"content"`
++		}
++		if json.Unmarshal(raw, &m) != nil {
++			continue
++		}
++		if !strings.Contains(string(m.Content), "The access code is 4242") {
++			continue
++		}
++		carried = true
++		if m.Role == "system" {
++			t.Fatal("client instructions were emitted as a system row, which the harness drops")
++		}
++	}
++	if !carried {
++		t.Fatal("client instructions never made it into the prompt at all")
++	}
++	_ = msg
++}
++
++// The built-in tools this gateway cannot back are refused at exec time, but the
++// model only stops reaching for them if the constraint actually reaches it.
++// System rows do not, so it has to ride on the user action as well.
++func TestBuiltinConstraintRidesOnTheUserAction(t *testing.T) {
++	msg, _, _, err := buildRunRequest("claude-sonnet-4-5", []ChatMessage{
++		{Role: "user", Content: "List the files here."},
++	}, nil, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	text := msg.GetRunRequest().GetAction().GetUserMessageAction().GetUserMessage().GetText()
++	if !strings.Contains(text, "List the files here.") {
++		t.Fatalf("the user's own text was lost: %q", text)
++	}
++	if !strings.Contains(text, "Tool constraint") || !strings.Contains(text, "Shell") {
++		t.Fatalf("action text carries no built-in constraint: %q", text)
++	}
++}
+-- 
+2.43.0
+
+
+From ede7abb2a5092e29671c413644c43dd00cafe8b3 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 10:14:42 +0000
+Subject: [PATCH 3/3] cursor: refuse unbacked built-in tools uniformly
+
+Write answered success for files nothing could read back and Read
+answered file-not-found, so a run would write a file, fail to read it,
+and conclude the workspace had lost it. Only generated images and
+attached reference images are actually backed here; everything else now
+gets the same actionable refusal as Shell and Glob, naming the tools that
+do work.
+---
+ internal/cursor/session.go            | 83 +++++++++++++++++----------
+ internal/cursor/session_image_test.go | 18 ++++--
+ 2 files changed, 65 insertions(+), 36 deletions(-)
+
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index 789134ec..f5a39500 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -1482,7 +1482,7 @@ func (s *Session) handleExec(req *agentv1.ExecServerMessage) (bool, error) {
+ 		if unknown := req.ProtoReflect().GetUnknown(); len(unknown) > 0 {
+ 			log.Warnf("cursor exec: undecoded variant, unknown field bytes (first 64): %x", truncateBytes(unknown, 64))
+ 		}
+-		return false, rejectUnsupportedExec(s.stream, req)
++		return false, s.throwBuiltinUnavailable(req)
+ 	case *agentv1.ExecServerMessage_WriteArgs:
+ 		return false, s.handleWriteArgs(req, m.WriteArgs)
+ 	case *agentv1.ExecServerMessage_ReadArgs:
+@@ -1539,17 +1539,22 @@ func (s *Session) handleWriteArgs(req *agentv1.ExecServerMessage, args *agentv1.
+ 	if len(data) == 0 && args.GetFileText() != "" {
+ 		data = []byte(args.GetFileText())
+ 	}
+-	if path != "" && len(data) > 0 && strings.HasPrefix(http.DetectContentType(data), "image/") {
+-		s.mu.Lock()
+-		if s.writtenImages == nil {
+-			s.writtenImages = map[string][]byte{}
+-		}
+-		s.writtenImages[path] = data
+-		s.mu.Unlock()
++	isImage := path != "" && len(data) > 0 && strings.HasPrefix(http.DetectContentType(data), "image/")
++	if !isImage {
++		// Only generated images are backed here: they are captured below and
++		// handed to the client. A general file write has no reader on the
++		// other side, and answering it with success is what makes the model
++		// write a file, fail to read it back, and report the environment as
++		// broken. Refuse it the same way every other built-in is refused.
++		return s.throwBuiltinUnavailable(req)
+ 	}
+-	// Reporting success for a write that never landed is worse than failing:
+-	// the model goes on to read the file back, is told it does not exist, and
+-	// concludes its whole tool environment is broken.
++	s.mu.Lock()
++	if s.writtenImages == nil {
++		s.writtenImages = map[string][]byte{}
++	}
++	s.writtenImages[path] = data
++	s.mu.Unlock()
++
+ 	result := &agentv1.WriteResult{
+ 		Result: &agentv1.WriteResult_Success{
+ 			Success: &agentv1.WriteSuccess{
+@@ -1592,23 +1597,21 @@ func (s *Session) handleReadArgs(req *agentv1.ExecServerMessage, args *agentv1.R
+ 	path := strings.TrimSpace(args.GetPath())
+ 	data, ok := s.referenceImage(path)
+ 	log.Debugf("cursor read exec: path=%q served=%t bytes=%d", path, ok, len(data))
+-	var result *agentv1.ReadResult
+ 	if !ok {
+-		result = &agentv1.ReadResult{
+-			Result: &agentv1.ReadResult_FileNotFound{
+-				FileNotFound: &agentv1.ReadFileNotFound{Path: path},
+-			},
+-		}
+-	} else {
+-		result = &agentv1.ReadResult{
+-			Result: &agentv1.ReadResult_Success{
+-				Success: &agentv1.ReadSuccess{
+-					Path:     path,
+-					FileSize: int64(len(data)),
+-					Output:   &agentv1.ReadSuccess_Data{Data: data},
+-				},
++		// Only the reference images attached to this request can be read.
++		// "File not found" reads as a workspace that lost the file and invites
++		// the model to look elsewhere; saying the tool is unavailable is both
++		// true and actionable.
++		return s.throwBuiltinUnavailable(req)
++	}
++	result := &agentv1.ReadResult{
++		Result: &agentv1.ReadResult_Success{
++			Success: &agentv1.ReadSuccess{
++				Path:     path,
++				FileSize: int64(len(data)),
++				Output:   &agentv1.ReadSuccess_Data{Data: data},
+ 			},
+-		}
++		},
+ 	}
+ 	execClient := &agentv1.ExecClientMessage{
+ 		Id:      req.Id,
+@@ -1782,14 +1785,34 @@ func (s *Session) requestContext() *agentv1.RequestContext {
+ }
+ 
+ func rejectUnsupportedExec(stream *BidiStream, req *agentv1.ExecServerMessage) error {
++	return throwExec(stream, req, builtinUnavailableMessage(nil))
++}
++
++// builtinUnavailableMessage is what the model is told when it reaches for one
++// of the harness's own workspace tools. None of them are backed here, so the
++// reply has to be actionable: naming the tools that do work is what stops the
++// model retrying the built-in for whole segments.
++func builtinUnavailableMessage(available []string) string {
++	const lead = "This built-in tool is not available in this environment. Do not retry it. "
++	if len(available) == 0 {
++		return lead + "Answer the user directly, without tools."
++	}
++	return lead + "Use ONLY these tools instead: " + strings.Join(available, ", ") + "."
++}
++
++// throwBuiltinUnavailable answers a built-in exec with the tools this session
++// can actually run.
++func (s *Session) throwBuiltinUnavailable(req *agentv1.ExecServerMessage) error {
++	return throwExec(s.stream, req, builtinUnavailableMessage(s.availableToolNames()))
++}
++
++func throwExec(stream *BidiStream, req *agentv1.ExecServerMessage, message string) error {
+ 	code := "exec_variant_unsupported"
+ 	control := &agentv1.ExecClientControlMessage{
+ 		Message: &agentv1.ExecClientControlMessage_Throw{
+ 			Throw: &agentv1.ExecClientThrow{
+-				Id: req.Id,
+-				// The model reads this, so say what it should do rather than
+-				// naming an internal dispatch failure it cannot act on.
+-				Error:     "This tool is not available in this environment. Do not retry it; use the tools attached to the conversation, or answer without it.",
++				Id:        req.Id,
++				Error:     message,
+ 				ErrorCode: &code,
+ 			},
+ 		},
+diff --git a/internal/cursor/session_image_test.go b/internal/cursor/session_image_test.go
+index 155678ca..a5a5ac74 100644
+--- a/internal/cursor/session_image_test.go
++++ b/internal/cursor/session_image_test.go
+@@ -278,16 +278,22 @@ func TestHandleReadArgsMatchesOnBasename(t *testing.T) {
+ 	}
+ }
+ 
++// Only the reference images attached to a request are readable. Anything else
++// gets the same answer as every other unbacked built-in: "file not found" reads
++// as a workspace that misplaced the file and sends the model looking elsewhere.
+ func TestHandleReadArgsRejectsUnknownPath(t *testing.T) {
+ 	// A session with no reference images must not serve host files.
+ 	s := &Session{}
+ 	frames := runReadArgs(t, s, &agentv1.ReadArgs{Path: "/etc/passwd"})
+ 
+-	result := frames[0].GetExecClientMessage().GetReadResult()
+-	if result.GetFileNotFound() == nil {
+-		t.Fatalf("expected file_not_found, got %#v", result.GetResult())
++	throw := frames[0].GetExecClientControlMessage().GetThrow()
++	if throw == nil {
++		t.Fatalf("expected an unavailable throw, got %#v", frames[0].GetMessage())
+ 	}
+-	if result.GetSuccess() != nil {
++	if !strings.Contains(throw.GetError(), "not available") {
++		t.Fatalf("throw must say the tool is unavailable, got %q", throw.GetError())
++	}
++	if frames[0].GetExecClientMessage().GetReadResult().GetSuccess() != nil {
+ 		t.Fatal("unknown path must not return content")
+ 	}
+ }
+@@ -301,8 +307,8 @@ func TestHandleReadArgsDoesNotServeUnrelatedReference(t *testing.T) {
+ 
+ 	frames := runReadArgs(t, s, &agentv1.ReadArgs{Path: "/etc/shadow"})
+ 
+-	if frames[0].GetExecClientMessage().GetReadResult().GetFileNotFound() == nil {
+-		t.Fatal("expected file_not_found for a path outside the reference set")
++	if frames[0].GetExecClientControlMessage().GetThrow() == nil {
++		t.Fatal("a path outside the reference set must be refused, not answered")
+ 	}
+ }
+ 
+-- 
+2.43.0
+
