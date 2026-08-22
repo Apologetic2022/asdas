@@ -1,0 +1,605 @@
+From 9fbc39d622dd44c66911c7732f15711f66e8f0bf Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 15:13:45 +0000
+Subject: [PATCH 1/2] cursor: rename only the tools that collide with a Cursor
+ built-in
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Client tool names are namespaced on the wire because Cursor's harness
+registers its own agent tools alongside them and Anthropic refuses a
+request that declares one name twice. The refusal is not a clean error:
+the run simply never produces a token, so the rename was applied to
+every client tool rather than risk missing one.
+
+A Claude Code client declares about thirty tools and four of them
+collide — Read, Write, Glob and Grep. The other twenty-six were renamed
+for nothing, and the model noticed. It could see both AskUserQuestion
+and mcp_AskUserQuestion, was told in the system prompt that only the
+prefixed copies were real, and concluded that instruction might be a
+prompt injection. It spent turns reasoning about that in the open, told
+the user "mcp_Write is genuinely in my available toolset alongside
+Write", and wrote a page explaining how to work around its tools being
+unavailable. Desktop clients got the rest of the damage: a question card
+arrives named mcp_AskUserQuestion, which the client never declared, so
+it cannot render the card and shows the raw call instead.
+
+Rename the four that collide and leave the rest alone. The built-in
+names come from asking a run that carries no client tools to enumerate
+what it has. The match is case-insensitive, because the collision is
+upstream's and "write" collides exactly as hard as "Write".
+---
+ internal/cursor/agent.go             |  7 +++-
+ internal/cursor/agent_system_test.go | 62 +++++++++++++++++++++++++---
+ internal/cursor/session.go           | 44 +++++++++++++++++++-
+ 3 files changed, 104 insertions(+), 9 deletions(-)
+
+diff --git a/internal/cursor/agent.go b/internal/cursor/agent.go
+index b235540e..078f072b 100644
+--- a/internal/cursor/agent.go
++++ b/internal/cursor/agent.go
+@@ -428,12 +428,17 @@ func builtinToolConstraint(tools []ToolDefinition, mcpPrefixed bool) string {
+ 		if name == "" {
+ 			continue
+ 		}
+-		if mcpPrefixed {
++		if needsWirePrefix(mcpPrefixed, name) {
+ 			// Naming the built-in each one replaces is what actually stops the
+ 			// model reaching for it. Telling it only that "mcp_-prefixed tools
+ 			// work" leaves it to guess that mcp_Bash is the shell it wanted, and
+ 			// it guesses wrong: it calls Shell, gets refused, and burns a
+ 			// segment deciding whether to believe the refusal.
++			//
++			// Only the renamed ones are described this way. Saying it about
++			// every tool told the model its entire toolset was an alias of
++			// something else, which is both false and the kind of claim that
++			// reads as an injection attempt.
+ 			names = append(names, fmt.Sprintf("%s%s (use this whenever %s is needed)", mcpToolWirePrefix, name, name))
+ 			continue
+ 		}
+diff --git a/internal/cursor/agent_system_test.go b/internal/cursor/agent_system_test.go
+index f7309c56..1e7c4703 100644
+--- a/internal/cursor/agent_system_test.go
++++ b/internal/cursor/agent_system_test.go
+@@ -63,7 +63,9 @@ func TestBuiltinConstraintRidesOnTheUserAction(t *testing.T) {
+ 
+ // Telling the model only that "mcp_-prefixed tools work" leaves it to guess
+ // which one replaces the built-in it wanted. It guesses wrong, calls the
+-// built-in, and burns a segment on the refusal. Name the mapping instead.
++// built-in, and burns a segment on the refusal. Name the mapping instead —
++// but only for the tools that were actually renamed. Write collides with a
++// Cursor built-in; Bash does not, because Cursor's shell is called Shell.
+ func TestConstraintNamesTheMcpToolThatReplacesEachBuiltin(t *testing.T) {
+ 	msg, _, _, err := buildRunRequest("claude-sonnet-5", []ChatMessage{
+ 		{Role: "user", Content: "Run date."},
+@@ -72,12 +74,60 @@ func TestConstraintNamesTheMcpToolThatReplacesEachBuiltin(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	text := msg.GetRunRequest().GetAction().GetUserMessageAction().GetUserMessage().GetText()
+-	for _, want := range []string{
+-		"mcp_Bash (use this whenever Bash is needed)",
+-		"mcp_Write (use this whenever Write is needed)",
++	if want := "mcp_Write (use this whenever Write is needed)"; !strings.Contains(text, want) {
++		t.Fatalf("action text is missing %q: %s", want, text)
++	}
++	if strings.Contains(text, "mcp_Bash") {
++		t.Fatalf("Bash collides with nothing and must keep its own name: %s", text)
++	}
++	if !strings.Contains(text, "Bash") {
++		t.Fatalf("Bash is available and must still be listed: %s", text)
++	}
++}
++
++// A client tool that collides with nothing must reach the model under its own
++// name. Renaming the whole toolset is what broke desktop clients: the model saw
++// AskUserQuestion and mcp_AskUserQuestion side by side, was told only the
++// prefixed one was real, and spent its turn reasoning aloud about whether that
++// was a prompt injection instead of asking the question.
++func TestOnlyCollidingToolsAreRenamedOnTheWire(t *testing.T) {
++	tools := []ToolDefinition{
++		{Name: "AskUserQuestion"}, {Name: "Bash"}, {Name: "Edit"}, {Name: "NotebookEdit"},
++		{Name: "Read"}, {Name: "Write"}, {Name: "Glob"}, {Name: "Grep"},
++	}
++	defs := buildMcpToolDefinitions(tools, true)
++	got := make(map[string]bool, len(defs))
++	for _, def := range defs {
++		got[def.GetName()] = true
++	}
++	for _, name := range []string{"mcp_Read", "mcp_Write", "mcp_Glob", "mcp_Grep"} {
++		if !got[name] {
++			t.Errorf("%s collides with a Cursor built-in and must be renamed; wire names: %v", name, got)
++		}
++	}
++	for _, name := range []string{"AskUserQuestion", "Bash", "Edit", "NotebookEdit"} {
++		if !got[name] {
++			t.Errorf("%s collides with nothing and must keep its own name; wire names: %v", name, got)
++		}
++	}
++}
++
++// The rename is only ever a workaround for upstream refusing a duplicate name,
++// so a call that comes back prefixed has to resolve to the client's own tool —
++// that is what the client is waiting on.
++func TestARenamedCallResolvesBackToTheClientTool(t *testing.T) {
++	s := &Session{renameToolsOnWire: true, tools: []ToolDefinition{{Name: "Write"}, {Name: "AskUserQuestion"}}}
++	s.toolIndex = indexTools(s.tools)
++	for wire, want := range map[string]string{
++		"mcp_Write":       "Write",
++		"AskUserQuestion": "AskUserQuestion",
+ 	} {
+-		if !strings.Contains(text, want) {
+-			t.Fatalf("action text is missing %q: %s", want, text)
++		def := s.lookupTool(wire, MCPProviderIdentifier)
++		if def == nil {
++			t.Fatalf("%s resolved to nothing", wire)
++		}
++		if def.Name != want {
++			t.Errorf("%s resolved to %q, the client is waiting on %q", wire, def.Name, want)
+ 		}
+ 	}
+ }
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index c5680d2d..64f33c30 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -1815,7 +1815,7 @@ func (s *Session) availableToolNames() []string {
+ 			continue
+ 		}
+ 		name := t.Name
+-		if s.renameToolsOnWire {
++		if needsWirePrefix(s.renameToolsOnWire, name) {
+ 			name = mcpToolWirePrefix + name
+ 		}
+ 		names = append(names, name)
+@@ -1883,6 +1883,46 @@ func throwExec(stream *BidiStream, req *agentv1.ExecServerMessage, message strin
+ // tool, so clients always see their own names.
+ const mcpToolWirePrefix = "mcp_"
+ 
++// cursorBuiltinToolNames are the tools Cursor's own agent harness registers on
++// every run, obtained by asking a run carrying no client tools to enumerate
++// what it has. A client tool sharing one of these names is the only kind that
++// has to be renamed, and getting the list wrong is not a soft failure: a
++// duplicate name does not come back as an error, the run simply never
++// produces a token.
++var cursorBuiltinToolNames = map[string]bool{
++	"askquestion":      true,
++	"awaitshell":       true,
++	"delete":           true,
++	"editnotebook":     true,
++	"fetchmcpresource": true,
++	"generateimage":    true,
++	"glob":             true,
++	"grep":             true,
++	"listmcpresources": true,
++	"read":             true,
++	"shell":            true,
++	"strreplace":       true,
++	"switchmode":       true,
++	"task":             true,
++	"todowrite":        true,
++	"write":            true,
++}
++
++// needsWirePrefix reports whether this client tool has to be namespaced.
++//
++// Only the colliding ones are. Renaming the whole toolset — thirty tools where
++// four collide — is what made the model distrust the setup: it could see both
++// AskUserQuestion and mcp_AskUserQuestion, was told in the system prompt that
++// only the prefixed ones were real, and reasoned in the open about whether
++// that instruction was a prompt injection before narrating "mcp_Write is
++// genuinely in my available toolset alongside Write" to the user.
++//
++// The match is case-insensitive because the collision is upstream's, and a
++// client that declares "write" collides just as hard as one declaring "Write".
++func needsWirePrefix(renameOnWire bool, name string) bool {
++	return renameOnWire && cursorBuiltinToolNames[strings.ToLower(strings.TrimSpace(name))]
++}
++
+ func buildMcpToolDefinitions(tools []ToolDefinition, renameOnWire bool) []*agentv1.McpToolDefinition {
+ 	out := make([]*agentv1.McpToolDefinition, 0, len(tools))
+ 	for _, tool := range tools {
+@@ -1890,7 +1930,7 @@ func buildMcpToolDefinitions(tools []ToolDefinition, renameOnWire bool) []*agent
+ 		if name == "" {
+ 			continue
+ 		}
+-		if renameOnWire {
++		if needsWirePrefix(renameOnWire, name) {
+ 			name = mcpToolWirePrefix + name
+ 		}
+ 		schema := tool.Parameters
+-- 
+2.43.0
+
+
+From 1596ab64eb137b6438dd41aef93ecd4c46ef0ba2 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 15:13:54 +0000
+Subject: [PATCH 2/2] cursor: translate the wire alias back out of the model's
+ prose
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The four tools that collide with a Cursor built-in are still registered
+upstream under a prefixed alias, so the model knows one of them as
+mcp_Write and reasons about it under that name: "I'll use mcp_Write to
+create the page". The alias is this gateway's own invention. The client
+declared Write, has no tool called mcp_Write, and neither does the user
+reading the reply.
+
+Translate this session's aliases back on the way out, in both the text
+and the thinking stream. Only the aliases this session actually created
+are rewritten — a blanket search for the prefix would also rewrite a
+genuine mention of some other mcp_ tool, which a client may well have.
+
+Deltas break wherever the upstream tokenizer broke them, so the rewriter
+holds back a trailing fragment that could still grow into an alias
+rather than emitting it raw, and releases it when the segment ends or a
+tool call arrives to take its place.
+---
+ internal/cursor/session.go         |  46 ++++++++-
+ internal/cursor/wire_names.go      | 145 +++++++++++++++++++++++++++++
+ internal/cursor/wire_names_test.go |  97 +++++++++++++++++++
+ 3 files changed, 283 insertions(+), 5 deletions(-)
+ create mode 100644 internal/cursor/wire_names.go
+ create mode 100644 internal/cursor/wire_names_test.go
+
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index 64f33c30..f47ebd5f 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -161,6 +161,12 @@ type Session struct {
+ 	// turn it on.
+ 	allowImages bool
+ 
++	// textNames and thinkingNames translate the wire aliases back to the
++	// client's own tool names in streamed prose. They are separate because
++	// each holds a partial match across deltas and the two streams interleave.
++	textNames     *wireNameRewriter
++	thinkingNames *wireNameRewriter
++
+ 	// renameToolsOnWire mirrors the tool-name namespacing applied when the
+ 	// run was built (see claudeWireModel): incoming tool calls resolve the
+ 	// prefixed name back to the client's definition, and tool listings shown
+@@ -419,6 +425,8 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 	session.Model = selection.ModelID
+ 	session.usage.model = selection.ModelID
+ 	session.renameToolsOnWire = claudeWireModel(selection.ModelID)
++	session.textNames = newWireNameRewriter(session.tools, session.renameToolsOnWire)
++	session.thinkingNames = newWireNameRewriter(session.tools, session.renameToolsOnWire)
+ 	session.stream = stream
+ 	session.blobStore = blobStore
+ 	session.transcript = echoTranscript(messages)
+@@ -910,6 +918,7 @@ func (s *Session) SetPromptTokens(promptTokens int64) {
+ // until the closing TurnEnded, so without this every tool-loop request would
+ // answer with no usage at all and be charged as an uncached full prompt.
+ func (s *Session) endSegment(reason string) {
++	s.flushWireNames()
+ 	s.mu.Lock()
+ 	var segment TokenUsage
+ 	if s.segmentBilled.Empty() {
+@@ -923,6 +932,24 @@ func (s *Session) endSegment(reason string) {
+ 	s.emit(StreamEvent{Type: "segment_end", Reason: reason})
+ }
+ 
++// flushWireNames releases text the alias rewriters were holding back, so a
++// fragment that never became an alias still reaches the client.
++func (s *Session) flushWireNames() {
++	if text := s.textNames.flush(); text != "" {
++		s.mu.Lock()
++		s.segText.WriteString(text)
++		s.outputChars += len(text)
++		s.mu.Unlock()
++		s.emit(StreamEvent{Type: "text_delta", Text: text})
++	}
++	if thinking := s.thinkingNames.flush(); thinking != "" {
++		s.mu.Lock()
++		s.outputChars += len(thinking)
++		s.mu.Unlock()
++		s.emit(StreamEvent{Type: "thinking_delta", Text: thinking})
++	}
++}
++
+ // resetSegmentUsage starts a fresh segment's accounting; the run ledger keeps
+ // what earlier segments were already billed.
+ func (s *Session) resetSegmentUsage() {
+@@ -1256,20 +1283,26 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
+ 	case *agentv1.AgentServerMessage_InteractionUpdate:
+ 		switch u := m.InteractionUpdate.Message.(type) {
+ 		case *agentv1.InteractionUpdate_TextDelta:
++			text := s.textNames.rewrite(u.TextDelta.GetText())
+ 			s.mu.Lock()
+ 			s.everOutput = true
+ 			s.outputAfterCkpt = true
+-			s.segText.WriteString(u.TextDelta.GetText())
+-			s.outputChars += len(u.TextDelta.GetText())
++			s.segText.WriteString(text)
++			s.outputChars += len(text)
+ 			s.mu.Unlock()
+-			s.emit(StreamEvent{Type: "text_delta", Text: u.TextDelta.GetText()})
++			if text != "" {
++				s.emit(StreamEvent{Type: "text_delta", Text: text})
++			}
+ 		case *agentv1.InteractionUpdate_ThinkingDelta:
++			thinking := s.thinkingNames.rewrite(u.ThinkingDelta.GetText())
+ 			s.mu.Lock()
+ 			s.everOutput = true
+ 			s.outputAfterCkpt = true
+-			s.outputChars += len(u.ThinkingDelta.GetText())
++			s.outputChars += len(thinking)
+ 			s.mu.Unlock()
+-			s.emit(StreamEvent{Type: "thinking_delta", Text: u.ThinkingDelta.GetText()})
++			if thinking != "" {
++				s.emit(StreamEvent{Type: "thinking_delta", Text: thinking})
++			}
+ 		case *agentv1.InteractionUpdate_TurnEnded:
+ 			total := TokenUsage{}
+ 			if u.TurnEnded.InputTokens != nil {
+@@ -1762,6 +1795,9 @@ func (s *Session) handleMcpArgs(req *agentv1.ExecServerMessage, args *agentv1.Mc
+ 		s.manager.BindPending(callID, s)
+ 	}
+ 	log.Debugf("cursor client tool call: session=%s tool=%s call_id=%s", s.ID, def.Name, callID)
++	// Any text held back waiting to see if it was an alias belongs before the
++	// call that follows it, not after.
++	s.flushWireNames()
+ 	s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
+ 	return true, nil
+ }
+diff --git a/internal/cursor/wire_names.go b/internal/cursor/wire_names.go
+new file mode 100644
+index 00000000..8960e876
+--- /dev/null
++++ b/internal/cursor/wire_names.go
+@@ -0,0 +1,145 @@
++package cursor
++
++import "strings"
++
++// wireNameRewriter puts the gateway's tool aliases back into the client's
++// vocabulary on the way out.
++//
++// A client tool whose name collides with one of Cursor's own is registered
++// upstream under a prefixed alias (see needsWirePrefix), so the model knows it
++// as mcp_Write and reasons about it out loud under that name: "I'll use
++// mcp_Write to create the page". The client has no such tool. The alias is the
++// gateway's own invention and it means nothing to anyone downstream, so it is
++// translated back before the text leaves.
++//
++// Only this session's aliases are rewritten. A blanket search for the prefix
++// would also rewrite a genuine mention of some other mcp_ tool, which the
++// client may well have.
++type wireNameRewriter struct {
++	// aliases maps the wire name to the name the client gave the tool.
++	aliases map[string]string
++	pending string
++}
++
++// newWireNameRewriter returns nil when no tool was renamed, which is the
++// common case and lets the caller skip the work entirely.
++func newWireNameRewriter(tools []ToolDefinition, renameOnWire bool) *wireNameRewriter {
++	if !renameOnWire {
++		return nil
++	}
++	aliases := make(map[string]string)
++	for i := range tools {
++		name := strings.TrimSpace(tools[i].Name)
++		if name != "" && needsWirePrefix(renameOnWire, name) {
++			aliases[mcpToolWirePrefix+name] = name
++		}
++	}
++	if len(aliases) == 0 {
++		return nil
++	}
++	return &wireNameRewriter{aliases: aliases}
++}
++
++// rewrite translates one streamed chunk, holding back any trailing fragment
++// that could still turn into an alias once more text arrives. Deltas split
++// wherever the upstream tokenizer happened to split, so "mcp_" and "Write"
++// routinely arrive separately.
++func (r *wireNameRewriter) rewrite(chunk string) string {
++	if r == nil {
++		return chunk
++	}
++	out, pending := r.scan(r.pending+chunk, false)
++	r.pending = pending
++	return out
++}
++
++// flush releases whatever was held back. At the end of a segment there is no
++// more text coming, so a trailing alias is complete and can be translated.
++func (r *wireNameRewriter) flush() string {
++	if r == nil || r.pending == "" {
++		return ""
++	}
++	out, _ := r.scan(r.pending, true)
++	r.pending = ""
++	return out
++}
++
++func (r *wireNameRewriter) scan(s string, atEnd bool) (string, string) {
++	var b strings.Builder
++	for i := 0; i < len(s); {
++		j := strings.Index(s[i:], mcpToolWirePrefix)
++		if j < 0 {
++			// The prefix itself can straddle two deltas ("mc" then "p_Write"),
++			// in which case there is nothing here to find yet.
++			if h := partialPrefixLen(s[i:]); h > 0 && !atEnd {
++				b.WriteString(s[i : len(s)-h])
++				return b.String(), s[len(s)-h:]
++			}
++			b.WriteString(s[i:])
++			break
++		}
++		j += i
++		b.WriteString(s[i:j])
++		tail := s[j:]
++		if alias := r.matchAt(tail, atEnd); alias != "" {
++			b.WriteString(r.aliases[alias])
++			i = j + len(alias)
++			continue
++		}
++		if !atEnd && r.couldGrowInto(tail) {
++			return b.String(), tail
++		}
++		b.WriteString(mcpToolWirePrefix)
++		i = j + len(mcpToolWirePrefix)
++	}
++	return b.String(), ""
++}
++
++// matchAt returns the longest alias starting here, provided the name ends
++// there. Without the boundary check mcp_Read would also fire inside
++// mcp_ReadNotebook, which is a different tool.
++func (r *wireNameRewriter) matchAt(tail string, atEnd bool) string {
++	best := ""
++	for alias := range r.aliases {
++		if len(alias) <= len(best) || !strings.HasPrefix(tail, alias) {
++			continue
++		}
++		if rest := tail[len(alias):]; rest == "" && !atEnd {
++			// The name may continue in the next chunk; not decidable yet.
++			continue
++		} else if rest != "" && isNameChar(rest[0]) {
++			continue
++		}
++		best = alias
++	}
++	return best
++}
++
++// couldGrowInto reports whether more text could turn this tail into an alias.
++func (r *wireNameRewriter) couldGrowInto(tail string) bool {
++	for alias := range r.aliases {
++		if strings.HasPrefix(alias, tail) || (strings.HasPrefix(tail, alias) && len(tail) == len(alias)) {
++			return true
++		}
++	}
++	return false
++}
++
++// partialPrefixLen is the length of the trailing fragment that could still
++// become the alias prefix once the next delta arrives.
++func partialPrefixLen(s string) int {
++	longest := len(mcpToolWirePrefix) - 1
++	if longest > len(s) {
++		longest = len(s)
++	}
++	for n := longest; n > 0; n-- {
++		if strings.HasPrefix(mcpToolWirePrefix, s[len(s)-n:]) {
++			return n
++		}
++	}
++	return 0
++}
++
++func isNameChar(c byte) bool {
++	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
++}
+diff --git a/internal/cursor/wire_names_test.go b/internal/cursor/wire_names_test.go
+new file mode 100644
+index 00000000..251579f7
+--- /dev/null
++++ b/internal/cursor/wire_names_test.go
+@@ -0,0 +1,97 @@
++package cursor
++
++import (
++	"strings"
++	"testing"
++)
++
++func rewriterFor(names ...string) *wireNameRewriter {
++	tools := make([]ToolDefinition, 0, len(names))
++	for _, n := range names {
++		tools = append(tools, ToolDefinition{Name: n})
++	}
++	return newWireNameRewriter(tools, true)
++}
++
++// The alias only exists between this gateway and Cursor. A client asked for
++// Write, so that is the name it has to read in the reply.
++func TestAliasIsTranslatedBackToTheClientName(t *testing.T) {
++	r := rewriterFor("Write", "Read")
++	got := r.rewrite("I'll use mcp_Write to create the page, then mcp_Read it back.") + r.flush()
++	want := "I'll use Write to create the page, then Read it back."
++	if got != want {
++		t.Fatalf("got %q, want %q", got, want)
++	}
++}
++
++// Deltas break wherever the tokenizer broke, so the alias arrives in pieces
++// far more often than not.
++func TestAnAliasSplitAcrossDeltasIsStillTranslated(t *testing.T) {
++	for _, chunks := range [][]string{
++		{"use ", "mcp_", "Write", " now"},
++		{"use mc", "p_Wri", "te now"},
++		{"use mcp_W", "rite now"},
++		{"use mcp_Write", " now"},
++	} {
++		r := rewriterFor("Write")
++		var b strings.Builder
++		for _, c := range chunks {
++			b.WriteString(r.rewrite(c))
++		}
++		b.WriteString(r.flush())
++		if got := b.String(); got != "use Write now" {
++			t.Errorf("chunks %q produced %q", chunks, got)
++		}
++	}
++}
++
++// An alias at the very end has nothing after it to prove the name ended, so it
++// is held until the segment closes rather than emitted raw.
++func TestAnAliasAtTheEndIsTranslatedOnFlush(t *testing.T) {
++	r := rewriterFor("Write")
++	got := r.rewrite("calling mcp_Write")
++	if strings.Contains(got, "mcp_") {
++		t.Fatalf("emitted the alias before it was decidable: %q", got)
++	}
++	if final := got + r.flush(); final != "calling Write" {
++		t.Fatalf("got %q", final)
++	}
++}
++
++// Only this session's aliases are rewritten: the client may have real tools of
++// its own whose names start with the same prefix, and those must survive.
++func TestUnrelatedMcpNamesAreLeftAlone(t *testing.T) {
++	r := rewriterFor("Write")
++	got := r.rewrite("mcp_linear_createIssue and mcp_WriteFile are untouched, mcp_Write is not.") + r.flush()
++	want := "mcp_linear_createIssue and mcp_WriteFile are untouched, Write is not."
++	if got != want {
++		t.Fatalf("got %q, want %q", got, want)
++	}
++}
++
++// A tool that was never renamed has no alias, so there is nothing to rewrite
++// and the rewriter should not exist at all.
++func TestNoRewriterWhenNothingWasRenamed(t *testing.T) {
++	if r := rewriterFor("AskUserQuestion", "Bash"); r != nil {
++		t.Fatal("built a rewriter for a toolset that was never renamed")
++	}
++	if r := newWireNameRewriter([]ToolDefinition{{Name: "Write"}}, false); r != nil {
++		t.Fatal("built a rewriter for a model that does not rename")
++	}
++	if got := (*wireNameRewriter)(nil).rewrite("mcp_Write stays"); got != "mcp_Write stays" {
++		t.Fatalf("nil rewriter altered text: %q", got)
++	}
++}
++
++// Text that merely contains the prefix must pass through unchanged and whole.
++func TestTextWithoutAnAliasIsPreserved(t *testing.T) {
++	r := rewriterFor("Write")
++	var b strings.Builder
++	for _, c := range []string{"the mcp_ prefix", " is an implementation ", "detail"} {
++		b.WriteString(r.rewrite(c))
++	}
++	b.WriteString(r.flush())
++	if got, want := b.String(), "the mcp_ prefix is an implementation detail"; got != want {
++		t.Fatalf("got %q, want %q", got, want)
++	}
++}
+-- 
+2.43.0
+

@@ -493,3 +493,96 @@ upstream report lands and carries the real cache creation.
 `tests/agent_tool_loop_cache_probe.py` drives this shape. It echoes back the
 exact `tool_use` id and input the gateway emitted; a probe that invents an id
 cannot match the parked session and measures a path no real client takes.
+
+## cursor-tool-name-collisions.patch
+
+The report came with three screenshots: the model writing a page titled "工作区
+插件调用不可用时的绕行方案" (a workaround for when plugin calls are
+unavailable), a confirmation prompt arriving as a raw code block full of
+`toolu_…` and JSON instead of a clickable card, and the user's note that the
+desktop client was misbehaving.
+
+Nothing was wrong with the wire format. Probed directly and through NewAPI,
+single-turn and multi-turn, before and after dropping the live session, every
+call came back as a proper `tool_use` block with valid accumulated JSON and
+`stop_reason: tool_use`. The fault was the *name*.
+
+Client tool names are namespaced on the wire — `Write` is registered upstream
+as `mcp_Write` — because Cursor's harness registers its own agent tools
+alongside the client's and Anthropic refuses a request that declares one name
+twice. That refusal is not a clean error. The run just never produces a token,
+which is why the rename was applied to every client tool rather than risk
+missing one.
+
+A Claude Code client declares about thirty tools. Four of them collide. Asking
+a run that carries no client tools to list what it has returns Cursor's side of
+the overlap:
+
+```
+Shell  Glob  Grep  AwaitShell  Read  Delete  StrReplace  Write
+EditNotebook  TodoWrite  GenerateImage  AskQuestion  Task
+ListMcpResources  FetchMcpResource  SwitchMode
+```
+
+Intersected with the client's list that is `Read`, `Write`, `Glob`, `Grep` —
+and nothing else. `AskUserQuestion` is not `AskQuestion`; `Edit` is not
+`StrReplace`; `Bash` is not `Shell`. Twenty-six tools were being renamed for
+nothing, and the model noticed. From the gateway's own request log, in its
+reasoning:
+
+> Looking back at what I actually have available, I see both the "mcp_*"
+> prefixed tools and the standard ones listed … the error message telling me to
+> use mcp_Write instead of Write makes sense as a legitimate constraint rather
+> than a potential injection attempt.
+
+and then, to the user:
+
+> That tool error is legitimate this time — `mcp_Write` is genuinely in my
+> available toolset alongside `Write`, so I'll just use it instead.
+
+The system prompt was asserting that the model's entire visible toolset was
+fake and only the prefixed copies were real. That reads as a prompt injection,
+so the model spent its turns litigating it instead of working — and wrote the
+workaround page from the screenshot. The confirmation card broke for a simpler
+reason: it reached the client named `mcp_AskUserQuestion`, a tool the client
+never declared, so there was nothing to render and the raw call showed through.
+
+Two commits.
+
+**Rename only what collides.** The four that do are still renamed, so the
+duplicate-name hang stays fixed; the other twenty-six keep the names their
+client gave them. The match is case-insensitive, because the collision is
+upstream's and `write` collides as hard as `Write`. Getting this list wrong
+fails silently, so it is derived rather than guessed, and the failure mode is
+recorded next to it.
+
+**Translate the alias back out of prose.** The four that are renamed are still
+known to the model as `mcp_Write` and it reasons about them under that name.
+The alias is the gateway's invention and means nothing downstream, so this
+session's aliases are rewritten out of the text and thinking streams. Only this
+session's — a blanket search for the prefix would also rewrite a genuine
+mention of some other `mcp_` tool, which a client may well have. Deltas break
+wherever the tokenizer broke them, so the rewriter holds back a trailing
+fragment that could still grow into an alias and releases it when the segment
+ends or a tool call takes its place.
+
+Verified on the deployed build:
+
+| check | before | after |
+| --- | --- | --- |
+| full 30-tool set, nothing renamed | hangs, no token in 420s | n/a |
+| full 30-tool set, only colliders renamed | n/a | accepted in 3s |
+| `AskUserQuestion` name seen by client | `mcp_AskUserQuestion` | `AskUserQuestion` |
+| `Write` name seen by client | `Write` | `Write` |
+| `mcp_` in reply or reasoning | present | absent |
+
+Multi-turn holds across a gateway restart mid-conversation — `AskUserQuestion`,
+then `AskUserQuestion` again, then `Write`, every one a real `tool_use` block
+with no raw JSON in the text. Grok is unaffected, as it never renamed anything.
+The previous round's cache accounting is unchanged: intermediate steps still
+read (`16498`, `16540`, `16607`) against small input, with no invented writes.
+
+`tests/toolwire_probe.py` checks the shape a client actually receives,
+`tests/allnames_probe.py` finds name collisions, `tests/foldleak_probe.py`
+continues a tool conversation whose session is gone, and
+`tests/realistic_probe.py` reproduces the reported session in full.
