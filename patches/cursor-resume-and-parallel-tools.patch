@@ -1,0 +1,473 @@
+From a2fd4e2a8c4e9eb70ce38eda85fcfdf84407df7b Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 09:25:43 +0000
+Subject: [PATCH] cursor: stop stale-context resumes and split parallel tool
+ batches
+
+Two defects surfaced together in production traffic on 15.204.94.214.
+
+1. lookupPrefixResume treated a request the checkpoint already covered end
+   to end as a continuation and resumed it carrying the literal text
+   "Continue.". Every repeated request - a retry, a polling monitor, two
+   agents opening with the same turn - therefore replayed a finished
+   conversation and answered that stale context instead of the request in
+   hand ("I don't have any task to continue"). The replay also rewrote the
+   prompt, so the provider-side cache missed and the turn was billed as a
+   fresh cache write. Repeating one prompt five times reproduced it: only
+   the first answered correctly, and the prompt grew every turn as the
+   nudge and its wrong answer were appended. Boundaries that fold to an
+   empty tail are now skipped, so the probe keeps walking to a shorter
+   boundary that carries a real instruction, and a fully covered request
+   runs fresh. The same five repeats now all answer correctly and all keep
+   their ~99.5% cache read.
+
+2. The read loop paused the segment on the first client tool call it saw.
+   A parallel batch arrives as back-to-back frames that usually land in
+   separate body reads, so only the batch's first call reached the client
+   per round trip: asking for three get_weather calls in one reply returned
+   Paris on turn 1, Tokyo on turn 2 and Lima on turn 3. Body reads move to
+   a dedicated goroutine feeding a channel so the consumer can bound its
+   wait, and the loop now drains for parallelToolGrace after the first tool
+   call before parking. The mid-turn checkpoint, pending-usage flush and
+   pause bookkeeping still run once, after the drain.
+---
+ internal/cursor/agent.go                      |  14 +-
+ internal/cursor/conversation_cache_test.go    |  44 +++-
+ internal/cursor/session.go                    | 204 ++++++++++++------
+ internal/cursor/session_paralleltools_test.go |  94 ++++++++
+ 4 files changed, 272 insertions(+), 84 deletions(-)
+ create mode 100644 internal/cursor/session_paralleltools_test.go
+
+diff --git a/internal/cursor/agent.go b/internal/cursor/agent.go
+index 764f16e0..7abbcee0 100644
+--- a/internal/cursor/agent.go
++++ b/internal/cursor/agent.go
+@@ -226,12 +226,6 @@ func foldTurnTailText(tail []ChatMessage) string {
+ 	return b.String()
+ }
+ 
+-// foldContinueNudge is the user text a resume carries when the request adds
+-// nothing beyond what the checkpoint already covers — a client re-forking the
+-// same continuation after discarding the reply it got. The model just picks
+-// the turn back up.
+-const foldContinueNudge = "Continue."
+-
+ // lookupPrefixResume probes every message boundary of a request, longest
+ // prefix first, for a stored checkpoint covering exactly that prefix. It
+ // rescues the requests the trailing-user-run split cannot: tool-result
+@@ -242,6 +236,12 @@ const foldContinueNudge = "Continue."
+ // are stored under the final transcript, the client's request prefix, and
+ // mid-turn tool-pause boundaries, so any of those positions can hit. On a hit
+ // the un-checkpointed tail is folded into the resumed turn's user message.
++//
++// A boundary whose tail folds to nothing is skipped rather than resumed: the
++// request restates a turn the checkpoint already answered, so there is no new
++// instruction to send. Resuming it anyway would replay the finished turn and
++// the model would answer that stale context instead of the request in hand. A
++// shorter boundary can still carry a real tail, so the probe keeps walking.
+ func lookupPrefixResume(accountKey, wireModelID string, messages []ChatMessage) (*convEntry, string, string, bool) {
+ 	echo := echoTranscript(messages)
+ 	prefixes := conversationPrefixFingerprints(echo)
+@@ -257,7 +257,7 @@ func lookupPrefixResume(accountKey, wireModelID string, messages []ChatMessage)
+ 		}
+ 		text := foldTurnTailText(echo[i:])
+ 		if strings.TrimSpace(text) == "" {
+-			text = foldContinueNudge
++			continue
+ 		}
+ 		return entry, prefixes[i], text, true
+ 	}
+diff --git a/internal/cursor/conversation_cache_test.go b/internal/cursor/conversation_cache_test.go
+index 51c3931e..d59c5d92 100644
+--- a/internal/cursor/conversation_cache_test.go
++++ b/internal/cursor/conversation_cache_test.go
+@@ -137,14 +137,42 @@ func TestLookupPrefixResumeSurvivesClientDivergence(t *testing.T) {
+ 		}
+ 	}
+ 
+-	// An exact duplicate of the covered prefix (a client re-forking the same
+-	// continuation) resumes with the nudge instead of missing.
+-	entry, _, folded, ok = lookupPrefixResume("acct-div", "claude-opus-5", requestPrefix)
+-	if !ok || entry == nil || entry.conversationID != "conv-div" {
+-		t.Fatalf("expected duplicate continuation to resume, got ok=%v", ok)
+-	}
+-	if folded != foldContinueNudge {
+-		t.Fatalf("duplicate continuation must carry the continue nudge, got %q", folded)
++	// A request the checkpoint already covers end to end must not resume:
++	// there is nothing left to ask, so replaying the finished turn would
++	// answer stale context instead of this request.
++	if _, _, _, ok = lookupPrefixResume("acct-div", "claude-opus-5", requestPrefix); ok {
++		t.Fatal("a fully covered request must miss so it runs fresh")
++	}
++}
++
++func TestLookupPrefixResumeSkipsCoveredBoundaryForShorterOne(t *testing.T) {
++	t.Setenv("CPA_CURSOR_CONV_CACHE_DIR", t.TempDir())
++	// Two checkpoints: one for the finished first turn, one keyed under the
++	// whole request a previous identical send stored.
++	firstTurn := []ChatMessage{
++		{Role: "user", Content: "what is the capital of France"},
++		{Role: "assistant", Content: "Paris"},
++	}
++	repeat := append(append([]ChatMessage(nil), firstTurn...),
++		ChatMessage{Role: "user", Content: "and of Japan"})
++
++	shortFp := conversationFingerprint(echoTranscript(firstTurn))
++	fullFp := conversationFingerprint(echoTranscript(repeat))
++	state := &agentv1.ConversationStateStructure{Turns: [][]byte{[]byte("turn")}}
++	defaultConversationCache.Store("acct-skip", shortFp, &convEntry{conversationID: "conv-short", state: state, model: "claude-opus-5"})
++	defaultConversationCache.Store("acct-skip", fullFp, &convEntry{conversationID: "conv-full", state: state, model: "claude-opus-5"})
++	defer defaultConversationCache.Invalidate("acct-skip", shortFp)
++	defer defaultConversationCache.Invalidate("acct-skip", fullFp)
++
++	entry, gotFp, folded, ok := lookupPrefixResume("acct-skip", "claude-opus-5", repeat)
++	if !ok || entry == nil {
++		t.Fatal("expected the shorter boundary to resume")
++	}
++	if entry.conversationID != "conv-short" || gotFp != shortFp {
++		t.Fatalf("expected the boundary that leaves a tail, got %q", entry.conversationID)
++	}
++	if !strings.Contains(folded, "and of Japan") {
++		t.Fatalf("resume must carry the new turn, got %q", folded)
+ 	}
+ }
+ 
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index e0ac44b0..2325ad21 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -503,12 +503,33 @@ func (s *Session) readLoop(ctx context.Context) {
+ 			decoder.SetCompression(enc)
+ 		}
+ 	}
+-	readBuf := make([]byte, 32*1024)
++	// A dedicated goroutine owns the blocking body reads so the consumer loop
++	// can bound how long it waits (the parallel tool-call drain below) without
++	// abandoning a read already in flight.
++	reads := make(chan readChunk, 4)
++	go func() {
++		buf := make([]byte, 32*1024)
++		for {
++			n, errRead := s.stream.Read(buf)
++			chunk := readChunk{err: errRead}
++			if n > 0 {
++				chunk.data = append([]byte(nil), buf[:n]...)
++			}
++			select {
++			case reads <- chunk:
++			case <-ctx.Done():
++				return
++			}
++			if errRead != nil {
++				return
++			}
++		}
++	}()
++
+ 	for {
+ 		s.mu.Lock()
+ 		waiting := s.waitingTools
+ 		closed := s.closed
+-		stream := s.stream
+ 		pauseCh := s.pauseCh
+ 		s.mu.Unlock()
+ 		if closed {
+@@ -535,83 +556,128 @@ func (s *Session) readLoop(ctx context.Context) {
+ 			}
+ 		}
+ 
+-		n, errRead := stream.Read(readBuf)
+-		if n > 0 {
+-			envelopes, errFeed := decoder.Feed(readBuf[:n])
+-			if errFeed != nil {
+-				s.fail(errFeed)
+-				return
+-			}
+-			endForTools := false
+-			for _, env := range envelopes {
+-				if env.EndStream() {
+-					debugDumpFrame(env, nil)
+-					if len(env.Payload) > 0 {
+-						var trailer struct {
+-							Error json.RawMessage `json:"error"`
+-						}
+-						_ = json.Unmarshal(env.Payload, &trailer)
+-						if len(trailer.Error) > 0 && string(trailer.Error) != "null" {
+-							s.fail(fmt.Errorf("cursor connect end-stream error: %s", string(trailer.Error)))
+-							return
+-						}
+-					}
+-					s.storeConversationSnapshot()
+-					s.markFinished()
+-					s.endSegment("stop")
+-					_ = s.closeWith("upstream_end_stream")
++		var chunk readChunk
++		select {
++		case <-ctx.Done():
++			continue
++		case chunk = <-reads:
++		}
++		endForTools, done := s.processChunk(decoder, chunk)
++		if done {
++			return
++		}
++		if !endForTools {
++			continue
++		}
++		// The first client tool call of a parallel batch pauses the segment.
++		// Upstream sends the siblings right behind it, so keep draining for a
++		// moment; otherwise they land one turn late, one per round trip.
++		timer := time.NewTimer(parallelToolGrace)
++	drain:
++		for {
++			select {
++			case <-ctx.Done():
++				timer.Stop()
++				break drain
++			case <-timer.C:
++				break drain
++			case chunk = <-reads:
++				_, done = s.processChunk(decoder, chunk)
++				if done {
++					timer.Stop()
+ 					return
+ 				}
+-				chunks := splitAgentServerRecords(env.Payload)
+-				if len(chunks) == 0 {
+-					chunks = [][]byte{env.Payload}
+-				}
+-				for _, chunk := range chunks {
+-					serverMsg := &agentv1.AgentServerMessage{}
+-					if err := proto.Unmarshal(chunk, serverMsg); err != nil {
+-						s.fail(fmt.Errorf("cursor decode server message: %w", err))
+-						return
+-					}
+-					debugDumpFrame(env, serverMsg)
+-					pause, err := s.handleServerMessage(serverMsg)
+-					if err != nil {
+-						s.fail(err)
+-						return
++			}
++		}
++		s.flushAssistantSegment()
++		// Mirror the mid-turn checkpoint before parking: if this
++		// session is never resumed (client re-forks, gateway
++		// restarts), the next request can still continue the same
++		// upstream conversation instead of re-billing the prefix.
++		s.storePauseSnapshot()
++		if usage := s.takePendingUsage(); usage != nil {
++			s.emit(*usage)
++		}
++		s.beginWaitingTools()
++		s.endSegment("tool_calls")
++	}
++}
++
++// readChunk is one raw read from the Agent H2 response body.
++type readChunk struct {
++	data []byte
++	err  error
++}
++
++// parallelToolGrace is how long the read loop keeps draining after the first
++// client tool call before pausing the segment. The upstream agent emits a
++// parallel batch back to back, so without the window only the first call of
++// the batch reaches the client in this segment.
++const parallelToolGrace = 120 * time.Millisecond
++
++// processChunk feeds one raw read into the Connect decoder and dispatches the
++// complete envelopes. It reports whether the segment paused for client tools
++// and whether the read loop is finished.
++func (s *Session) processChunk(decoder *Decoder, chunk readChunk) (endForTools bool, done bool) {
++	if len(chunk.data) > 0 {
++		envelopes, errFeed := decoder.Feed(chunk.data)
++		if errFeed != nil {
++			s.fail(errFeed)
++			return false, true
++		}
++		for _, env := range envelopes {
++			if env.EndStream() {
++				debugDumpFrame(env, nil)
++				if len(env.Payload) > 0 {
++					var trailer struct {
++						Error json.RawMessage `json:"error"`
+ 					}
+-					if pause {
+-						endForTools = true
++					_ = json.Unmarshal(env.Payload, &trailer)
++					if len(trailer.Error) > 0 && string(trailer.Error) != "null" {
++						s.fail(fmt.Errorf("cursor connect end-stream error: %s", string(trailer.Error)))
++						return false, true
+ 					}
+ 				}
++				s.storeConversationSnapshot()
++				s.markFinished()
++				s.endSegment("stop")
++				_ = s.closeWith("upstream_end_stream")
++				return false, true
+ 			}
+-			if endForTools {
+-				s.flushAssistantSegment()
+-				// Mirror the mid-turn checkpoint before parking: if this
+-				// session is never resumed (client re-forks, gateway
+-				// restarts), the next request can still continue the same
+-				// upstream conversation instead of re-billing the prefix.
+-				s.storePauseSnapshot()
+-				if usage := s.takePendingUsage(); usage != nil {
+-					s.emit(*usage)
++			records := splitAgentServerRecords(env.Payload)
++			if len(records) == 0 {
++				records = [][]byte{env.Payload}
++			}
++			for _, record := range records {
++				serverMsg := &agentv1.AgentServerMessage{}
++				if err := proto.Unmarshal(record, serverMsg); err != nil {
++					s.fail(fmt.Errorf("cursor decode server message: %w", err))
++					return false, true
++				}
++				debugDumpFrame(env, serverMsg)
++				pause, err := s.handleServerMessage(serverMsg)
++				if err != nil {
++					s.fail(err)
++					return false, true
++				}
++				if pause {
++					endForTools = true
+ 				}
+-				s.beginWaitingTools()
+-				s.endSegment("tool_calls")
+ 			}
+ 		}
+-		if errRead == io.EOF {
+-			s.storeConversationSnapshot()
+-			s.markFinished()
+-			s.endSegment("stop")
+-			_ = s.closeWith("upstream_eof")
+-			return
+-		}
+-		if errRead != nil {
+-			s.fail(errRead)
+-			return
+-		}
+-		if n == 0 {
+-			time.Sleep(10 * time.Millisecond)
+-		}
+ 	}
++	if chunk.err == io.EOF {
++		s.storeConversationSnapshot()
++		s.markFinished()
++		s.endSegment("stop")
++		_ = s.closeWith("upstream_eof")
++		return false, true
++	}
++	if chunk.err != nil {
++		s.fail(chunk.err)
++		return false, true
++	}
++	return endForTools, false
+ }
+ 
+ func (s *Session) beginWaitingTools() {
+diff --git a/internal/cursor/session_paralleltools_test.go b/internal/cursor/session_paralleltools_test.go
+new file mode 100644
+index 00000000..bbad65c6
+--- /dev/null
++++ b/internal/cursor/session_paralleltools_test.go
+@@ -0,0 +1,94 @@
++package cursor
++
++import (
++	"context"
++	"io"
++	"testing"
++	"time"
++
++	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/structpb"
++)
++
++func mcpArgsEnvelope(t *testing.T, execID, callID, city string) []byte {
++	t.Helper()
++	msg := &agentv1.AgentServerMessage{
++		Message: &agentv1.AgentServerMessage_ExecServerMessage{
++			ExecServerMessage: &agentv1.ExecServerMessage{
++				Id:     1,
++				ExecId: execID,
++				Message: &agentv1.ExecServerMessage_McpArgs{
++					McpArgs: &agentv1.McpArgs{
++						Name:               "get_weather",
++						ToolName:           "get_weather",
++						ToolCallId:         callID,
++						ProviderIdentifier: MCPProviderIdentifier,
++						Args:               map[string]*structpb.Value{"city": structpb.NewStringValue(city)},
++					},
++				},
++			},
++		},
++	}
++	payload, err := proto.Marshal(msg)
++	if err != nil {
++		t.Fatalf("marshal server message: %v", err)
++	}
++	return EncodeEnvelope(payload, false)
++}
++
++// The upstream agent emits a parallel tool batch as back-to-back frames that
++// often land in separate body reads. All of them belong to the same segment;
++// pausing on the first would hand the client one call per round trip.
++func TestReadLoopDrainsParallelToolCallsIntoOneSegment(t *testing.T) {
++	bodyR, bodyW := io.Pipe()
++	_, streamW := io.Pipe()
++	tool := ToolDefinition{Name: "get_weather"}
++	s := &Session{
++		ID:        "sess-parallel",
++		events:    make(chan StreamEvent, 16),
++		pending:   map[string]*pendingExec{},
++		tools:     []ToolDefinition{tool},
++		toolIndex: map[string]*ToolDefinition{"get_weather": &tool},
++		stream:    &BidiStream{writer: streamW, body: bodyR},
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go s.readLoop(ctx)
++
++	go func() {
++		for i, city := range []string{"Paris", "Tokyo", "Lima"} {
++			if _, err := bodyW.Write(mcpArgsEnvelope(t, "exec", string(rune('a'+i)), city)); err != nil {
++				return
++			}
++			time.Sleep(10 * time.Millisecond)
++		}
++	}()
++
++	var cities []string
++	deadline := time.After(5 * time.Second)
++	for {
++		select {
++		case ev, ok := <-s.events:
++			if !ok {
++				t.Fatalf("events closed after %v", cities)
++			}
++			switch ev.Type {
++			case "tool_call":
++				cities = append(cities, ev.ToolCall.Arguments["city"].(string))
++				continue
++			case "segment_end":
++				if ev.Reason != "tool_calls" {
++					t.Fatalf("unexpected segment end %q", ev.Reason)
++				}
++				if len(cities) != 3 {
++					t.Fatalf("parallel batch split across segments: got %v, want all three", cities)
++				}
++				return
++			}
++		case <-deadline:
++			t.Fatalf("timed out with %v", cities)
++		}
++	}
++}
+-- 
+2.43.0
+
