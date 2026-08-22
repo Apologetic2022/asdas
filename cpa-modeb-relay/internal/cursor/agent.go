@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -220,6 +222,206 @@ func storeBlob(store map[string][]byte, data []byte) []byte {
 const resumeContinuationPrompt = "Continue the conversation. The results of your earlier tool calls are " +
 	"already provided in the conversation history above. Use them to fulfill the user's most recent " +
 	"request. Call more tools if needed; otherwise answer the user directly."
+
+// splitTrailingUserRun keeps reminder/todo rows emitted as adjacent user
+// messages in the incoming turn. The prefix is the transcript a checkpoint
+// stored at the end of the previous assistant turn.
+func splitTrailingUserRun(messages []ChatMessage) (prefix, turn []ChatMessage) {
+	i := len(messages)
+	for i > 0 && messages[i-1].Role == "user" {
+		i--
+	}
+	return messages[:i], messages[i:]
+}
+
+func joinedUserText(turn []ChatMessage) string {
+	parts := make([]string, 0, len(turn))
+	for i := range turn {
+		if content := strings.TrimSpace(turn[i].Content); content != "" {
+			parts = append(parts, turn[i].Content)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+const foldTurnTailResultLimit = 20000
+
+// foldTurnTailText turns a structured tail that is newer than the latest
+// checkpoint into the one text action accepted by a resumed Agent run.
+func foldTurnTailText(tail []ChatMessage) string {
+	var builder strings.Builder
+	toolActivity := false
+	write := func(text string) {
+		if strings.TrimSpace(text) == "" {
+			return
+		}
+		if builder.Len() > 0 {
+			builder.WriteString("\n\n")
+		}
+		builder.WriteString(text)
+	}
+	for i := range tail {
+		msg := &tail[i]
+		switch msg.Role {
+		case "user", "system":
+			write(msg.Content)
+		case "assistant":
+			if strings.TrimSpace(msg.Content) != "" {
+				write("[your reply so far]\n" + msg.Content)
+			}
+			for j := range msg.ToolCalls {
+				toolActivity = true
+				call := &msg.ToolCalls[j]
+				args := "{}"
+				if len(call.Arguments) > 0 {
+					if payload, err := json.Marshal(call.Arguments); err == nil {
+						args = string(payload)
+					}
+				}
+				write(fmt.Sprintf("[called tool %s id=%s arguments=%s]",
+					strings.TrimSpace(call.Name), normalizeFingerprintToolID(call.ID), args))
+			}
+		case "tool":
+			toolActivity = true
+			content := msg.Content
+			if len(content) > foldTurnTailResultLimit {
+				content = content[:foldTurnTailResultLimit] + "\n… (truncated)"
+			}
+			write(fmt.Sprintf("[tool result %s id=%s]\n%s",
+				strings.TrimSpace(msg.Name), normalizeFingerprintToolID(msg.ToolCallID), content))
+		}
+	}
+	if toolActivity {
+		write("[The tool calls above have already run; continue the task from their results and do not repeat them.]")
+	}
+	return builder.String()
+}
+
+// lookupPrefixResume finds the longest stored checkpoint that leaves a real
+// tail to execute. It also waits for an announced in-flight store, closing the
+// race between a fast follow-up request and Cursor's trailing checkpoint.
+func lookupPrefixResume(accountKey, wireModelID string, messages []ChatMessage) (*convEntry, string, string, []ChatMessage, bool) {
+	scope := convScope(accountKey, wireModelID)
+	echo := echoTranscript(messages)
+	prefixes := conversationPrefixFingerprints(echo)
+	resolved := func(i int, entry *convEntry) (*convEntry, string, string, []ChatMessage, bool) {
+		if entry == nil || entry.model != wireModelID {
+			return nil, "", "", nil, false
+		}
+		text := foldTurnTailText(echo[i:])
+		if strings.TrimSpace(text) == "" {
+			return nil, "", "", nil, false
+		}
+		return entry, prefixes[i], text, echo[:i], true
+	}
+
+	waitIndex := 0
+	var wait <-chan struct{}
+	for i := len(echo); i >= 1; i-- {
+		if entry, ok := defaultConversationCache.LookupNoWait(scope, prefixes[i]); ok {
+			if found, fingerprint, text, prefix, hit := resolved(i, entry); hit {
+				return found, fingerprint, text, prefix, true
+			}
+			continue
+		}
+		if wait == nil {
+			if pending := defaultConversationCache.PendingWait(scope, prefixes[i]); pending != nil {
+				waitIndex, wait = i, pending
+			}
+		}
+	}
+	if wait == nil {
+		return nil, "", "", nil, false
+	}
+	select {
+	case <-wait:
+	case <-time.After(convPendingWait):
+	}
+	entry, ok := defaultConversationCache.LookupNoWait(scope, prefixes[waitIndex])
+	if !ok {
+		return nil, "", "", nil, false
+	}
+	return resolved(waitIndex, entry)
+}
+
+// buildResumeRunRequest replays Cursor's own checkpoint under the same
+// conversation id and sends only the new turn. This is the operation that
+// preserves the provider prompt cache across separate gateway requests.
+func buildResumeRunRequest(model string, entry *convEntry, userText string, tools []ToolDefinition, choice ToolChoice) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
+	if entry == nil || entry.state == nil || strings.TrimSpace(entry.conversationID) == "" {
+		return nil, nil, "", fmt.Errorf("cursor: no conversation checkpoint to resume")
+	}
+	selection := ResolveRequestedModel(model)
+	publicID := selection.PublicID
+	if publicID == "" {
+		publicID = selection.ModelID
+	}
+	wireID := selection.ModelID
+	displayID := publicID
+	displayName := publicID
+	if catalog, ok := catalogEntry(publicID); ok {
+		if catalog.DisplayModel != "" {
+			displayID = catalog.DisplayModel
+		}
+		if catalog.DisplayName != "" {
+			displayName = catalog.DisplayName
+		}
+		selection.MaxMode = selection.MaxMode || catalog.MaxMode
+		if !selection.VariantStringRepr && len(selection.Parameters) == 0 && len(catalog.Parameters) > 0 {
+			selection.Parameters = append([]ModelParameter(nil), catalog.Parameters...)
+		}
+		if selection.VariantStringRepr && strings.TrimSpace(catalog.WireID) != "" {
+			wireID = catalog.WireID
+			selection.ModelID = wireID
+		}
+	}
+	details := &agentv1.ModelDetails{ModelId: wireID, DisplayModelId: displayID, DisplayName: displayName}
+	if selection.MaxMode {
+		maxMode := true
+		details.MaxMode = &maxMode
+	}
+
+	if directive := toolChoiceDirective(choice); directive != "" {
+		userText += "\n\n[Response constraint: " + directive + "]"
+	}
+	if directive := mcpOnlyToolDirective(tools); directive != "" {
+		userText += "\n\n[Tool constraint: " + directive + "]"
+	}
+	blobStore := make(map[string][]byte, len(entry.blobs))
+	for key, value := range entry.blobs {
+		blobStore[key] = append([]byte(nil), value...)
+	}
+	conversationID := entry.conversationID
+	supportsImages := true
+	run := &agentv1.AgentRunRequest{
+		ConversationId:             &conversationID,
+		ConversationState:          proto.Clone(entry.state).(*agentv1.ConversationStateStructure),
+		ModelDetails:               details,
+		RequestedModel:             toRequestedModelProto(selection),
+		ClientSupportsInlineImages: &supportsImages,
+		Action: &agentv1.ConversationAction{
+			Action: &agentv1.ConversationAction_UserMessageAction{
+				UserMessageAction: &agentv1.UserMessageAction{
+					UserMessage: &agentv1.UserMessage{
+						Text:      userText,
+						MessageId: uuid.NewString(),
+					},
+				},
+			},
+		},
+	}
+	if definitions := buildMcpToolDefinitions(tools); len(definitions) > 0 {
+		run.McpTools = &agentv1.McpTools{McpTools: definitions}
+	}
+	log.Debugf("cursor: built checkpoint resume conv=%s model=%s turns=%d", conversationID, wireID, len(entry.state.GetTurns()))
+	return &agentv1.AgentClientMessage{
+		Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: run},
+	}, blobStore, conversationID, nil
+}
+
+func echoTranscript(messages []ChatMessage) []ChatMessage {
+	return append([]ChatMessage(nil), messages...)
+}
 
 func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition, choice ToolChoice) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
 	selection := ResolveRequestedModel(model)

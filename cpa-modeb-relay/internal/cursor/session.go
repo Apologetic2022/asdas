@@ -95,6 +95,27 @@ type Session struct {
 	lastActivity time.Time
 	manager      *SessionManager
 
+	// Conversation continuation state. Cursor's provider cache follows the
+	// upstream conversation id, so the latest checkpoint is stored under a
+	// fingerprint of the transcript the client will echo on its next request.
+	accountKey      string
+	convScope       string
+	transcript      []ChatMessage
+	segText         strings.Builder
+	segCalls        []ToolCall
+	checkpoint      *agentv1.ConversationStateStructure
+	ckptCount       int
+	ckptAfterEnd    bool
+	outputAfterCkpt bool
+	turnEnded       bool
+	resumed         bool
+	resumeKey       string
+	everOutput      bool
+	snapshotStored  bool
+	requestKey      string
+	pauseCkptStored int
+	pendingResolve  func()
+
 	// turnEndedSeen records that the pre-tool segment already delivered its
 	// TurnEnded (and usage). When it did not, the TurnEnded that surfaces
 	// right after tool results are submitted belongs to the previous segment
@@ -128,9 +149,49 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 	}
 	tools = ApplyToolChoice(tools, opts.ToolChoice)
 	selection := ResolveRequestedModel(model)
-	clientMsg, blobStore, conversationID, err := buildRunRequest(model, messages, tools, opts.ToolChoice)
-	if err != nil {
-		return nil, err
+	accountKey := accountKeyForSession(opts.AuthID, creds)
+	scope := convScope(accountKey, selection.ModelID)
+	var clientMsg *agentv1.AgentClientMessage
+	var blobStore map[string][]byte
+	var conversationID string
+	var cachedPrefix []ChatMessage
+	resumed := false
+	resumeKey := ""
+	if conversationReuseEnabled() && scope != "" {
+		prefix, turn := splitTrailingUserRun(messages)
+		userText := joinedUserText(turn)
+		var entry *convEntry
+		if len(prefix) > 0 && userText != "" {
+			resumeKey = conversationFingerprint(prefix)
+			if found, ok := defaultConversationCache.Lookup(scope, resumeKey); ok && found.model == selection.ModelID {
+				entry = found
+				cachedPrefix = prefix
+			}
+		}
+		resumeMode := "turn"
+		if entry == nil {
+			if found, fingerprint, folded, matched, ok := lookupPrefixResume(accountKey, selection.ModelID, messages); ok {
+				entry, resumeKey, userText, cachedPrefix = found, fingerprint, folded, matched
+				resumeMode = "fold"
+			}
+		}
+		if entry != nil {
+			cm, blobs, id, errResume := buildResumeRunRequest(model, entry, userText, tools, opts.ToolChoice)
+			if errResume == nil {
+				clientMsg, blobStore, conversationID = cm, blobs, id
+				resumed = true
+				log.Infof("cursor: resuming conversation %s from checkpoint (account=%s model=%s mode=%s)", id, accountKey, selection.ModelID, resumeMode)
+			} else {
+				log.Warnf("cursor: checkpoint found but resume request build failed, replaying full history: %v", errResume)
+			}
+		}
+	}
+	if clientMsg == nil {
+		var err error
+		clientMsg, blobStore, conversationID, err = buildRunRequest(model, messages, tools, opts.ToolChoice)
+		if err != nil {
+			return nil, err
+		}
 	}
 	first, err := proto.Marshal(clientMsg)
 	if err != nil {
@@ -156,6 +217,22 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		return OpenAgentRun(runCtx, creds.BaseURL, headers, first)
 	}
 	stream, err := openRun()
+	if err != nil && resumed {
+		// A stale or rejected checkpoint must not wedge a conversation. Drop
+		// it and retry once with the complete request history.
+		defaultConversationCache.Invalidate(scope, resumeKey)
+		resumed = false
+		resumeKey = ""
+		cachedPrefix = nil
+		log.Warnf("cursor: checkpoint resume rejected, rebuilding conversation: %v", err)
+		clientMsg, blobStore, conversationID, err = buildRunRequest(model, messages, tools, opts.ToolChoice)
+		if err == nil {
+			first, err = proto.Marshal(clientMsg)
+		}
+		if err == nil {
+			stream, err = openRun()
+		}
+	}
 	if err != nil && isTransientRunOpenError(err) && ctx.Err() == nil {
 		// Cursor's edge occasionally answers a run open with a bare 502/503;
 		// a single quick retry rides it out instead of failing the request.
@@ -188,6 +265,17 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		lastActivity:   time.Now(),
 		manager:        DefaultSessionManager(),
 		promptTokens:   opts.PromptTokens,
+		accountKey:     accountKey,
+		convScope:      scope,
+		transcript:     echoTranscript(messages),
+		resumed:        resumed,
+		resumeKey:      resumeKey,
+	}
+	session.requestKey = conversationFingerprint(session.transcript)
+	if resumed {
+		// A checkpoint already covers this prefix upstream. Seeding the run
+		// ledger makes paused tool-loop segments report it as cache read.
+		session.usage.sentPrompt = EstimatePromptTokens(cachedPrefix, tools)
 	}
 	session.manager.Register(session)
 	go session.heartbeatLoop(runCtx)
@@ -245,6 +333,8 @@ func (s *Session) touch() {
 func (s *Session) markOutput(chars int) {
 	s.mu.Lock()
 	s.contentSinceResume = true
+	s.everOutput = true
+	s.outputAfterCkpt = true
 	s.outputChars += chars
 	s.mu.Unlock()
 }
@@ -258,6 +348,169 @@ func (s *Session) setPromptTokens(promptTokens int64) {
 	s.mu.Lock()
 	s.promptTokens = promptTokens
 	s.mu.Unlock()
+}
+
+func (s *Session) flushAssistantSegmentLocked() {
+	text := s.segText.String()
+	calls := s.segCalls
+	if strings.TrimSpace(text) == "" && len(calls) == 0 {
+		return
+	}
+	s.transcript = append(s.transcript, ChatMessage{
+		Role:      "assistant",
+		Content:   text,
+		ToolCalls: append([]ToolCall(nil), calls...),
+	})
+	s.segText.Reset()
+	s.segCalls = nil
+}
+
+func (s *Session) flushAssistantSegment() {
+	s.mu.Lock()
+	s.flushAssistantSegmentLocked()
+	s.mu.Unlock()
+}
+
+func (s *Session) finalTranscriptLocked() []ChatMessage {
+	out := append([]ChatMessage(nil), s.transcript...)
+	if text := s.segText.String(); strings.TrimSpace(text) != "" || len(s.segCalls) > 0 {
+		out = append(out, ChatMessage{
+			Role:      "assistant",
+			Content:   text,
+			ToolCalls: append([]ToolCall(nil), s.segCalls...),
+		})
+	}
+	return out
+}
+
+const checkpointGraceWindow = 3 * time.Second
+
+func (s *Session) finishAfterCheckpoint() {
+	deadline := time.Now().Add(checkpointGraceWindow)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		done := s.ckptAfterEnd || s.closed
+		s.mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	s.storeConversationSnapshot()
+	_ = s.closeNow()
+}
+
+// storeConversationSnapshot publishes a complete turn under both the final
+// echoed transcript and the request prefix. The latter survives clients that
+// rewrite assistant/tool rows before sending the next request.
+func (s *Session) storeConversationSnapshot() {
+	if !conversationReuseEnabled() {
+		return
+	}
+	s.mu.Lock()
+	complete := s.ckptAfterEnd || !s.outputAfterCkpt
+	if s.snapshotStored || s.convScope == "" || s.checkpoint == nil || !complete {
+		s.mu.Unlock()
+		return
+	}
+	s.snapshotStored = true
+	s.flushAssistantSegmentLocked()
+	transcript := append([]ChatMessage(nil), s.transcript...)
+	state := proto.Clone(s.checkpoint).(*agentv1.ConversationStateStructure)
+	blobs := cloneBlobStore(s.blobStore)
+	conversationID := s.ConversationID
+	model := s.Model
+	scope := s.convScope
+	requestKey := s.requestKey
+	s.mu.Unlock()
+
+	keys := checkpointKeys(conversationFingerprint(transcript), requestKey)
+	for _, key := range keys {
+		defaultConversationCache.Store(scope, key, &convEntry{
+			conversationID: conversationID,
+			state:          state,
+			blobs:          blobs,
+			model:          model,
+		})
+	}
+	s.resolvePending()
+	log.Infof("cursor: stored conversation checkpoint conv=%s model=%s turns=%d keys=%d", conversationID, model, len(state.GetTurns()), len(keys))
+}
+
+// storePauseSnapshot preserves the latest checkpoint when a run parks for
+// tools. If the live stream disappears, the continuation can fold its tool
+// results onto this checkpoint instead of replaying the whole prompt cold.
+func (s *Session) storePauseSnapshot() {
+	if !conversationReuseEnabled() {
+		return
+	}
+	s.mu.Lock()
+	if s.convScope == "" || s.checkpoint == nil || s.snapshotStored || s.turnEnded ||
+		s.ckptCount == s.pauseCkptStored || (s.resumed && !s.everOutput) {
+		s.mu.Unlock()
+		return
+	}
+	s.pauseCkptStored = s.ckptCount
+	state := proto.Clone(s.checkpoint).(*agentv1.ConversationStateStructure)
+	blobs := cloneBlobStore(s.blobStore)
+	conversationID := s.ConversationID
+	model := s.Model
+	scope := s.convScope
+	requestKey := s.requestKey
+	transcript := s.finalTranscriptLocked()
+	s.mu.Unlock()
+
+	keys := checkpointKeys(conversationFingerprint(transcript), requestKey)
+	for _, key := range keys {
+		defaultConversationCache.Store(scope, key, &convEntry{
+			conversationID: conversationID,
+			state:          state,
+			blobs:          blobs,
+			model:          model,
+		})
+	}
+	log.Infof("cursor: stored tool-pause checkpoint conv=%s model=%s keys=%d", conversationID, model, len(keys))
+}
+
+func cloneBlobStore(source map[string][]byte) map[string][]byte {
+	out := make(map[string][]byte, len(source))
+	for key, value := range source {
+		out[key] = append([]byte(nil), value...)
+	}
+	return out
+}
+
+func checkpointKeys(transcriptFingerprint, requestKey string) []string {
+	keys := make([]string, 0, 2)
+	if transcriptFingerprint != "" {
+		keys = append(keys, transcriptFingerprint)
+	}
+	if requestKey != "" && requestKey != transcriptFingerprint {
+		keys = append(keys, requestKey)
+	}
+	return keys
+}
+
+func beginPendingAll(scope string, keys []string) func() {
+	resolvers := make([]func(), 0, len(keys))
+	for _, key := range keys {
+		resolvers = append(resolvers, defaultConversationCache.BeginPending(scope, key))
+	}
+	return func() {
+		for _, resolve := range resolvers {
+			resolve()
+		}
+	}
+}
+
+func (s *Session) resolvePending() {
+	s.mu.Lock()
+	resolve := s.pendingResolve
+	s.pendingResolve = nil
+	s.mu.Unlock()
+	if resolve != nil {
+		resolve()
+	}
 }
 
 // endSegment closes a segment, billing it from an estimate when Cursor
@@ -421,6 +674,8 @@ func (s *Session) readLoop(ctx context.Context) {
 				}
 			}
 		}
+		s.flushAssistantSegment()
+		s.storePauseSnapshot()
 		s.beginWaitingTools()
 		s.endSegment("tool_calls")
 	}
@@ -448,8 +703,9 @@ func (s *Session) processChunk(decoder *Decoder, chunk readChunk) (endForTools b
 						return false, true
 					}
 				}
+				s.storeConversationSnapshot()
 				s.endSegment("stop")
-				_ = s.Close()
+				_ = s.closeNow()
 				return false, true
 			}
 			serverMsg := &agentv1.AgentServerMessage{}
@@ -468,8 +724,9 @@ func (s *Session) processChunk(decoder *Decoder, chunk readChunk) (endForTools b
 		}
 	}
 	if chunk.err == io.EOF {
+		s.storeConversationSnapshot()
 		s.endSegment("stop")
-		_ = s.Close()
+		_ = s.closeNow()
 		return false, true
 	}
 	if chunk.err != nil {
@@ -646,6 +903,12 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 		}
 		s.mu.Lock()
 		delete(s.pending, result.ToolCallID)
+		s.transcript = append(s.transcript, ChatMessage{
+			Role:       "tool",
+			Name:       result.Name,
+			ToolCallID: result.ToolCallID,
+			Content:    result.Content,
+		})
 		s.mu.Unlock()
 		if s.manager != nil {
 			s.manager.UnbindPending(result.ToolCallID)
@@ -699,8 +962,19 @@ func (s *Session) sendMcpResult(req *agentv1.ExecServerMessage, result ToolResul
 	return sendExecStreamClose(s.stream, req.Id)
 }
 
-// Close tears down the Agent stream.
+// Close tears down the Agent stream. A clean final turn keeps reading briefly
+// because Cursor sends its reusable conversation checkpoint after TurnEnded.
 func (s *Session) Close() error {
+	s.mu.Lock()
+	graceful := s.turnEnded && !s.closed
+	s.mu.Unlock()
+	if graceful {
+		return nil
+	}
+	return s.closeNow()
+}
+
+func (s *Session) closeNow() error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -709,7 +983,13 @@ func (s *Session) Close() error {
 	s.closed = true
 	stream := s.stream
 	cancel := s.cancel
+	pending := len(s.pending)
+	waiting := s.waitingTools
 	s.mu.Unlock()
+	if pending > 0 || waiting {
+		s.storePauseSnapshot()
+	}
+	s.resolvePending()
 	if cancel != nil {
 		cancel()
 	}
@@ -729,6 +1009,9 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 		case *agentv1.InteractionUpdate_TextDelta:
 			text := u.TextDelta.GetText()
 			s.markOutput(len(text))
+			s.mu.Lock()
+			s.segText.WriteString(text)
+			s.mu.Unlock()
 			s.emit(StreamEvent{Type: "text_delta", Text: text})
 		case *agentv1.InteractionUpdate_ThinkingDelta:
 			text := u.ThinkingDelta.GetText()
@@ -764,6 +1047,13 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			segment := s.usage.upstream(total, s.promptTokens)
 			s.segmentBilled.add(segment)
 			ev := usageEvent(segment)
+			if pendingCount == 0 && !waiting && !swallow {
+				s.turnEnded = true
+				if conversationReuseEnabled() && s.convScope != "" && !s.snapshotStored && s.pendingResolve == nil {
+					keys := checkpointKeys(conversationFingerprint(s.finalTranscriptLocked()), s.requestKey)
+					s.pendingResolve = beginPendingAll(s.convScope, keys)
+				}
+			}
 			s.mu.Unlock()
 			if pendingCount > 0 || waiting {
 				// cursor2api: some transports emit turn_ended for the pre-tool
@@ -782,7 +1072,7 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			}
 			s.emit(ev)
 			s.endSegment("stop")
-			go func() { _ = s.Close() }()
+			go s.finishAfterCheckpoint()
 		case *agentv1.InteractionUpdate_ToolCallStarted,
 			*agentv1.InteractionUpdate_PartialToolCall,
 			*agentv1.InteractionUpdate_ToolCallCompleted:
@@ -793,7 +1083,24 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 	case *agentv1.AgentServerMessage_ExecServerMessage:
 		return s.handleExec(m.ExecServerMessage)
 	case *agentv1.AgentServerMessage_ConversationCheckpointUpdate:
-		// ignore for MVP
+		// Keep Cursor's own serialized state. Replaying this state under the
+		// same conversation id is what keeps the provider prompt cache warm.
+		if m.ConversationCheckpointUpdate != nil {
+			if cloned, ok := proto.Clone(m.ConversationCheckpointUpdate).(*agentv1.ConversationStateStructure); ok {
+				s.mu.Lock()
+				s.checkpoint = cloned
+				s.ckptCount++
+				s.outputAfterCkpt = false
+				if s.turnEnded {
+					s.ckptAfterEnd = true
+				}
+				count := s.ckptCount
+				afterEnd := s.ckptAfterEnd
+				s.mu.Unlock()
+				log.Debugf("cursor: conversation checkpoint #%d turns=%d afterTurnEnd=%v conv=%s",
+					count, len(cloned.GetTurns()), afterEnd, s.ConversationID)
+			}
+		}
 	case *agentv1.AgentServerMessage_ServerMetrics:
 		// ignore
 	}
@@ -877,6 +1184,7 @@ func (s *Session) handleMcpArgs(req *agentv1.ExecServerMessage, args *agentv1.Mc
 	copyReq := proto.Clone(req).(*agentv1.ExecServerMessage)
 	s.mu.Lock()
 	s.pending[callID] = &pendingExec{request: copyReq, call: call}
+	s.segCalls = append(s.segCalls, call)
 	s.mu.Unlock()
 	if s.manager != nil {
 		s.manager.BindPending(callID, s)

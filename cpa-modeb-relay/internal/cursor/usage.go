@@ -2,9 +2,9 @@ package cursor
 
 import "encoding/json"
 
-// TokenUsage is an Anthropic-style disjoint token breakdown, which is what
-// Cursor reports: InputTokens counts only the prompt the provider had to read
-// fresh, with the cached and newly cached prefixes counted separately.
+// TokenUsage is Cursor's token breakdown. Cursor's input_tokens is the whole
+// prompt; cache_read_tokens and cache_write_tokens are subsets of it despite
+// their Anthropic-looking names.
 type TokenUsage struct {
 	InputTokens      int64
 	OutputTokens     int64
@@ -13,9 +13,9 @@ type TokenUsage struct {
 	ReasoningTokens  int64
 }
 
-// PromptTokens is the whole prompt: the fresh read plus both cached parts.
+// PromptTokens is the whole prompt Cursor reported.
 func (u TokenUsage) PromptTokens() int64 {
-	return u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
+	return u.InputTokens
 }
 
 // Empty reports whether the breakdown carries no tokens at all.
@@ -60,20 +60,34 @@ func (r *runUsage) upstream(total TokenUsage, prompt int64) TokenUsage {
 		CacheWriteTokens: remaining(total.CacheWriteTokens, r.billed.CacheWriteTokens),
 		ReasoningTokens:  remaining(total.ReasoningTokens, r.billed.ReasoningTokens),
 	}
+	segment.clampCacheToPrompt()
 	r.record(segment, prompt)
 	return segment
 }
 
+// clampCacheToPrompt keeps the read/write subsets inside the inclusive prompt.
+func (u *TokenUsage) clampCacheToPrompt() {
+	room := u.PromptTokens()
+	if u.CacheReadTokens > room {
+		u.CacheReadTokens = room
+	}
+	if room -= u.CacheReadTokens; u.CacheWriteTokens > room {
+		u.CacheWriteTokens = room
+	}
+}
+
 // estimate bills a segment that ended before any report arrived.
 func (r *runUsage) estimate(prompt, output int64) TokenUsage {
-	cached := r.sentPrompt
-	if cached > prompt {
-		cached = prompt
+	read := r.sentPrompt
+	if read > prompt {
+		read = prompt
 	}
 	segment := TokenUsage{
-		InputTokens:     prompt - cached,
+		// Cache writes are never invented. The provider chooses cache
+		// breakpoints; the closing report supplies the actual write count.
+		InputTokens:     prompt,
 		OutputTokens:    output,
-		CacheReadTokens: cached,
+		CacheReadTokens: read,
 	}
 	r.record(segment, prompt)
 	return segment

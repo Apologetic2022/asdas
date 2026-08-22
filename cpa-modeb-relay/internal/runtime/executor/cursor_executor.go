@@ -524,11 +524,15 @@ func toolChoiceLabel(choice cursorlib.ToolChoice) string {
 	return fmt.Sprintf("%q", choice.Mode)
 }
 
-// usageDetail renders a segment for the statistics store, which keeps the
-// disjoint Anthropic-style split that Cursor reports and totals it itself.
+// usageDetail converts Cursor's inclusive input count to the disjoint token
+// classes used by the statistics store.
 func usageDetail(tokens cursorlib.TokenUsage) usage.Detail {
+	fresh := tokens.InputTokens - tokens.CacheReadTokens - tokens.CacheWriteTokens
+	if fresh < 0 {
+		fresh = 0
+	}
 	return usage.Detail{
-		InputTokens:         tokens.InputTokens,
+		InputTokens:         fresh,
 		OutputTokens:        tokens.OutputTokens,
 		CachedTokens:        tokens.CacheReadTokens,
 		CacheReadTokens:     tokens.CacheReadTokens,
@@ -538,10 +542,8 @@ func usageDetail(tokens cursorlib.TokenUsage) usage.Detail {
 	}
 }
 
-// openAIUsagePayload renders a segment on the wire. OpenAI's prompt_tokens is
-// the whole prompt with cached_tokens a subset of it, so Cursor's disjoint
-// counters have to be summed; forwarding its input_tokens as prompt_tokens hid
-// the cached prefix entirely and let cached_tokens exceed the prompt.
+// openAIUsagePayload renders Cursor's inclusive prompt count and both cache
+// subsets in the OpenAI prompt_tokens_details object.
 func openAIUsagePayload(tokens cursorlib.TokenUsage) map[string]any {
 	prompt := tokens.PromptTokens()
 	return map[string]any{
@@ -549,7 +551,8 @@ func openAIUsagePayload(tokens cursorlib.TokenUsage) map[string]any {
 		"completion_tokens": tokens.OutputTokens,
 		"total_tokens":      prompt + tokens.OutputTokens,
 		"prompt_tokens_details": map[string]any{
-			"cached_tokens": tokens.CacheReadTokens,
+			"cached_tokens":         tokens.CacheReadTokens,
+			"cache_creation_tokens": tokens.CacheWriteTokens,
 		},
 		"completion_tokens_details": map[string]any{
 			"reasoning_tokens": tokens.ReasoningTokens,

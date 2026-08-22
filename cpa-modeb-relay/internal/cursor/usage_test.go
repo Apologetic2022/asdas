@@ -17,26 +17,24 @@ func TestRunUsageReconcilesEstimatesWithCumulativeReport(t *testing.T) {
 	if second.CacheReadTokens != 40000 {
 		t.Fatalf("resumed segment cache read = %d, want the 40000 prefix already sent", second.CacheReadTokens)
 	}
-	if second.InputTokens != 2000 {
-		t.Fatalf("resumed segment fresh read = %d, want only the 2000 the prompt grew by", second.InputTokens)
+	if second.InputTokens != 42000 {
+		t.Fatalf("resumed segment prompt = %d, want the whole inclusive prompt", second.InputTokens)
 	}
 
-	total := TokenUsage{InputTokens: 90000, OutputTokens: 4000, CacheReadTokens: 120000}
+	total := TokenUsage{InputTokens: 130000, OutputTokens: 4000, CacheReadTokens: 120000}
 	final := run.upstream(total, 44000)
-	if got, want := final.InputTokens, int64(90000-42000); got != want {
+	if got, want := final.InputTokens, int64(130000-82000); got != want {
 		t.Fatalf("final input = %d, want %d", got, want)
 	}
-	if got, want := final.CacheReadTokens, int64(120000-40000); got != want {
-		t.Fatalf("final cache read = %d, want %d", got, want)
+	if got, want := final.CacheReadTokens, int64(48000); got != want {
+		t.Fatalf("final cache read = %d, want it capped at %d", got, want)
 	}
 	if got, want := final.OutputTokens, int64(4000-55); got != want {
 		t.Fatalf("final output = %d, want %d", got, want)
 	}
 
-	if run.billed.InputTokens != total.InputTokens ||
-		run.billed.CacheReadTokens != total.CacheReadTokens ||
-		run.billed.OutputTokens != total.OutputTokens {
-		t.Fatalf("run billed %+v, want it to add up to the cumulative report %+v", run.billed, total)
+	if run.billed.InputTokens != total.InputTokens || run.billed.OutputTokens != total.OutputTokens {
+		t.Fatalf("run billed %+v, want input/output to add up to %+v", run.billed, total)
 	}
 }
 
@@ -52,9 +50,21 @@ func TestRunUsageClampsOvershootingEstimates(t *testing.T) {
 	}
 }
 
-func TestPromptTokensSumsTheDisjointCounters(t *testing.T) {
-	u := TokenUsage{InputTokens: 100, CacheReadTokens: 900, CacheWriteTokens: 50}
+func TestPromptTokensDoesNotDoubleCountCacheSubsets(t *testing.T) {
+	u := TokenUsage{InputTokens: 1050, CacheReadTokens: 900, CacheWriteTokens: 50}
 	if got := u.PromptTokens(); got != 1050 {
-		t.Fatalf("prompt tokens = %d, want 1050", got)
+		t.Fatalf("prompt tokens = %d, want the inclusive 1050", got)
+	}
+}
+
+func TestEstimateNeverInventsCacheWrites(t *testing.T) {
+	var run runUsage
+	run.estimate(12499, 51)
+	second := run.estimate(13147, 33)
+	if second.CacheWriteTokens != 0 {
+		t.Fatalf("estimated cache write = %d, want 0", second.CacheWriteTokens)
+	}
+	if fresh := second.InputTokens - second.CacheReadTokens; fresh != 648 {
+		t.Fatalf("estimated fresh input = %d, want 648", fresh)
 	}
 }

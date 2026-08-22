@@ -51,9 +51,9 @@ func TestTrailingToolCallIDs(t *testing.T) {
 	}
 }
 
-func TestOpenAIUsagePayloadCountsTheCachedPrefixInThePrompt(t *testing.T) {
+func TestOpenAIUsagePayloadTreatsCacheCountersAsPromptSubsets(t *testing.T) {
 	tokens := cursorlib.TokenUsage{
-		InputTokens:      2000,
+		InputTokens:      132250,
 		OutputTokens:     48,
 		CacheReadTokens:  130000,
 		CacheWriteTokens: 250,
@@ -71,10 +71,13 @@ func TestOpenAIUsagePayloadCountsTheCachedPrefixInThePrompt(t *testing.T) {
 	if got := details["cached_tokens"].(int64); got != 130000 {
 		t.Fatalf("cached tokens = %d, want 130000", got)
 	}
+	if got := details["cache_creation_tokens"].(int64); got != 250 {
+		t.Fatalf("cache creation tokens = %d, want 250", got)
+	}
 
 	detail := usageDetail(tokens)
 	if detail.InputTokens != 2000 {
-		t.Fatalf("detail input = %d, want only the fresh read", detail.InputTokens)
+		t.Fatalf("detail input = %d, want only the fresh tokens", detail.InputTokens)
 	}
 	if detail.CacheReadTokens != 130000 || detail.CacheCreationTokens != 250 {
 		t.Fatalf("detail cache split = %d/%d, want 130000/250", detail.CacheReadTokens, detail.CacheCreationTokens)
