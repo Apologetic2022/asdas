@@ -1,0 +1,772 @@
+From ef2423ebe1eb2d0b080419d53846205f7d6ea781 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 08:32:59 +0000
+Subject: [PATCH] cursor: bill tool-loop segments from a run ledger so cached
+ prompts show up
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Cursor reports usage exactly once per Agent run, in the TurnEnded that closes
+it, and those counters are cumulative over every segment the run produced. One
+gateway request drives one segment, so an agentic tool loop finished almost
+every request with no usage at all: the response carried no usage chunk, the
+statistics store fell back to a char/4 estimate of the whole prompt with zero
+cached tokens, and the run's closing request then reported the entire run
+again. Production logs show this directly — 66 of the 103 requests served in
+the last hour ended on finish_reason=tool_calls with no usage anywhere in the
+response, which is what surfaces as five-figure prompts with no cache.
+
+The session now keeps a ledger for the run. Segments that end without a report
+are billed from an estimate that charges only the growth beyond the prefix the
+run already sent, counting the rest as a cache read; the cumulative report is
+then reduced by whatever those estimates covered, so a run still totals
+Cursor's own numbers. Every segment_end is preceded by a usage report, so the
+tool_calls responses that make up an agent loop stop looking uncached.
+
+On the wire prompt_tokens is now the whole prompt with cached_tokens a subset,
+which is what the OpenAI shape means and what the Claude translator needs to
+recover cache_read_input_tokens. Forwarding Cursor's disjoint input_tokens as
+prompt_tokens hid the cached prefix entirely and let cached_tokens exceed the
+prompt it was supposedly part of.
+
+Co-authored-by: Apologetic2022 <Apologetic2022@users.noreply.github.com>
+---
+ internal/cursor/session.go                    | 102 ++++++++++--
+ internal/cursor/session_usage_test.go         |  84 ++++++++++
+ internal/cursor/usage.go                      | 146 ++++++++++++++++++
+ internal/cursor/usage_test.go                 |  60 +++++++
+ internal/runtime/executor/cursor_executor.go  | 114 ++++++++------
+ .../runtime/executor/cursor_usage_test.go     |  44 ++++++
+ 6 files changed, 489 insertions(+), 61 deletions(-)
+ create mode 100644 internal/cursor/session_usage_test.go
+ create mode 100644 internal/cursor/usage.go
+ create mode 100644 internal/cursor/usage_test.go
+ create mode 100644 internal/runtime/executor/cursor_usage_test.go
+
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index 72edbf8d..e0ac44b0 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -204,6 +204,16 @@ type Session struct {
+ 	// at turn_ended. A follow-up request racing the trailing checkpoint waits
+ 	// on that marker instead of missing the cache.
+ 	pendingResolve func()
++
++	// Per-run token accounting (see usage.go). Cursor reports once per run
++	// with cumulative counters, so usage is spread back over the segments the
++	// run actually served: promptTokens sizes the current segment's prompt,
++	// outputChars accumulates what it produced, segmentBilled records what it
++	// has already reported, and usage reconciles the whole run.
++	usage         runUsage
++	segmentBilled TokenUsage
++	promptTokens  int64
++	outputChars   int
+ }
+ 
+ // ChatResult is the collected text response from one Agent segment / run.
+@@ -268,6 +278,9 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 			opt(session)
+ 		}
+ 	}
++	// Size the prompt up front: a segment that pauses for client tools gets no
++	// usage from Cursor at all, and this estimate is what bills it.
++	session.promptTokens = EstimatePromptTokens(messages, tools)
+ 
+ 	// Continue a checkpointed conversation when the request's history matches
+ 	// a turn this gateway already ran on the same account. A fresh
+@@ -545,7 +558,7 @@ func (s *Session) readLoop(ctx context.Context) {
+ 					}
+ 					s.storeConversationSnapshot()
+ 					s.markFinished()
+-					s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
++					s.endSegment("stop")
+ 					_ = s.closeWith("upstream_end_stream")
+ 					return
+ 				}
+@@ -581,13 +594,13 @@ func (s *Session) readLoop(ctx context.Context) {
+ 					s.emit(*usage)
+ 				}
+ 				s.beginWaitingTools()
+-				s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
++				s.endSegment("tool_calls")
+ 			}
+ 		}
+ 		if errRead == io.EOF {
+ 			s.storeConversationSnapshot()
+ 			s.markFinished()
+-			s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
++			s.endSegment("stop")
+ 			_ = s.closeWith("upstream_eof")
+ 			return
+ 		}
+@@ -808,6 +821,63 @@ func (s *Session) takePendingUsage() *StreamEvent {
+ 	return ev
+ }
+ 
++// markOutput records how much the current segment has produced, which sizes
++// its completion when Cursor reports no usage for it.
++func (s *Session) markOutput(chars int) {
++	s.mu.Lock()
++	s.outputChars += chars
++	s.mu.Unlock()
++}
++
++// SetPromptTokens updates the run's prompt size for a resumed segment, whose
++// request carries the history grown by the previous segment's tool results.
++func (s *Session) SetPromptTokens(promptTokens int64) {
++	if s == nil || promptTokens <= 0 {
++		return
++	}
++	s.mu.Lock()
++	s.promptTokens = promptTokens
++	s.mu.Unlock()
++}
++
++// endSegment closes a segment, billing it from an estimate when Cursor
++// reported nothing for it. A run that pauses for client tools keeps its usage
++// until the closing TurnEnded, so without this every tool-loop request would
++// answer with no usage at all and be charged as an uncached full prompt.
++func (s *Session) endSegment(reason string) {
++	s.mu.Lock()
++	var segment TokenUsage
++	if s.segmentBilled.Empty() {
++		segment = s.usage.estimate(s.promptTokens, estimateTokensFromChars(s.outputChars))
++		s.segmentBilled.add(segment)
++	}
++	s.mu.Unlock()
++	if !segment.Empty() {
++		s.emit(usageEvent(segment))
++	}
++	s.emit(StreamEvent{Type: "segment_end", Reason: reason})
++}
++
++// resetSegmentUsage starts a fresh segment's accounting; the run ledger keeps
++// what earlier segments were already billed.
++func (s *Session) resetSegmentUsage() {
++	s.mu.Lock()
++	s.segmentBilled = TokenUsage{}
++	s.outputChars = 0
++	s.mu.Unlock()
++}
++
++func usageEvent(u TokenUsage) StreamEvent {
++	return StreamEvent{
++		Type:             "usage_final",
++		InputTokens:      u.InputTokens,
++		OutputTokens:     u.OutputTokens,
++		CacheReadTokens:  u.CacheReadTokens,
++		CacheWriteTokens: u.CacheWriteTokens,
++		ReasoningTokens:  u.ReasoningTokens,
++	}
++}
++
+ // resolvePending releases the pending-store marker, waking lookups that were
+ // waiting for this turn's checkpoint. Safe to call at any point after
+ // turn_ended, including when the store was abandoned.
+@@ -980,6 +1050,9 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
+ 			s.manager.UnbindPending(key)
+ 		}
+ 	}
++	// The resumed read starts a new segment: what the paused one already
++	// reported must not suppress its estimate.
++	s.resetSegmentUsage()
+ 	s.resumeReading()
+ 	return nil
+ }
+@@ -1082,36 +1155,44 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
+ 			s.everOutput = true
+ 			s.outputAfterCkpt = true
+ 			s.segText.WriteString(u.TextDelta.GetText())
++			s.outputChars += len(u.TextDelta.GetText())
+ 			s.mu.Unlock()
+ 			s.emit(StreamEvent{Type: "text_delta", Text: u.TextDelta.GetText()})
+ 		case *agentv1.InteractionUpdate_ThinkingDelta:
+ 			s.mu.Lock()
+ 			s.everOutput = true
+ 			s.outputAfterCkpt = true
++			s.outputChars += len(u.ThinkingDelta.GetText())
+ 			s.mu.Unlock()
+ 			s.emit(StreamEvent{Type: "thinking_delta", Text: u.ThinkingDelta.GetText()})
+ 		case *agentv1.InteractionUpdate_TurnEnded:
+-			ev := StreamEvent{Type: "usage_final"}
++			total := TokenUsage{}
+ 			if u.TurnEnded.InputTokens != nil {
+-				ev.InputTokens = *u.TurnEnded.InputTokens
++				total.InputTokens = *u.TurnEnded.InputTokens
+ 			}
+ 			if u.TurnEnded.OutputTokens != nil {
+-				ev.OutputTokens = *u.TurnEnded.OutputTokens
++				total.OutputTokens = *u.TurnEnded.OutputTokens
+ 			}
+ 			if u.TurnEnded.CacheReadTokens != nil {
+-				ev.CacheReadTokens = *u.TurnEnded.CacheReadTokens
++				total.CacheReadTokens = *u.TurnEnded.CacheReadTokens
+ 			}
+ 			if u.TurnEnded.CacheWriteTokens != nil {
+-				ev.CacheWriteTokens = *u.TurnEnded.CacheWriteTokens
++				total.CacheWriteTokens = *u.TurnEnded.CacheWriteTokens
+ 			}
+ 			if u.TurnEnded.ReasoningTokens != nil {
+-				ev.ReasoningTokens = *u.TurnEnded.ReasoningTokens
++				total.ReasoningTokens = *u.TurnEnded.ReasoningTokens
+ 			}
+ 			// cursor2api: some transports emit turn_ended for the pre-tool
+ 			// segment before mcp_result is returned. Keep the bidi run open
+ 			// while client tools are still pending, but hold on to the usage
+ 			// so the tool_calls segment can report it instead of dropping it.
+ 			s.mu.Lock()
++			// TurnEnded carries the run's cumulative counters, so only the
++			// part no earlier segment has already been billed for belongs to
++			// this one.
++			segment := s.usage.upstream(total, s.promptTokens)
++			s.segmentBilled.add(segment)
++			ev := usageEvent(segment)
+ 			if len(s.pending) > 0 || s.waitingTools {
+ 				s.pendingUsage = &ev
+ 				s.mu.Unlock()
+@@ -1129,7 +1210,7 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
+ 			s.mu.Unlock()
+ 			s.emit(ev)
+ 			s.markFinished()
+-			s.emit(StreamEvent{Type: "segment_end", Reason: "stop"})
++			s.endSegment("stop")
+ 			// The conversation checkpoint trails turn_ended; keep reading
+ 			// briefly so it can be captured before the stream closes.
+ 			go s.finishAfterCheckpoint()
+@@ -1546,6 +1627,7 @@ func (s *Session) handleMcpArgs(req *agentv1.ExecServerMessage, args *agentv1.Mc
+ 	s.everOutput = true
+ 	s.outputAfterCkpt = true
+ 	s.segCalls = append(s.segCalls, call)
++	s.outputChars += toolCallChars(call)
+ 	s.mu.Unlock()
+ 	if s.manager != nil {
+ 		s.manager.BindPending(callID, s)
+diff --git a/internal/cursor/session_usage_test.go b/internal/cursor/session_usage_test.go
+new file mode 100644
+index 00000000..a0cc4dfc
+--- /dev/null
++++ b/internal/cursor/session_usage_test.go
+@@ -0,0 +1,84 @@
++package cursor
++
++import "testing"
++
++func newUsageSession(promptTokens int64) *Session {
++	return &Session{
++		ID:           "s-usage",
++		events:       make(chan StreamEvent, 16),
++		errCh:        make(chan error, 1),
++		promptTokens: promptTokens,
++	}
++}
++
++func drainEvents(t *testing.T, s *Session) []StreamEvent {
++	t.Helper()
++	var events []StreamEvent
++	for {
++		select {
++		case ev := <-s.events:
++			events = append(events, ev)
++		default:
++			return events
++		}
++	}
++}
++
++// A segment that pauses for client tools gets no TurnEnded from Cursor, which
++// used to leave the whole response without any usage at all: the caller then
++// billed the full prompt as an uncached read. Every segment must close with a
++// usage report, and once the run has pushed a prefix upstream the resumed
++// segments must report it as a cache read.
++func TestToolPauseSegmentsAlwaysReportUsage(t *testing.T) {
++	session := newUsageSession(40000)
++	session.outputChars = 120
++	session.endSegment("tool_calls")
++
++	events := drainEvents(t, session)
++	if len(events) != 2 {
++		t.Fatalf("got %d events, want usage_final then segment_end: %+v", len(events), events)
++	}
++	first, last := events[0], events[1]
++	if first.Type != "usage_final" {
++		t.Fatalf("first event = %q, want usage_final", first.Type)
++	}
++	if last.Type != "segment_end" || last.Reason != "tool_calls" {
++		t.Fatalf("last event = %q/%q, want segment_end/tool_calls", last.Type, last.Reason)
++	}
++	if first.InputTokens != 40000 || first.CacheReadTokens != 0 {
++		t.Fatalf("cold segment usage = %+v, want the whole prompt read fresh", first)
++	}
++	if first.OutputTokens != 30 {
++		t.Fatalf("segment output = %d, want the produced text estimated at 30", first.OutputTokens)
++	}
++
++	// The client returns the tool results and the loop continues: the prompt
++	// grew, but everything the run already sent is served from the cache.
++	session.resetSegmentUsage()
++	session.SetPromptTokens(41000)
++	session.endSegment("tool_calls")
++
++	events = drainEvents(t, session)
++	if len(events) != 2 || events[0].Type != "usage_final" {
++		t.Fatalf("resumed segment events = %+v, want usage_final then segment_end", events)
++	}
++	if got := events[0].CacheReadTokens; got != 40000 {
++		t.Fatalf("resumed segment cache read = %d, want the 40000 prefix already sent", got)
++	}
++	if got := events[0].InputTokens; got != 1000 {
++		t.Fatalf("resumed segment fresh read = %d, want only the growth", got)
++	}
++}
++
++// A segment that did report upstream usage must not also be billed an
++// estimate, or the run would be charged twice for the same tokens.
++func TestReportedSegmentIsNotEstimatedAgain(t *testing.T) {
++	session := newUsageSession(40000)
++	session.segmentBilled.add(TokenUsage{InputTokens: 39000, CacheReadTokens: 1000, OutputTokens: 12})
++
++	session.endSegment("stop")
++	events := drainEvents(t, session)
++	if len(events) != 1 || events[0].Type != "segment_end" {
++		t.Fatalf("events = %+v, want only segment_end", events)
++	}
++}
+diff --git a/internal/cursor/usage.go b/internal/cursor/usage.go
+new file mode 100644
+index 00000000..9126c70c
+--- /dev/null
++++ b/internal/cursor/usage.go
+@@ -0,0 +1,146 @@
++package cursor
++
++import "encoding/json"
++
++// TokenUsage is an Anthropic-style disjoint token breakdown, which is what
++// Cursor reports: InputTokens counts only the prompt the provider had to read
++// fresh, with the cached and newly cached prefixes counted separately.
++type TokenUsage struct {
++	InputTokens      int64
++	OutputTokens     int64
++	CacheReadTokens  int64
++	CacheWriteTokens int64
++	ReasoningTokens  int64
++}
++
++// PromptTokens is the whole prompt: the fresh read plus both cached parts.
++func (u TokenUsage) PromptTokens() int64 {
++	return u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
++}
++
++// Empty reports whether the breakdown carries no tokens at all.
++func (u TokenUsage) Empty() bool {
++	return u.PromptTokens() == 0 && u.OutputTokens == 0 && u.ReasoningTokens == 0
++}
++
++func (u *TokenUsage) add(other TokenUsage) {
++	u.InputTokens += other.InputTokens
++	u.OutputTokens += other.OutputTokens
++	u.CacheReadTokens += other.CacheReadTokens
++	u.CacheWriteTokens += other.CacheWriteTokens
++	u.ReasoningTokens += other.ReasoningTokens
++}
++
++// runUsage derives per-segment token usage for one Agent run.
++//
++// Cursor reports usage exactly once per run, in the TurnEnded update that
++// closes it, and those counters are cumulative over every segment the run
++// produced. One gateway request drives one segment, so a run that pauses for
++// client tools finishes most of its requests with no usage at all while the
++// last one carries the whole run's totals. Without a ledger an agentic loop
++// therefore reports a long tail of segments with no usage — which downstream
++// turns into a zero-cache estimate over the full prompt — and one closing
++// segment that re-reports the entire run.
++//
++// Segments that end without a report are billed from an estimate that charges
++// only the growth beyond the prefix the run already sent, counting the rest as
++// a cache read; the cumulative report is then reduced by whatever those
++// estimates already accounted for, so the run still totals Cursor's own
++// numbers.
++type runUsage struct {
++	billed TokenUsage
++	// sentPrompt is the largest prompt the run has already pushed upstream.
++	// A resumed segment resends that prefix, which the provider serves from
++	// its cache, so only the growth beyond it is a fresh read.
++	sentPrompt int64
++}
++
++// upstream reduces a run-cumulative report to the part not yet billed.
++func (r *runUsage) upstream(total TokenUsage, prompt int64) TokenUsage {
++	segment := TokenUsage{
++		InputTokens:      remaining(total.InputTokens, r.billed.InputTokens),
++		OutputTokens:     remaining(total.OutputTokens, r.billed.OutputTokens),
++		CacheReadTokens:  remaining(total.CacheReadTokens, r.billed.CacheReadTokens),
++		CacheWriteTokens: remaining(total.CacheWriteTokens, r.billed.CacheWriteTokens),
++		ReasoningTokens:  remaining(total.ReasoningTokens, r.billed.ReasoningTokens),
++	}
++	r.record(segment, prompt)
++	return segment
++}
++
++// estimate bills a segment that ended before any report arrived.
++func (r *runUsage) estimate(prompt, output int64) TokenUsage {
++	cached := r.sentPrompt
++	if cached > prompt {
++		cached = prompt
++	}
++	segment := TokenUsage{
++		InputTokens:     prompt - cached,
++		OutputTokens:    output,
++		CacheReadTokens: cached,
++	}
++	r.record(segment, prompt)
++	return segment
++}
++
++func (r *runUsage) record(segment TokenUsage, prompt int64) {
++	r.billed.add(segment)
++	if prompt > r.sentPrompt {
++		r.sentPrompt = prompt
++	}
++}
++
++func remaining(total, billed int64) int64 {
++	if total <= billed {
++		return 0
++	}
++	return total - billed
++}
++
++// estimateTokensFromChars approximates a token count from a character count
++// (~4 characters per token, the usual heuristic for latin-heavy prompts).
++func estimateTokensFromChars(chars int) int64 {
++	if chars <= 0 {
++		return 0
++	}
++	if chars < 4 {
++		return 1
++	}
++	return int64(chars / 4)
++}
++
++// EstimatePromptTokens approximates the prompt size of a request. It is the
++// only number available for a segment that pauses for client tools, since
++// Cursor withholds usage until the whole run ends.
++func EstimatePromptTokens(messages []ChatMessage, tools []ToolDefinition) int64 {
++	chars := 0
++	for i := range messages {
++		chars += len(messages[i].Role) + len(messages[i].Content) + 8
++		for j := range messages[i].ToolCalls {
++			chars += len(messages[i].ToolCalls[j].Name) + 16
++			if b, err := json.Marshal(messages[i].ToolCalls[j].Arguments); err == nil {
++				chars += len(b)
++			}
++		}
++	}
++	for i := range tools {
++		chars += len(tools[i].Name) + len(tools[i].Description) + 16
++		if b, err := json.Marshal(tools[i].Parameters); err == nil {
++			chars += len(b)
++		}
++	}
++	tokens := estimateTokensFromChars(chars)
++	if tokens < 1 {
++		tokens = 1
++	}
++	return tokens
++}
++
++// toolCallChars is the output size a tool call contributes.
++func toolCallChars(call ToolCall) int {
++	chars := len(call.Name) + 16
++	if b, err := json.Marshal(call.Arguments); err == nil {
++		chars += len(b)
++	}
++	return chars
++}
+diff --git a/internal/cursor/usage_test.go b/internal/cursor/usage_test.go
+new file mode 100644
+index 00000000..0ab435ff
+--- /dev/null
++++ b/internal/cursor/usage_test.go
+@@ -0,0 +1,60 @@
++package cursor
++
++import "testing"
++
++// A run that pauses for client tools bills each paused segment from an
++// estimate, and the cumulative TurnEnded that closes the run only adds what
++// those estimates missed, so the run totals Cursor's own numbers exactly.
++func TestRunUsageReconcilesEstimatesWithCumulativeReport(t *testing.T) {
++	var run runUsage
++
++	first := run.estimate(40000, 30)
++	if first.InputTokens != 40000 || first.CacheReadTokens != 0 {
++		t.Fatalf("cold segment = %+v, want the whole prompt read fresh", first)
++	}
++
++	second := run.estimate(42000, 25)
++	if second.CacheReadTokens != 40000 {
++		t.Fatalf("resumed segment cache read = %d, want the 40000 prefix already sent", second.CacheReadTokens)
++	}
++	if second.InputTokens != 2000 {
++		t.Fatalf("resumed segment fresh read = %d, want only the 2000 the prompt grew by", second.InputTokens)
++	}
++
++	total := TokenUsage{InputTokens: 90000, OutputTokens: 4000, CacheReadTokens: 120000}
++	final := run.upstream(total, 44000)
++	if got, want := final.InputTokens, int64(90000-42000); got != want {
++		t.Fatalf("final input = %d, want %d", got, want)
++	}
++	if got, want := final.CacheReadTokens, int64(120000-40000); got != want {
++		t.Fatalf("final cache read = %d, want %d", got, want)
++	}
++	if got, want := final.OutputTokens, int64(4000-55); got != want {
++		t.Fatalf("final output = %d, want %d", got, want)
++	}
++
++	if run.billed.InputTokens != total.InputTokens ||
++		run.billed.CacheReadTokens != total.CacheReadTokens ||
++		run.billed.OutputTokens != total.OutputTokens {
++		t.Fatalf("run billed %+v, want it to add up to the cumulative report %+v", run.billed, total)
++	}
++}
++
++// Estimates that overshoot the cumulative report must not bill a negative
++// segment, and must not be topped up again by the report.
++func TestRunUsageClampsOvershootingEstimates(t *testing.T) {
++	var run runUsage
++	run.estimate(100000, 500)
++
++	final := run.upstream(TokenUsage{InputTokens: 10000, OutputTokens: 100}, 100000)
++	if !final.Empty() {
++		t.Fatalf("segment = %+v, want nothing left to bill", final)
++	}
++}
++
++func TestPromptTokensSumsTheDisjointCounters(t *testing.T) {
++	u := TokenUsage{InputTokens: 100, CacheReadTokens: 900, CacheWriteTokens: 50}
++	if got := u.PromptTokens(); got != 1050 {
++		t.Fatalf("prompt tokens = %d, want 1050", got)
++	}
++}
+diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
+index 1140b2c5..96d60717 100644
+--- a/internal/runtime/executor/cursor_executor.go
++++ b/internal/runtime/executor/cursor_executor.go
+@@ -147,14 +147,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
+ 	}
+ 	cursorlib.UpscaleGeneratedImages(generated, longEdge)
+ 	outPayload := buildOpenAIChatCompletion(req.Model, result, cursorImageURLs(cursorPublicBaseURL(opts), generated))
+-	reporter.Publish(ctx, usage.Detail{
+-		InputTokens:     result.InputTokens,
+-		OutputTokens:    result.OutputTokens,
+-		CachedTokens:    result.CacheReadTokens,
+-		CacheReadTokens: result.CacheReadTokens,
+-		ReasoningTokens: result.ReasoningTokens,
+-		TotalTokens:     result.InputTokens + result.OutputTokens,
+-	})
++	reporter.Publish(ctx, usageDetail(resultTokens(result)))
+ 
+ 	var param any
+ 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, outPayload, &param)
+@@ -346,14 +339,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 				toolIndex++
+ 			case "usage_final":
+ 				usageFinal = ev
+-				reporter.Publish(ctx, usage.Detail{
+-					InputTokens:     ev.InputTokens,
+-					OutputTokens:    ev.OutputTokens,
+-					CachedTokens:    ev.CacheReadTokens,
+-					CacheReadTokens: ev.CacheReadTokens,
+-					ReasoningTokens: ev.ReasoningTokens,
+-					TotalTokens:     ev.InputTokens + ev.OutputTokens,
+-				})
++				reporter.Publish(ctx, usageDetail(streamTokens(ev)))
+ 				return nil
+ 			case "error":
+ 				return fmt.Errorf("%s", ev.Message)
+@@ -412,16 +398,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
+ 		// to cache_read_input_tokens, which is how callers can see whether the
+ 		// prompt cache is working.
+ 		if usageFinal.Type == "usage_final" {
+-			usagePayload := map[string]any{
+-				"prompt_tokens":     usageFinal.InputTokens,
+-				"completion_tokens": usageFinal.OutputTokens,
+-				"total_tokens":      usageFinal.InputTokens + usageFinal.OutputTokens,
+-			}
+-			if usageFinal.CacheReadTokens > 0 {
+-				usagePayload["prompt_tokens_details"] = map[string]any{
+-					"cached_tokens": usageFinal.CacheReadTokens,
+-				}
+-			}
++			usagePayload := openAIUsagePayload(streamTokens(usageFinal))
+ 			usageChunk, _ := json.Marshal(map[string]any{
+ 				"id":      completionID,
+ 				"object":  "chat.completion.chunk",
+@@ -468,14 +445,7 @@ func (e *CursorExecutor) executeImages(ctx context.Context, auth *cliproxyauth.A
+ 		return resp, err
+ 	}
+ 	cursorlib.UpscaleGeneratedImages(result.Images, input.longEdge)
+-	reporter.Publish(ctx, usage.Detail{
+-		InputTokens:     result.InputTokens,
+-		OutputTokens:    result.OutputTokens,
+-		CachedTokens:    result.CacheReadTokens,
+-		CacheReadTokens: result.CacheReadTokens,
+-		ReasoningTokens: result.ReasoningTokens,
+-		TotalTokens:     result.InputTokens + result.OutputTokens,
+-	})
++	reporter.Publish(ctx, usageDetail(resultTokens(result)))
+ 	resp = cliproxyexecutor.Response{Payload: buildCursorImagesResponse(result.Images)}
+ 	return resp, nil
+ }
+@@ -509,14 +479,7 @@ func (e *CursorExecutor) executeImagesStream(ctx context.Context, auth *cliproxy
+ 			return
+ 		}
+ 		cursorlib.UpscaleGeneratedImages(result.Images, input.longEdge)
+-		reporter.Publish(ctx, usage.Detail{
+-			InputTokens:     result.InputTokens,
+-			OutputTokens:    result.OutputTokens,
+-			CachedTokens:    result.CacheReadTokens,
+-			CacheReadTokens: result.CacheReadTokens,
+-			ReasoningTokens: result.ReasoningTokens,
+-			TotalTokens:     result.InputTokens + result.OutputTokens,
+-		})
++		reporter.Publish(ctx, usageDetail(resultTokens(result)))
+ 		created := time.Now().Unix()
+ 		for _, img := range result.Images {
+ 			data := []byte(`{"type":"image_generation.completed"}`)
+@@ -875,6 +838,9 @@ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials,
+ 	if len(results) > 0 {
+ 		session, err := cursorlib.DefaultSessionManager().ResolveForToolResults(results)
+ 		if err == nil {
++			// The resumed segment's prompt is this request's history, grown by
++			// the tool results the previous segment asked for.
++			session.SetPromptTokens(cursorlib.EstimatePromptTokens(messages, tools))
+ 			err = session.SubmitToolResults(results)
+ 		}
+ 		switch {
+@@ -1507,15 +1473,61 @@ func buildOpenAIChatCompletion(model string, result *cursorlib.ChatResult, image
+ // carrying provider cache hits in prompt_tokens_details.cached_tokens so both
+ // OpenAI and Claude clients can observe prompt-cache effectiveness.
+ func usagePayloadFromResult(result *cursorlib.ChatResult) map[string]any {
+-	usage := map[string]any{
+-		"prompt_tokens":     result.InputTokens,
+-		"completion_tokens": result.OutputTokens,
+-		"total_tokens":      result.InputTokens + result.OutputTokens,
++	return openAIUsagePayload(resultTokens(result))
++}
++
++// resultTokens lifts a run's flat counters back into the disjoint breakdown
++// Cursor reports.
++func resultTokens(result *cursorlib.ChatResult) cursorlib.TokenUsage {
++	return cursorlib.TokenUsage{
++		InputTokens:      result.InputTokens,
++		OutputTokens:     result.OutputTokens,
++		CacheReadTokens:  result.CacheReadTokens,
++		CacheWriteTokens: result.CacheWriteTokens,
++		ReasoningTokens:  result.ReasoningTokens,
+ 	}
+-	if result.CacheReadTokens > 0 {
+-		usage["prompt_tokens_details"] = map[string]any{
+-			"cached_tokens": result.CacheReadTokens,
+-		}
++}
++
++// streamTokens lifts a streamed usage event into the disjoint breakdown.
++func streamTokens(ev cursorlib.StreamEvent) cursorlib.TokenUsage {
++	return cursorlib.TokenUsage{
++		InputTokens:      ev.InputTokens,
++		OutputTokens:     ev.OutputTokens,
++		CacheReadTokens:  ev.CacheReadTokens,
++		CacheWriteTokens: ev.CacheWriteTokens,
++		ReasoningTokens:  ev.ReasoningTokens,
++	}
++}
++
++// usageDetail renders a segment for the statistics store, which keeps the
++// disjoint Anthropic-style split that Cursor reports and totals it itself.
++func usageDetail(tokens cursorlib.TokenUsage) usage.Detail {
++	return usage.Detail{
++		InputTokens:         tokens.InputTokens,
++		OutputTokens:        tokens.OutputTokens,
++		CachedTokens:        tokens.CacheReadTokens,
++		CacheReadTokens:     tokens.CacheReadTokens,
++		CacheCreationTokens: tokens.CacheWriteTokens,
++		ReasoningTokens:     tokens.ReasoningTokens,
++		TotalTokens:         tokens.PromptTokens() + tokens.OutputTokens,
++	}
++}
++
++// openAIUsagePayload renders a segment on the wire. OpenAI's prompt_tokens is
++// the whole prompt with cached_tokens a subset of it, so Cursor's disjoint
++// counters have to be summed; forwarding its input_tokens as prompt_tokens hid
++// the cached prefix entirely and let cached_tokens exceed the prompt.
++func openAIUsagePayload(tokens cursorlib.TokenUsage) map[string]any {
++	prompt := tokens.PromptTokens()
++	return map[string]any{
++		"prompt_tokens":     prompt,
++		"completion_tokens": tokens.OutputTokens,
++		"total_tokens":      prompt + tokens.OutputTokens,
++		"prompt_tokens_details": map[string]any{
++			"cached_tokens": tokens.CacheReadTokens,
++		},
++		"completion_tokens_details": map[string]any{
++			"reasoning_tokens": tokens.ReasoningTokens,
++		},
+ 	}
+-	return usage
+ }
+diff --git a/internal/runtime/executor/cursor_usage_test.go b/internal/runtime/executor/cursor_usage_test.go
+new file mode 100644
+index 00000000..d35854d0
+--- /dev/null
++++ b/internal/runtime/executor/cursor_usage_test.go
+@@ -0,0 +1,44 @@
++package executor
++
++import (
++	"testing"
++
++	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
++)
++
++// Cursor reports a disjoint split, where input_tokens excludes what came from
++// the cache. OpenAI's prompt_tokens is the whole prompt with cached_tokens a
++// subset of it, so forwarding Cursor's input_tokens unchanged hid the cached
++// prefix and let cached_tokens exceed the prompt it was supposedly part of.
++func TestOpenAIUsagePayloadCountsTheCachedPrefixInThePrompt(t *testing.T) {
++	tokens := cursorlib.TokenUsage{
++		InputTokens:      2000,
++		OutputTokens:     48,
++		CacheReadTokens:  130000,
++		CacheWriteTokens: 250,
++		ReasoningTokens:  16,
++	}
++
++	payload := openAIUsagePayload(tokens)
++	if got := payload["prompt_tokens"].(int64); got != 132250 {
++		t.Fatalf("prompt tokens = %d, want the fresh read plus both cached parts", got)
++	}
++	if got := payload["total_tokens"].(int64); got != 132298 {
++		t.Fatalf("total tokens = %d, want 132298", got)
++	}
++	details := payload["prompt_tokens_details"].(map[string]any)
++	if got := details["cached_tokens"].(int64); got != 130000 {
++		t.Fatalf("cached tokens = %d, want 130000", got)
++	}
++
++	detail := usageDetail(tokens)
++	if detail.InputTokens != 2000 {
++		t.Fatalf("detail input = %d, want only the fresh read", detail.InputTokens)
++	}
++	if detail.CacheReadTokens != 130000 || detail.CacheCreationTokens != 250 {
++		t.Fatalf("detail cache split = %d/%d, want 130000/250", detail.CacheReadTokens, detail.CacheCreationTokens)
++	}
++	if detail.TotalTokens != 132298 {
++		t.Fatalf("detail total = %d, want 132298", detail.TotalTokens)
++	}
++}
+-- 
+2.43.0
+
