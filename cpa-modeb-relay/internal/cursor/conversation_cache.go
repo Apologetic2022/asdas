@@ -25,6 +25,11 @@ const (
 	convCacheTTL     = 2 * time.Hour
 	convCacheMaxSize = 2048
 	convPendingWait  = checkpointGraceWindow + time.Second
+	// Cursor can publish its conversation checkpoint slightly before the
+	// provider-side prompt-cache write becomes readable. Production traces
+	// showed an immediate Opus follow-up rewriting the whole 25k prefix while
+	// the request two seconds later read it. Hold only that propagation gap.
+	convCachePropagationDelay = 2 * time.Second
 )
 
 type convEntry struct {
@@ -33,6 +38,7 @@ type convEntry struct {
 	blobs          map[string][]byte
 	model          string
 	expiresAt      time.Time
+	readyAt        time.Time
 }
 
 type pendingMarker struct {
@@ -173,7 +179,11 @@ func (c *conversationCache) Store(scope, fingerprint string, entry *convEntry) {
 	if scope == "" || fingerprint == "" || entry == nil || entry.state == nil {
 		return
 	}
-	entry.expiresAt = time.Now().Add(convCacheTTL)
+	now := time.Now()
+	entry.expiresAt = now.Add(convCacheTTL)
+	if entry.readyAt.IsZero() {
+		entry.readyAt = now.Add(convCachePropagationDelay)
+	}
 	key := convCacheKey(scope, fingerprint)
 	c.mu.Lock()
 	if len(c.entries) >= convCacheMaxSize {
@@ -221,11 +231,12 @@ func (c *conversationCache) pruneLocked() {
 // conversation cold. The payload contains conversation text blobs and is
 // written mode 0600; CPA_CURSOR_CONV_PERSIST=0 disables persistence.
 type persistedConvEntry struct {
-	ConversationID string            `json:"conversation_id"`
-	Model          string            `json:"model"`
-	ExpiresAtUnix  int64             `json:"expires_at_unix"`
-	State          []byte            `json:"state"`
-	Blobs          map[string][]byte `json:"blobs,omitempty"`
+	ConversationID  string            `json:"conversation_id"`
+	Model           string            `json:"model"`
+	ExpiresAtUnix   int64             `json:"expires_at_unix"`
+	ReadyAtUnixNano int64             `json:"ready_at_unix_nano,omitempty"`
+	State           []byte            `json:"state"`
+	Blobs           map[string][]byte `json:"blobs,omitempty"`
 }
 
 func convPersistEnabled() bool {
@@ -269,11 +280,12 @@ func persistConvEntry(key string, entry *convEntry) {
 		return
 	}
 	payload, err := json.Marshal(persistedConvEntry{
-		ConversationID: entry.conversationID,
-		Model:          entry.model,
-		ExpiresAtUnix:  entry.expiresAt.Unix(),
-		State:          state,
-		Blobs:          entry.blobs,
+		ConversationID:  entry.conversationID,
+		Model:           entry.model,
+		ExpiresAtUnix:   entry.expiresAt.Unix(),
+		ReadyAtUnixNano: entry.readyAt.UnixNano(),
+		State:           state,
+		Blobs:           entry.blobs,
 	})
 	if err != nil {
 		return
@@ -325,6 +337,10 @@ func (c *conversationCache) loadPersisted(key string) (*convEntry, bool) {
 		blobs:          stored.Blobs,
 		model:          stored.Model,
 		expiresAt:      expiresAt,
+		readyAt:        time.Unix(0, stored.ReadyAtUnixNano),
+	}
+	if stored.ReadyAtUnixNano == 0 {
+		entry.readyAt = time.Time{}
 	}
 	c.mu.Lock()
 	if existing := c.entries[key]; existing != nil {

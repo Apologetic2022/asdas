@@ -1,6 +1,8 @@
 package cursor
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -42,6 +44,24 @@ func TestConversationFingerprintTracksSystemPromptAndNormalizesToolIDs(t *testin
 	changed[0].Content = "be verbose"
 	if conversationFingerprint(changed) == conversationFingerprint(echoed) {
 		t.Fatal("changing the system prompt must invalidate the checkpoint fingerprint")
+	}
+}
+
+func TestWaitForConversationCachePropagation(t *testing.T) {
+	entry := &convEntry{readyAt: time.Now().Add(25 * time.Millisecond)}
+	started := time.Now()
+	if err := waitForConversationCache(context.Background(), entry); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond {
+		t.Fatalf("cache propagation wait returned too early: %v", elapsed)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	entry.readyAt = time.Now().Add(time.Second)
+	if err := waitForConversationCache(ctx, entry); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled wait error = %v", err)
 	}
 }
 
@@ -155,6 +175,42 @@ func TestEveryCompletedTurnWritesANewCheckpoint(t *testing.T) {
 	defaultConversationCache.Invalidate(scope, firstFP)
 	defaultConversationCache.Invalidate(scope, second.requestKey)
 	defaultConversationCache.Invalidate(scope, secondFP)
+}
+
+func TestCompletedTurnStoresSyntheticCheckpointWhenServerOmitsOne(t *testing.T) {
+	t.Setenv("CPA_CURSOR_CONV_CACHE_DIR", t.TempDir())
+	scope := convScope("auth:synthetic", "claude-opus-5")
+	request := []ChatMessage{
+		{Role: "system", Content: "stable prompt"},
+		{Role: "user", Content: "current question"},
+		{Role: "system", Content: "current reminder"},
+	}
+	session := &Session{
+		ConversationID:  "conv-synthetic",
+		Model:           "claude-opus-5",
+		convScope:       scope,
+		transcript:      append([]ChatMessage(nil), request...),
+		requestKey:      conversationFingerprint(request),
+		requestState:    &agentv1.ConversationStateStructure{},
+		requestAction:   "current question\n\ncurrent reminder",
+		requestMessages: len(request),
+		blobStore:       map[string][]byte{},
+	}
+	session.segText.WriteString("completed answer")
+	session.storeConversationSnapshot()
+
+	transcript := append(append([]ChatMessage(nil), request...),
+		ChatMessage{Role: "assistant", Content: "completed answer"})
+	fingerprint := conversationFingerprint(transcript)
+	entry, ok := defaultConversationCache.Lookup(scope, fingerprint)
+	if !ok {
+		t.Fatal("missing synthetic completed-turn checkpoint")
+	}
+	if len(entry.state.GetTurns()) != 1 {
+		t.Fatalf("synthetic turns = %d, want 1", len(entry.state.GetTurns()))
+	}
+	defaultConversationCache.Invalidate(scope, session.requestKey)
+	defaultConversationCache.Invalidate(scope, fingerprint)
 }
 
 func TestBuildResumeRunRequestKeepsConversationAndCheckpoint(t *testing.T) {

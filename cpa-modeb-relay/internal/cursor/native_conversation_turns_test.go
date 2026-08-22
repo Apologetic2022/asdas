@@ -123,3 +123,65 @@ func TestNativeTailResumeAppendsCompletedToolTurn(t *testing.T) {
 		t.Fatalf("appended native result = %q", got)
 	}
 }
+
+func TestTrailingSystemReminderStaysInCurrentUserAction(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "system", Content: "stable system prompt"},
+		{Role: "user", Content: "old question"},
+		{Role: "assistant", Content: "old answer"},
+		{Role: "user", Content: "current question"},
+		{Role: "system", Content: "current system reminder"},
+	}
+	prefix, turn := splitTrailingUserRun(messages)
+	if len(prefix) != 3 || len(turn) != 2 {
+		t.Fatalf("prefix=%d turn=%d, want 3/2", len(prefix), len(turn))
+	}
+	message, _, _, err := buildRunRequest("claude-opus-5", messages, nil, ToolChoice{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := message.GetRunRequest().GetAction().GetUserMessageAction().GetUserMessage().GetText()
+	if action != "current question\n\ncurrent system reminder" {
+		t.Fatalf("action = %q", action)
+	}
+	if action == resumeContinuationPrompt {
+		t.Fatal("trailing system reminder was mistaken for a tool continuation")
+	}
+}
+
+func TestSynthesizeConversationCheckpointWhenCursorOmitsUpdate(t *testing.T) {
+	state, blobs, err := synthesizeConversationCheckpoint(
+		&agentv1.ConversationStateStructure{},
+		map[string][]byte{},
+		"current question\n\ncurrent system reminder",
+		[]ChatMessage{{Role: "assistant", Content: "completed answer"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.GetTurns()) != 1 {
+		t.Fatalf("turns = %d, want 1", len(state.GetTurns()))
+	}
+	turn := &agentv1.ConversationTurnStructure{}
+	if err = proto.Unmarshal(blobs[hex.EncodeToString(state.GetTurns()[0])], turn); err != nil {
+		t.Fatal(err)
+	}
+	user := &agentv1.UserMessage{}
+	if err = proto.Unmarshal(blobs[hex.EncodeToString(turn.GetAgentConversationTurn().GetUserMessage())], user); err != nil {
+		t.Fatal(err)
+	}
+	if user.GetText() != "current question\n\ncurrent system reminder" {
+		t.Fatalf("native user action = %q", user.GetText())
+	}
+	steps := turn.GetAgentConversationTurn().GetSteps()
+	if len(steps) != 1 {
+		t.Fatalf("steps = %d, want 1", len(steps))
+	}
+	step := &agentv1.ConversationStep{}
+	if err = proto.Unmarshal(blobs[hex.EncodeToString(steps[0])], step); err != nil {
+		t.Fatal(err)
+	}
+	if got := step.GetAssistantMessage().GetText(); got != "completed answer" {
+		t.Fatalf("assistant step = %q", got)
+	}
+}

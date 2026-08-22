@@ -103,6 +103,10 @@ type Session struct {
 	transcript      []ChatMessage
 	segText         strings.Builder
 	segCalls        []ToolCall
+	requestState    *agentv1.ConversationStateStructure
+	requestAction   string
+	requestMessages int
+	cacheReadyAt    time.Time
 	checkpoint      *agentv1.ConversationStateStructure
 	ckptCount       int
 	ckptAfterEnd    bool
@@ -183,6 +187,9 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 			}
 		}
 		if entry != nil {
+			if errReady := waitForConversationCache(ctx, entry); errReady != nil {
+				return nil, errReady
+			}
 			var cm *agentv1.AgentClientMessage
 			var blobs map[string][]byte
 			var id string
@@ -263,29 +270,43 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		profile.CookieJar.RememberResponse(creds.BaseURL, stream.ResponseHeader())
 	}
 
+	initialTranscript := echoTranscript(messages)
+	var requestState *agentv1.ConversationStateStructure
+	requestAction := ""
+	if run := clientMsg.GetRunRequest(); run != nil {
+		if state := run.GetConversationState(); state != nil {
+			requestState = proto.Clone(state).(*agentv1.ConversationStateStructure)
+		}
+		if action := run.GetAction().GetUserMessageAction(); action != nil && action.GetUserMessage() != nil {
+			requestAction = action.GetUserMessage().GetText()
+		}
+	}
 	session := &Session{
-		ID:             uuid.NewString(),
-		ConversationID: conversationID,
-		Model:          selection.ModelID,
-		AuthID:         opts.AuthID,
-		stream:         stream,
-		blobStore:      blobStore,
-		tools:          append([]ToolDefinition(nil), tools...),
-		toolIndex:      indexTools(tools),
-		pending:        map[string]*pendingExec{},
-		events:         make(chan StreamEvent, 64),
-		errCh:          make(chan error, 1),
-		pauseCh:        make(chan struct{}),
-		cancel:         cancel,
-		lastActivity:   time.Now(),
-		manager:        DefaultSessionManager(),
-		promptTokens:   opts.PromptTokens,
-		accountKey:     accountKey,
-		convScope:      scope,
-		transcript:     echoTranscript(messages),
-		resumed:        resumed,
-		resumeKey:      resumeKey,
-		textToolFilter: &textToolCallFilter{},
+		ID:              uuid.NewString(),
+		ConversationID:  conversationID,
+		Model:           selection.ModelID,
+		AuthID:          opts.AuthID,
+		stream:          stream,
+		blobStore:       blobStore,
+		tools:           append([]ToolDefinition(nil), tools...),
+		toolIndex:       indexTools(tools),
+		pending:         map[string]*pendingExec{},
+		events:          make(chan StreamEvent, 64),
+		errCh:           make(chan error, 1),
+		pauseCh:         make(chan struct{}),
+		cancel:          cancel,
+		lastActivity:    time.Now(),
+		manager:         DefaultSessionManager(),
+		promptTokens:    opts.PromptTokens,
+		accountKey:      accountKey,
+		convScope:       scope,
+		transcript:      initialTranscript,
+		requestState:    requestState,
+		requestAction:   requestAction,
+		requestMessages: len(initialTranscript),
+		resumed:         resumed,
+		resumeKey:       resumeKey,
+		textToolFilter:  &textToolCallFilter{},
 	}
 	session.requestKey = conversationFingerprint(session.transcript)
 	if resumed {
@@ -297,6 +318,24 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 	go session.heartbeatLoop(runCtx)
 	go session.readLoop(runCtx)
 	return session, nil
+}
+
+func waitForConversationCache(ctx context.Context, entry *convEntry) error {
+	if entry == nil || entry.readyAt.IsZero() {
+		return nil
+	}
+	wait := time.Until(entry.readyAt)
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // isTransientRunOpenError reports whether an agent run open failure is worth
@@ -472,6 +511,34 @@ func (s *Session) finishAfterCheckpoint() {
 	_ = s.closeNow()
 }
 
+// synthesizeConversationCheckpoint advances the exact state sent in the run
+// request with this run's native action and generated assistant/tool steps.
+// Cursor occasionally omits ConversationCheckpointUpdate (especially on long
+// Claude Code turns); dropping the snapshot in that case makes every later
+// request cold even though the gateway has all data needed to reconstruct it.
+func synthesizeConversationCheckpoint(base *agentv1.ConversationStateStructure, blobs map[string][]byte, action string, generated []ChatMessage) (*agentv1.ConversationStateStructure, map[string][]byte, error) {
+	if base == nil {
+		return nil, nil, fmt.Errorf("cursor: cannot synthesize checkpoint without request state")
+	}
+	state := proto.Clone(base).(*agentv1.ConversationStateStructure)
+	blobStore := cloneBlobStore(blobs)
+	tail := make([]ChatMessage, 0, len(generated)+1)
+	if strings.TrimSpace(action) != "" {
+		tail = append(tail, ChatMessage{Role: "user", Content: action})
+	}
+	tail = append(tail, generated...)
+	turns, systemRows, err := buildNativeConversationTurns(blobStore, tail)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(turns) == 0 && len(systemRows) == 0 {
+		return nil, nil, fmt.Errorf("cursor: synthesized checkpoint has no completed turn")
+	}
+	state.Turns = append(state.Turns, turns...)
+	state.RootPromptMessagesJson = append(state.RootPromptMessagesJson, systemRows...)
+	return state, blobStore, nil
+}
+
 // storeConversationSnapshot publishes a complete turn under both the final
 // echoed transcript and the request prefix. The latter survives clients that
 // rewrite assistant/tool rows before sending the next request.
@@ -480,22 +547,49 @@ func (s *Session) storeConversationSnapshot() {
 		return
 	}
 	s.mu.Lock()
-	complete := s.ckptAfterEnd || !s.outputAfterCkpt
-	if s.snapshotStored || s.convScope == "" || s.checkpoint == nil || !complete {
+	if s.snapshotStored || s.convScope == "" {
+		s.mu.Unlock()
+		return
+	}
+	s.flushAssistantSegmentLocked()
+	transcript := append([]ChatMessage(nil), s.transcript...)
+	var state *agentv1.ConversationStateStructure
+	source := "server"
+	if s.ckptAfterEnd && s.checkpoint != nil {
+		state = proto.Clone(s.checkpoint).(*agentv1.ConversationStateStructure)
+	} else if s.requestState != nil {
+		source = "synthetic"
+		state = proto.Clone(s.requestState).(*agentv1.ConversationStateStructure)
+	} else if s.checkpoint != nil && !s.outputAfterCkpt {
+		state = proto.Clone(s.checkpoint).(*agentv1.ConversationStateStructure)
+	} else {
 		s.mu.Unlock()
 		return
 	}
 	s.snapshotStored = true
-	s.flushAssistantSegmentLocked()
-	transcript := append([]ChatMessage(nil), s.transcript...)
-	state := proto.Clone(s.checkpoint).(*agentv1.ConversationStateStructure)
 	blobs := cloneBlobStore(s.blobStore)
+	requestAction := s.requestAction
+	requestMessages := s.requestMessages
 	conversationID := s.ConversationID
 	model := s.Model
 	scope := s.convScope
 	requestKey := s.requestKey
+	cacheReadyAt := s.cacheReadyAt
 	s.mu.Unlock()
 
+	if source == "synthetic" {
+		generated := []ChatMessage(nil)
+		if requestMessages >= 0 && requestMessages <= len(transcript) {
+			generated = transcript[requestMessages:]
+		}
+		var err error
+		state, blobs, err = synthesizeConversationCheckpoint(state, blobs, requestAction, generated)
+		if err != nil {
+			s.resolvePending()
+			log.Warnf("cursor: could not synthesize missing conversation checkpoint conv=%s model=%s: %v", conversationID, model, err)
+			return
+		}
+	}
 	keys := checkpointKeys(conversationFingerprint(transcript), requestKey)
 	for _, key := range keys {
 		defaultConversationCache.Store(scope, key, &convEntry{
@@ -503,10 +597,11 @@ func (s *Session) storeConversationSnapshot() {
 			state:          state,
 			blobs:          blobs,
 			model:          model,
+			readyAt:        cacheReadyAt,
 		})
 	}
 	s.resolvePending()
-	log.Infof("cursor: stored conversation checkpoint conv=%s model=%s turns=%d keys=%d", conversationID, model, len(state.GetTurns()), len(keys))
+	log.Infof("cursor: stored conversation checkpoint conv=%s model=%s turns=%d keys=%d source=%s", conversationID, model, len(state.GetTurns()), len(keys), source)
 }
 
 // storePauseSnapshot preserves the latest checkpoint when a run parks for
@@ -1123,6 +1218,7 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			syntheticTextCalls := s.syntheticTextCalls
 			if pendingCount == 0 && !waiting && !swallow {
 				s.turnEnded = true
+				s.cacheReadyAt = time.Now().Add(convCachePropagationDelay)
 				if conversationReuseEnabled() && s.convScope != "" && !s.snapshotStored && s.pendingResolve == nil {
 					keys := checkpointKeys(conversationFingerprint(s.finalTranscriptLocked()), s.requestKey)
 					s.pendingResolve = beginPendingAll(s.convScope, keys)

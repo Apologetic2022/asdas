@@ -223,15 +223,30 @@ const resumeContinuationPrompt = "Continue the conversation. The results of your
 	"already provided in the conversation history above. Use them to fulfill the user's most recent " +
 	"request. Call more tools if needed; otherwise answer the user directly."
 
-// splitTrailingUserRun keeps reminder/todo rows emitted as adjacent user
-// messages in the incoming turn. The prefix is the transcript a checkpoint
-// stored at the end of the previous assistant turn.
+// splitTrailingUserRun returns the current user action and any system
+// reminders appended after it. Claude Code regularly ends requests with
+// role=system reminder rows; requiring the literal last row to be user makes
+// every such turn miss the previous checkpoint and replay the full prompt.
 func splitTrailingUserRun(messages []ChatMessage) (prefix, turn []ChatMessage) {
-	i := len(messages)
-	for i > 0 && messages[i-1].Role == "user" {
-		i--
+	lastUser := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		role := strings.TrimSpace(messages[i].Role)
+		if role == "user" && strings.TrimSpace(messages[i].Content) != "" {
+			lastUser = i
+			break
+		}
+		if role != "system" {
+			return messages, nil
+		}
 	}
-	return messages[:i], messages[i:]
+	if lastUser < 0 {
+		return messages, nil
+	}
+	start := lastUser
+	for start > 0 && messages[start-1].Role == "user" {
+		start--
+	}
+	return messages[:start], messages[start:]
 }
 
 func joinedUserText(turn []ChatMessage) string {
@@ -379,26 +394,21 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		"content": systemPrompt,
 	}))
 
-	var activeUser *ChatMessage
-	historyEnd := len(messages)
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" && strings.TrimSpace(messages[i].Content) != "" {
-			activeUser = &messages[i]
-			historyEnd = i
-			break
+	historyMsgs, activeTurn := splitTrailingUserRun(messages)
+	actionText := joinedUserText(activeTurn)
+	if actionText == "" {
+		hasUser := false
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role == "user" && strings.TrimSpace(messages[i].Content) != "" {
+				hasUser = true
+				break
+			}
 		}
-	}
-	if activeUser == nil {
-		return nil, nil, "", fmt.Errorf("cursor: request has no user message")
-	}
-
-	// When assistant/tool rows trail the last user message the request is a
-	// tool-results continuation that must be replayed in a fresh run: keep the
-	// whole transcript as history and drive the run with a continuation prompt.
-	resume := historyEnd < len(messages)-1
-	historyMsgs := messages[:historyEnd]
-	actionText := activeUser.Content
-	if resume {
+		if !hasUser {
+			return nil, nil, "", fmt.Errorf("cursor: request has no user message")
+		}
+		// Assistant/tool rows trail the last user message: this is a tool
+		// continuation rebuilt after its live bidi session disappeared.
 		historyMsgs = messages
 		actionText = resumeContinuationPrompt
 	}
