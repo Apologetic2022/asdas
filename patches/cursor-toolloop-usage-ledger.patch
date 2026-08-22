@@ -1,6 +1,6 @@
-From ef2423ebe1eb2d0b080419d53846205f7d6ea781 Mon Sep 17 00:00:00 2001
+From 9e77c37a7d92c41da8967f9bc161fd225cae7beb Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
-Date: Sat, 22 Aug 2026 08:32:59 +0000
+Date: Sat, 22 Aug 2026 09:09:59 +0000
 Subject: [PATCH] cursor: bill tool-loop segments from a run ledger so cached
  prompts show up
 MIME-Version: 1.0
@@ -11,34 +11,38 @@ Cursor reports usage exactly once per Agent run, in the TurnEnded that closes
 it, and those counters are cumulative over every segment the run produced. One
 gateway request drives one segment, so an agentic tool loop finished almost
 every request with no usage at all: the response carried no usage chunk, the
-statistics store fell back to a char/4 estimate of the whole prompt with zero
-cached tokens, and the run's closing request then reported the entire run
-again. Production logs show this directly — 66 of the 103 requests served in
-the last hour ended on finish_reason=tool_calls with no usage anywhere in the
-response, which is what surfaces as five-figure prompts with no cache.
+statistics store fell back to an estimate of the whole prompt with zero cached
+tokens, and the run's closing request then reported the entire run again.
+Production logs show this directly — 66 of the 103 requests served in the hour
+before this change ended on finish_reason=tool_calls with no usage anywhere in
+the response, which is what surfaces as five-figure prompts with no cache. A
+six-turn tool loop against the deployed gateway reported nothing at all on
+every one of its turns.
 
 The session now keeps a ledger for the run. Segments that end without a report
-are billed from an estimate that charges only the growth beyond the prefix the
-run already sent, counting the rest as a cache read; the cumulative report is
-then reduced by whatever those estimates covered, so a run still totals
-Cursor's own numbers. Every segment_end is preceded by a usage report, so the
-tool_calls responses that make up an agent loop stop looking uncached.
+are billed from an estimate that counts the prefix the run already sent as a
+cache read; the cumulative report is then reduced by whatever those estimates
+covered, so a run still totals Cursor's own numbers. Every segment_end is now
+preceded by a usage report, so the tool_calls responses that make up an agent
+loop stop looking uncached. The same six-turn loop now reports ~95% cache on
+each turn after the first.
 
-On the wire prompt_tokens is now the whole prompt with cached_tokens a subset,
-which is what the OpenAI shape means and what the Claude translator needs to
-recover cache_read_input_tokens. Forwarding Cursor's disjoint input_tokens as
-prompt_tokens hid the cached prefix entirely and let cached_tokens exceed the
-prompt it was supposedly part of.
+Cursor's counters are not disjoint despite the Anthropic-style field names: a
+turn_ended carrying input_tokens 18817 with cache_read_tokens 18717 and
+cache_write_tokens 98 describes an ~18.8k prompt served almost entirely from
+cache, not a 37.6k one. Keep input_tokens as the whole prompt with the cache
+counters as subsets of it, which is already the OpenAI wire shape, and record
+cache writes in the statistics detail instead of dropping them.
 
 Co-authored-by: Apologetic2022 <Apologetic2022@users.noreply.github.com>
 ---
  internal/cursor/session.go                    | 102 ++++++++++--
  internal/cursor/session_usage_test.go         |  84 ++++++++++
- internal/cursor/usage.go                      | 146 ++++++++++++++++++
- internal/cursor/usage_test.go                 |  60 +++++++
- internal/runtime/executor/cursor_executor.go  | 114 ++++++++------
- .../runtime/executor/cursor_usage_test.go     |  44 ++++++
- 6 files changed, 489 insertions(+), 61 deletions(-)
+ internal/cursor/usage.go                      | 151 ++++++++++++++++++
+ internal/cursor/usage_test.go                 |  63 ++++++++
+ internal/runtime/executor/cursor_executor.go  | 115 +++++++------
+ .../runtime/executor/cursor_usage_test.go     |  47 ++++++
+ 6 files changed, 501 insertions(+), 61 deletions(-)
  create mode 100644 internal/cursor/session_usage_test.go
  create mode 100644 internal/cursor/usage.go
  create mode 100644 internal/cursor/usage_test.go
@@ -244,7 +248,7 @@ index 72edbf8d..e0ac44b0 100644
  		s.manager.BindPending(callID, s)
 diff --git a/internal/cursor/session_usage_test.go b/internal/cursor/session_usage_test.go
 new file mode 100644
-index 00000000..a0cc4dfc
+index 00000000..2c48cf8d
 --- /dev/null
 +++ b/internal/cursor/session_usage_test.go
 @@ -0,0 +1,84 @@
@@ -315,8 +319,8 @@ index 00000000..a0cc4dfc
 +	if got := events[0].CacheReadTokens; got != 40000 {
 +		t.Fatalf("resumed segment cache read = %d, want the 40000 prefix already sent", got)
 +	}
-+	if got := events[0].InputTokens; got != 1000 {
-+		t.Fatalf("resumed segment fresh read = %d, want only the growth", got)
++	if got := events[0].InputTokens; got != 41000 {
++		t.Fatalf("resumed segment prompt = %d, want the whole prompt, cache included", got)
 +	}
 +}
 +
@@ -334,17 +338,19 @@ index 00000000..a0cc4dfc
 +}
 diff --git a/internal/cursor/usage.go b/internal/cursor/usage.go
 new file mode 100644
-index 00000000..9126c70c
+index 00000000..a9de574f
 --- /dev/null
 +++ b/internal/cursor/usage.go
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,151 @@
 +package cursor
 +
 +import "encoding/json"
 +
-+// TokenUsage is an Anthropic-style disjoint token breakdown, which is what
-+// Cursor reports: InputTokens counts only the prompt the provider had to read
-+// fresh, with the cached and newly cached prefixes counted separately.
++// TokenUsage is a Cursor token breakdown. Despite the Anthropic-looking field
++// names the counters are not disjoint: a turn_ended reporting
++// input_tokens:18817 cache_read_tokens:18717 cache_write_tokens:98 read a
++// ~18.8k prompt of which all but ~2 tokens came from the cache. InputTokens is
++// therefore the whole prompt, with the two cache counters subsets of it.
 +type TokenUsage struct {
 +	InputTokens      int64
 +	OutputTokens     int64
@@ -353,9 +359,10 @@ index 00000000..9126c70c
 +	ReasoningTokens  int64
 +}
 +
-+// PromptTokens is the whole prompt: the fresh read plus both cached parts.
++// PromptTokens is the whole prompt, which is what Cursor already reports as
++// its input tokens. Summing in the cache counters would count them twice.
 +func (u TokenUsage) PromptTokens() int64 {
-+	return u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
++	return u.InputTokens
 +}
 +
 +// Empty reports whether the breakdown carries no tokens at all.
@@ -408,14 +415,16 @@ index 00000000..9126c70c
 +	return segment
 +}
 +
-+// estimate bills a segment that ended before any report arrived.
++// estimate bills a segment that ended before any report arrived. The prefix
++// the run already sent is counted as a cache read within the prompt, matching
++// how Cursor reports a warm turn.
 +func (r *runUsage) estimate(prompt, output int64) TokenUsage {
 +	cached := r.sentPrompt
 +	if cached > prompt {
 +		cached = prompt
 +	}
 +	segment := TokenUsage{
-+		InputTokens:     prompt - cached,
++		InputTokens:     prompt,
 +		OutputTokens:    output,
 +		CacheReadTokens: cached,
 +	}
@@ -486,10 +495,10 @@ index 00000000..9126c70c
 +}
 diff --git a/internal/cursor/usage_test.go b/internal/cursor/usage_test.go
 new file mode 100644
-index 00000000..0ab435ff
+index 00000000..1eeaeb0c
 --- /dev/null
 +++ b/internal/cursor/usage_test.go
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,63 @@
 +package cursor
 +
 +import "testing"
@@ -509,13 +518,13 @@ index 00000000..0ab435ff
 +	if second.CacheReadTokens != 40000 {
 +		t.Fatalf("resumed segment cache read = %d, want the 40000 prefix already sent", second.CacheReadTokens)
 +	}
-+	if second.InputTokens != 2000 {
-+		t.Fatalf("resumed segment fresh read = %d, want only the 2000 the prompt grew by", second.InputTokens)
++	if second.InputTokens != 42000 {
++		t.Fatalf("resumed segment prompt = %d, want the whole prompt, cache included", second.InputTokens)
 +	}
 +
-+	total := TokenUsage{InputTokens: 90000, OutputTokens: 4000, CacheReadTokens: 120000}
++	total := TokenUsage{InputTokens: 130000, OutputTokens: 4000, CacheReadTokens: 120000}
 +	final := run.upstream(total, 44000)
-+	if got, want := final.InputTokens, int64(90000-42000); got != want {
++	if got, want := final.InputTokens, int64(130000-82000); got != want {
 +		t.Fatalf("final input = %d, want %d", got, want)
 +	}
 +	if got, want := final.CacheReadTokens, int64(120000-40000); got != want {
@@ -544,14 +553,17 @@ index 00000000..0ab435ff
 +	}
 +}
 +
-+func TestPromptTokensSumsTheDisjointCounters(t *testing.T) {
-+	u := TokenUsage{InputTokens: 100, CacheReadTokens: 900, CacheWriteTokens: 50}
-+	if got := u.PromptTokens(); got != 1050 {
-+		t.Fatalf("prompt tokens = %d, want 1050", got)
++// Cursor's counters are not disjoint: a turn_ended carrying input_tokens 18817
++// with cache_read_tokens 18717 describes an ~18.8k prompt served almost
++// entirely from cache, not a 37.5k one. Summing them double-counts the prompt.
++func TestPromptTokensDoesNotDoubleCountTheCachedPrefix(t *testing.T) {
++	u := TokenUsage{InputTokens: 18817, CacheReadTokens: 18717, CacheWriteTokens: 98}
++	if got := u.PromptTokens(); got != 18817 {
++		t.Fatalf("prompt tokens = %d, want 18817", got)
 +	}
 +}
 diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
-index 1140b2c5..96d60717 100644
+index 1140b2c5..390071d0 100644
 --- a/internal/runtime/executor/cursor_executor.go
 +++ b/internal/runtime/executor/cursor_executor.go
 @@ -147,14 +147,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
@@ -646,7 +658,7 @@ index 1140b2c5..96d60717 100644
  			err = session.SubmitToolResults(results)
  		}
  		switch {
-@@ -1507,15 +1473,61 @@ func buildOpenAIChatCompletion(model string, result *cursorlib.ChatResult, image
+@@ -1507,15 +1473,62 @@ func buildOpenAIChatCompletion(model string, result *cursorlib.ChatResult, image
  // carrying provider cache hits in prompt_tokens_details.cached_tokens so both
  // OpenAI and Claude clients can observe prompt-cache effectiveness.
  func usagePayloadFromResult(result *cursorlib.ChatResult) map[string]any {
@@ -684,24 +696,25 @@ index 1140b2c5..96d60717 100644
 +	}
 +}
 +
-+// usageDetail renders a segment for the statistics store, which keeps the
-+// disjoint Anthropic-style split that Cursor reports and totals it itself.
++// usageDetail renders a segment for the statistics store. Cursor's input
++// tokens already cover the whole prompt, so the cache counters are recorded
++// alongside it rather than added to it.
 +func usageDetail(tokens cursorlib.TokenUsage) usage.Detail {
++	prompt := tokens.PromptTokens()
 +	return usage.Detail{
-+		InputTokens:         tokens.InputTokens,
++		InputTokens:         prompt,
 +		OutputTokens:        tokens.OutputTokens,
 +		CachedTokens:        tokens.CacheReadTokens,
 +		CacheReadTokens:     tokens.CacheReadTokens,
 +		CacheCreationTokens: tokens.CacheWriteTokens,
 +		ReasoningTokens:     tokens.ReasoningTokens,
-+		TotalTokens:         tokens.PromptTokens() + tokens.OutputTokens,
++		TotalTokens:         prompt + tokens.OutputTokens,
 +	}
 +}
 +
-+// openAIUsagePayload renders a segment on the wire. OpenAI's prompt_tokens is
-+// the whole prompt with cached_tokens a subset of it, so Cursor's disjoint
-+// counters have to be summed; forwarding its input_tokens as prompt_tokens hid
-+// the cached prefix entirely and let cached_tokens exceed the prompt.
++// openAIUsagePayload renders a segment on the wire, where prompt_tokens is the
++// whole prompt and cached_tokens a subset of it. That is already the shape of
++// Cursor's counters, so they are forwarded rather than summed.
 +func openAIUsagePayload(tokens cursorlib.TokenUsage) map[string]any {
 +	prompt := tokens.PromptTokens()
 +	return map[string]any{
@@ -719,10 +732,10 @@ index 1140b2c5..96d60717 100644
  }
 diff --git a/internal/runtime/executor/cursor_usage_test.go b/internal/runtime/executor/cursor_usage_test.go
 new file mode 100644
-index 00000000..d35854d0
+index 00000000..3a19fd0e
 --- /dev/null
 +++ b/internal/runtime/executor/cursor_usage_test.go
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,47 @@
 +package executor
 +
 +import (
@@ -731,13 +744,13 @@ index 00000000..d35854d0
 +	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
 +)
 +
-+// Cursor reports a disjoint split, where input_tokens excludes what came from
-+// the cache. OpenAI's prompt_tokens is the whole prompt with cached_tokens a
-+// subset of it, so forwarding Cursor's input_tokens unchanged hid the cached
-+// prefix and let cached_tokens exceed the prompt it was supposedly part of.
-+func TestOpenAIUsagePayloadCountsTheCachedPrefixInThePrompt(t *testing.T) {
++// Cursor's counters are not disjoint: a turn_ended carrying input_tokens
++// 132250 with cache_read_tokens 130000 describes a 132250-token prompt of
++// which 130000 came from the cache. Summing them would report a prompt twice
++// the size the caller actually sent.
++func TestOpenAIUsagePayloadTreatsCachedTokensAsPartOfThePrompt(t *testing.T) {
 +	tokens := cursorlib.TokenUsage{
-+		InputTokens:      2000,
++		InputTokens:      132250,
 +		OutputTokens:     48,
 +		CacheReadTokens:  130000,
 +		CacheWriteTokens: 250,
@@ -746,7 +759,7 @@ index 00000000..d35854d0
 +
 +	payload := openAIUsagePayload(tokens)
 +	if got := payload["prompt_tokens"].(int64); got != 132250 {
-+		t.Fatalf("prompt tokens = %d, want the fresh read plus both cached parts", got)
++		t.Fatalf("prompt tokens = %d, want the prompt Cursor reported", got)
 +	}
 +	if got := payload["total_tokens"].(int64); got != 132298 {
 +		t.Fatalf("total tokens = %d, want 132298", got)
@@ -755,10 +768,13 @@ index 00000000..d35854d0
 +	if got := details["cached_tokens"].(int64); got != 130000 {
 +		t.Fatalf("cached tokens = %d, want 130000", got)
 +	}
++	if details["cached_tokens"].(int64) > payload["prompt_tokens"].(int64) {
++		t.Fatal("cached tokens must be a subset of the prompt")
++	}
 +
 +	detail := usageDetail(tokens)
-+	if detail.InputTokens != 2000 {
-+		t.Fatalf("detail input = %d, want only the fresh read", detail.InputTokens)
++	if detail.InputTokens != 132250 {
++		t.Fatalf("detail input = %d, want the whole prompt", detail.InputTokens)
 +	}
 +	if detail.CacheReadTokens != 130000 || detail.CacheCreationTokens != 250 {
 +		t.Fatalf("detail cache split = %d/%d, want 130000/250", detail.CacheReadTokens, detail.CacheCreationTokens)

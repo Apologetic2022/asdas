@@ -31,5 +31,16 @@ is what makes an agent tool loop stop showing five-figure prompts with no
 cache: measured on the production gateway, 66 of 103 requests answered with no
 usage anywhere in the response before it, and none after.
 
+It also corrects how the two are combined. The `modeb-relay` series reads
+Cursor's counters as disjoint, the way the Anthropic field names suggest, and
+sums them into the prompt total. Raw `turn_ended` frames say otherwise:
+`input_tokens:18817 cache_read_tokens:18717 cache_write_tokens:98` is an ~18.8k
+prompt served almost entirely from cache, not a 37.6k one. This patch keeps
+`input_tokens` as the whole prompt with the cache counters as subsets.
+
 Verify with `tests/toolloop_strict_probe.py`, which drives a forced multi-turn
-tool loop and prints the per-turn cache share.
+tool loop and prints the per-turn cache share. Give every run a distinct
+conversation — the probe does this with a nonce — because an exact duplicate of
+an earlier prompt resumes that conversation from the checkpoint cache instead
+of starting a new turn, and answers the resumed context rather than the
+request.

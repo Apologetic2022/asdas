@@ -10,6 +10,7 @@ Usage: toolloop_strict.py [port] [turns] [model]
 import json
 import sys
 import urllib.request
+import uuid
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "8317"
 TURNS = int(sys.argv[2]) if len(sys.argv) > 2 else 6
@@ -33,12 +34,17 @@ TOOLS = [{
 BALLAST = ("You are a diagnostics agent for a large sensor array. "
            "Follow the operator's instructions exactly and never guess a reading. " * 400)
 
+# A per-run nonce keeps each run a distinct conversation. Without it a repeated
+# run is an exact duplicate of an earlier one and resumes that conversation from
+# the checkpoint cache instead of starting a new turn.
+NONCE = uuid.uuid4().hex[:8]
+
 messages = [
     {"role": "system", "content": BALLAST},
     {"role": "user", "content":
-        f"Read sensors 1 through {TURNS}. You must call read_sensor for exactly ONE "
-        f"sensor per reply, never more than one tool call per reply, and you must not "
-        f"summarise until you have read all {TURNS} sensors."},
+        f"Session {NONCE}. Read sensors 1 through {TURNS}. You must call read_sensor "
+        f"for exactly ONE sensor per reply, never more than one tool call per reply, "
+        f"and you must not summarise until you have read all {TURNS} sensors."},
 ]
 
 
