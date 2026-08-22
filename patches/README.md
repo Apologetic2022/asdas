@@ -82,3 +82,50 @@ Verify with `tests/parallel_toolcall_probe.py` on `grok-4.6` or
 `claude-opus-5`; `claude-sonnet-4-5` and `claude-fable-5` are serialised
 upstream by the agent harness and answer one call at a time regardless.
 Non-streaming grok-4.6 went from 7/8 full batches to 8/8.
+
+## Against the resume/parallel patch (base `a2fd4e2a`)
+
+`cursor-cache-fields-and-builtin-tools.patch`
+
+Apply last. Two more findings from the same gateway.
+
+**Cache creation was never reported to the client.** `openAIUsagePayload`
+carried only `prompt_tokens_details.cached_tokens`, so a cold turn that paid to
+fill the cache looked exactly like one that never cached: 42,760 prompt tokens,
+18,717 of them read, and nothing said about the 24,041 written. `usage.Detail`
+already tracked the figure for the internal statistics; only the wire payload
+dropped it. The Anthropic side dropped it as well — `extractOpenAIUsage` read
+just `cached_tokens`, so `/v1/messages` clients only ever saw
+`cache_read_input_tokens`. Both now carry creation
+(`prompt_tokens_details.cache_creation_tokens`, the name the rest of the
+repository already parses, and `cache_creation_input_tokens`), and the
+Anthropic path takes both counters out of `input_tokens` because Anthropic
+reports the three as disjoint. Verify with `tests/cache_fields_probe.py`.
+
+**The workspace built-ins reported a broken environment.** Their diagnostic
+came back as Shell with no exit status, Write succeeding but the following Read
+failing to find the file, and Glob answering "No exec result". Three separate
+causes:
+
+- The workspace is rooted at the process home directory, and the gateway runs
+  as a nologin service account whose home does not exist and cannot be created
+  by that account. Every `MkdirAll` failed, every error was discarded, and the
+  model was handed a path nothing could write to. It falls back to a base that
+  works.
+- `handleWriteArgs` answered every write with success even when nothing landed,
+  which is what made the following read look like the broken step. It answers
+  with the real outcome now.
+- An exec variant the trimmed proto has no case for decodes to nil, and the
+  stream was closed with no result at all. That is what the harness surfaces as
+  "No exec result" or a shell with no exit status, and the model retries it for
+  whole segments. It throws now, with text the model can act on. The note that
+  these built-ins are unavailable was also only added to claude runs carrying
+  client tools, so a plain chat never saw it; every run gets it.
+
+Verify with `tests/builtin_tools_probe.py`, which fails if the model reports an
+opaque tool failure.
+
+Serving Read from the headless workspace was tried and reverted.
+`ReadSuccess_Data` is the reference-image channel, and putting a text file
+through it made the provider reject the turn with a 400 on every attempt, so
+Read still serves only the reference images attached to the request.

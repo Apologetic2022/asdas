@@ -1,0 +1,521 @@
+From d0979e4dbe7df6912d21a5891eaca01778a6b2b9 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 09:56:43 +0000
+Subject: [PATCH] cursor: split cache creation from cache read and stop faking
+ tool results
+
+Follows the stale-resume/parallel-tools commit. Three findings from probing
+the production gateway on 15.204.914.214.
+
+Cache creation was never reported. openAIUsagePayload carried only
+prompt_tokens_details.cached_tokens, so a cold turn that paid to fill the
+cache was indistinguishable from one that never cached: 42,760 prompt
+tokens, 18,717 of them read, and nothing at all said about the 24,041
+written. usage.Detail already tracked CacheCreationTokens for the internal
+stats; only the wire payload dropped it. It now carries
+prompt_tokens_details.cache_creation_tokens, the name the rest of the
+repository already parses.
+
+The Anthropic side dropped it too. extractOpenAIUsage read only
+cached_tokens and subtracted it from input_tokens, so /v1/messages clients
+saw cache_read_input_tokens and never cache_creation_input_tokens. It now
+splits both counters out of the prompt, matching how Anthropic reports the
+three as disjoint, and omits a counter that is zero.
+
+The workspace built-ins reported a broken environment. Their diagnostic came
+back as Shell with no exit status, Write succeeded but the following Read
+could not find the file, and Glob with "No exec result":
+
+- The workspace is rooted at the process home directory. The service runs as
+  a nologin account whose home does not exist and cannot be created by that
+  account, so every MkdirAll failed, was ignored, and the model was handed a
+  path nothing could write to. It now falls back to a base that works.
+- handleWriteArgs answered every write with success even when nothing
+  landed, which is what made the following read look like the failure. It
+  now answers with the real outcome.
+- An exec variant the trimmed proto has no case for decoded to nil and the
+  stream was closed with no result, which the harness surfaces as "No exec
+  result" or a shell with no exit status and the model retries for whole
+  segments. It now throws with text the model can act on.
+- The note telling the model these built-ins are unavailable was only added
+  to claude runs that attached client tools, so a plain chat never saw it
+  and spent a segment on Shell and Glob before declaring the environment
+  broken. Every run gets it now.
+
+Serving Read from the workspace was tried and reverted: ReadSuccess_Data is
+the reference-image channel, and putting a text file through it made the
+provider reject the turn with a 400 on every attempt.
+---
+ internal/cursor/agent.go                      | 91 +++++++++++++------
+ internal/cursor/headless_workspace_test.go    | 66 ++++++++++++++
+ internal/cursor/session.go                    | 25 ++++-
+ internal/runtime/executor/cursor_executor.go  |  7 +-
+ .../openai/claude/cache_usage_test.go         | 63 +++++++++++++
+ .../openai/claude/openai_claude_response.go   | 58 +++++++-----
+ 6 files changed, 256 insertions(+), 54 deletions(-)
+ create mode 100644 internal/cursor/headless_workspace_test.go
+ create mode 100644 internal/translator/openai/claude/cache_usage_test.go
+
+diff --git a/internal/cursor/agent.go b/internal/cursor/agent.go
+index 7abbcee0..d210b208 100644
+--- a/internal/cursor/agent.go
++++ b/internal/cursor/agent.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/google/uuid"
+ 	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
+ 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
++	log "github.com/sirupsen/logrus"
+ 	"google.golang.org/protobuf/proto"
+ )
+ 
+@@ -386,12 +387,16 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 		// reporting it as delivered.
+ 		systemPrompt += " You cannot generate images in this conversation: your image generation tool is unavailable. If the user asks for an image, say so plainly instead of calling the tool or claiming an image was produced."
+ 	}
++	// The harness advertises its workspace built-ins on every run, including
++	// runs that attach no tools at all, and this gateway backs none of them.
++	// Gating the warning on the tool list is what let a plain chat spend a
++	// segment on Shell and Glob and then report the environment as broken.
++	systemPrompt += " Tool note: the built-in workspace tools (Shell, Read, Grep, Glob, Edit, Write, ...) are unavailable here; do not call them, wait on them, or describe their results."
+ 	if claudeUpstream && len(tools) > 0 {
+ 		// Client tools are registered under mcp_-prefixed names on claude
+-		// (see claudeWireModel). Without this note the model burns whole
+-		// segments retrying the workspace built-ins of the same name, which
+-		// run nowhere in this headless setup.
+-		systemPrompt += " Tool note: only the mcp_-prefixed tools attached to this conversation actually work here. Built-in workspace tools (Shell, Read, Grep, Glob, Edit, Write, ...) are unavailable; do not call them or wait on them."
++		// (see claudeWireModel), so the built-in of the same base name is the
++		// wrong one to reach for.
++		systemPrompt += " Only the mcp_-prefixed tools attached to this conversation actually work."
+ 	}
+ 	systemBlob := storeBlob(blobStore, mustJSON(map[string]any{
+ 		"role":    "system",
+@@ -631,21 +636,39 @@ func headlessWorkspaceEnv() *agentv1.RequestContextEnv {
+ // treats these as an open folder so server-side tools (GenerateImage) have a
+ // valid destination; the image itself is still returned inline as base64.
+ func headlessWorkspaceRoot() (root, project string) {
+-	base := os.TempDir()
++	// A service account's home directory is often absent and not creatable by
++	// the account itself (a nologin user under a root-owned /home). Advertising
++	// a workspace there gives the model a path nothing can write to, and every
++	// write it reports goes nowhere, so fall back to a base that works.
++	bases := make([]string, 0, 2)
+ 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+-		base = home
+-	}
+-	root = filepath.Join(base, "cliproxy-cursor-workspace")
+-	project = filepath.Join(base, ".cursor", "projects", "cliproxy-cursor-workspace")
+-	for _, dir := range []string{
+-		root,
+-		filepath.Join(root, "assets"),
+-		project,
+-		filepath.Join(project, "assets"),
+-		filepath.Join(project, "transcripts"),
+-		filepath.Join(project, "terminals"),
+-	} {
+-		_ = os.MkdirAll(dir, 0o755)
++		bases = append(bases, home)
++	}
++	bases = append(bases, os.TempDir())
++
++	for i, base := range bases {
++		root = filepath.Join(base, headlessWorkspaceDirName)
++		project = filepath.Join(base, ".cursor", "projects", headlessWorkspaceDirName)
++		usable := true
++		for _, dir := range []string{
++			root,
++			filepath.Join(root, "assets"),
++			project,
++			filepath.Join(project, "assets"),
++			filepath.Join(project, "transcripts"),
++			filepath.Join(project, "terminals"),
++		} {
++			if err := os.MkdirAll(dir, 0o755); err != nil {
++				usable = false
++				break
++			}
++		}
++		if usable {
++			return root, project
++		}
++		if i == len(bases)-1 {
++			log.Warnf("cursor workspace: no writable base for the headless workspace, tried %v", bases)
++		}
+ 	}
+ 	return root, project
+ }
+@@ -701,9 +724,28 @@ func IsHeadlessWorkspacePath(p string) bool {
+ // writeHeadlessWorkspaceFile persists server-delivered file bytes (e.g. the
+ // GenerateImage PNG) when the target lies inside the headless workspace or
+ // project folder. Failures are ignored: the bytes are returned inline anyway.
+-func writeHeadlessWorkspaceFile(path string, data []byte) {
+-	if strings.TrimSpace(path) == "" || len(data) == 0 {
+-		return
++// writeHeadlessWorkspaceFile stores a file the run wrote. It reports the error
++// rather than swallowing it, because the caller answers the exec with a write
++// result and must not claim success for bytes that never landed.
++func writeHeadlessWorkspaceFile(path string, data []byte) error {
++	cleaned, ok := headlessWorkspacePath(path)
++	if !ok {
++		return fmt.Errorf("path %q is outside the workspace", path)
++	}
++	if len(data) == 0 {
++		return nil
++	}
++	if err := os.MkdirAll(filepath.Dir(cleaned), 0o755); err != nil {
++		return err
++	}
++	return os.WriteFile(cleaned, data, 0o644)
++}
++
++// headlessWorkspacePath cleans a path and confirms it stays inside the
++// headless workspace, so an exec cannot reach the rest of the filesystem.
++func headlessWorkspacePath(path string) (string, bool) {
++	if strings.TrimSpace(path) == "" {
++		return "", false
+ 	}
+ 	root, project := headlessWorkspaceRoot()
+ 	cleaned := filepath.Clean(path)
+@@ -712,12 +754,9 @@ func writeHeadlessWorkspaceFile(path string, data []byte) {
+ 		return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+ 	}
+ 	if !inside(root) && !inside(project) {
+-		return
+-	}
+-	if err := os.MkdirAll(filepath.Dir(cleaned), 0o755); err != nil {
+-		return
++		return "", false
+ 	}
+-	_ = os.WriteFile(cleaned, data, 0o644)
++	return cleaned, true
+ }
+ 
+ func headlessRequestContext() *agentv1.RequestContext {
+diff --git a/internal/cursor/headless_workspace_test.go b/internal/cursor/headless_workspace_test.go
+new file mode 100644
+index 00000000..b1907f93
+--- /dev/null
++++ b/internal/cursor/headless_workspace_test.go
+@@ -0,0 +1,66 @@
++package cursor
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// The gateway commonly runs as a service account whose home directory does not
++// exist and cannot be created by that account (a nologin user under a
++// root-owned /home). Rooting the workspace there advertises a path to the model
++// that nothing can write to, so every write it makes silently vanishes while
++// still being reported as a success.
++func TestHeadlessWorkspaceFallsBackWhenHomeIsUnusable(t *testing.T) {
++	t.Setenv("HOME", filepath.Join(t.TempDir(), "missing", "home"))
++	t.Setenv("TMPDIR", t.TempDir())
++
++	root, project := headlessWorkspaceRoot()
++	for _, dir := range []string{root, project} {
++		info, err := os.Stat(dir)
++		if err != nil || !info.IsDir() {
++			t.Fatalf("workspace %q was not created: %v", dir, err)
++		}
++	}
++
++	path := filepath.Join(root, "probe.txt")
++	if err := writeHeadlessWorkspaceFile(path, []byte("PROBE")); err != nil {
++		t.Fatalf("write into the fallback workspace: %v", err)
++	}
++	if data, err := os.ReadFile(path); err != nil || string(data) != "PROBE" {
++		t.Fatalf("read back err=%v data=%q", err, data)
++	}
++}
++
++// A write that cannot land must say so, so the exec is not answered with a
++// success for bytes that went nowhere.
++func TestWriteHeadlessWorkspaceFileReportsFailure(t *testing.T) {
++	t.Setenv("HOME", t.TempDir())
++	if err := writeHeadlessWorkspaceFile("/etc/nope.txt", []byte("x")); err == nil {
++		t.Fatal("a write outside the workspace must report an error")
++	}
++}
++
++// An exec must not be able to name its way out of the workspace.
++func TestHeadlessWorkspaceRefusesPathsOutsideRoot(t *testing.T) {
++	home := t.TempDir()
++	t.Setenv("HOME", home)
++	root, _ := headlessWorkspaceRoot()
++
++	secret := filepath.Join(home, "outside.txt")
++	if err := os.WriteFile(secret, []byte("SECRET"), 0o600); err != nil {
++		t.Fatalf("seed outside file: %v", err)
++	}
++
++	for _, path := range []string{secret, filepath.Join(root, "..", "outside.txt"), ""} {
++		if _, ok := headlessWorkspacePath(path); ok {
++			t.Fatalf("%q must not resolve inside the workspace", path)
++		}
++		if err := writeHeadlessWorkspaceFile(path, []byte("CLOBBER")); err == nil {
++			t.Fatalf("%q must not be writable through the workspace", path)
++		}
++	}
++	if data, _ := os.ReadFile(secret); string(data) != "SECRET" {
++		t.Fatalf("file outside the workspace was overwritten: %q", data)
++	}
++}
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index 2325ad21..789134ec 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -1475,10 +1475,14 @@ func sniffImageMimeType(b64 string) string {
+ func (s *Session) handleExec(req *agentv1.ExecServerMessage) (bool, error) {
+ 	switch m := req.Message.(type) {
+ 	case nil:
++		// A built-in the trimmed proto has no variant for (shell, glob,
++		// list_dir, ...). Closing the exec stream empty is what the harness
++		// surfaces as "No exec result" or a shell with no exit status, and the
++		// model retries it for whole segments. An explicit throw ends it.
+ 		if unknown := req.ProtoReflect().GetUnknown(); len(unknown) > 0 {
+ 			log.Warnf("cursor exec: undecoded variant, unknown field bytes (first 64): %x", truncateBytes(unknown, 64))
+ 		}
+-		return false, sendExecStreamClose(s.stream, req.Id)
++		return false, rejectUnsupportedExec(s.stream, req)
+ 	case *agentv1.ExecServerMessage_WriteArgs:
+ 		return false, s.handleWriteArgs(req, m.WriteArgs)
+ 	case *agentv1.ExecServerMessage_ReadArgs:
+@@ -1543,8 +1547,9 @@ func (s *Session) handleWriteArgs(req *agentv1.ExecServerMessage, args *agentv1.
+ 		s.writtenImages[path] = data
+ 		s.mu.Unlock()
+ 	}
+-	writeHeadlessWorkspaceFile(path, data)
+-
++	// Reporting success for a write that never landed is worse than failing:
++	// the model goes on to read the file back, is told it does not exist, and
++	// concludes its whole tool environment is broken.
+ 	result := &agentv1.WriteResult{
+ 		Result: &agentv1.WriteResult_Success{
+ 			Success: &agentv1.WriteSuccess{
+@@ -1553,6 +1558,14 @@ func (s *Session) handleWriteArgs(req *agentv1.ExecServerMessage, args *agentv1.
+ 			},
+ 		},
+ 	}
++	if err := writeHeadlessWorkspaceFile(path, data); err != nil {
++		log.Warnf("cursor write exec: path=%q failed: %v", path, err)
++		result = &agentv1.WriteResult{
++			Result: &agentv1.WriteResult_Error{
++				Error: &agentv1.WriteError{Path: path, Error: err.Error()},
++			},
++		}
++	}
+ 	execClient := &agentv1.ExecClientMessage{
+ 		Id:      req.Id,
+ 		ExecId:  req.ExecId,
+@@ -1773,8 +1786,10 @@ func rejectUnsupportedExec(stream *BidiStream, req *agentv1.ExecServerMessage) e
+ 	control := &agentv1.ExecClientControlMessage{
+ 		Message: &agentv1.ExecClientControlMessage_Throw{
+ 			Throw: &agentv1.ExecClientThrow{
+-				Id:        req.Id,
+-				Error:     "No handler for Cursor exec message",
++				Id: req.Id,
++				// The model reads this, so say what it should do rather than
++				// naming an internal dispatch failure it cannot act on.
++				Error:     "This tool is not available in this environment. Do not retry it; use the tools attached to the conversation, or answer without it.",
+ 				ErrorCode: &code,
+ 			},
+ 		},
+diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
+index 390071d0..9cd03dc0 100644
+--- a/internal/runtime/executor/cursor_executor.go
++++ b/internal/runtime/executor/cursor_executor.go
+@@ -1525,7 +1525,12 @@ func openAIUsagePayload(tokens cursorlib.TokenUsage) map[string]any {
+ 		"completion_tokens": tokens.OutputTokens,
+ 		"total_tokens":      prompt + tokens.OutputTokens,
+ 		"prompt_tokens_details": map[string]any{
+-			"cached_tokens": tokens.CacheReadTokens,
++			// Both counters are subsets of prompt_tokens and mean opposite
++			// things: cached_tokens was served from the cache, the other was
++			// written into it. Reporting only the read makes a cold turn
++			// indistinguishable from one that never cached at all.
++			"cached_tokens":         tokens.CacheReadTokens,
++			"cache_creation_tokens": tokens.CacheWriteTokens,
+ 		},
+ 		"completion_tokens_details": map[string]any{
+ 			"reasoning_tokens": tokens.ReasoningTokens,
+diff --git a/internal/translator/openai/claude/cache_usage_test.go b/internal/translator/openai/claude/cache_usage_test.go
+new file mode 100644
+index 00000000..a29f004e
+--- /dev/null
++++ b/internal/translator/openai/claude/cache_usage_test.go
+@@ -0,0 +1,63 @@
++package claude
++
++import (
++	"testing"
++
++	"github.com/tidwall/gjson"
++)
++
++// Cache reads and cache writes mean opposite things: one turn was served from
++// the cache, the other paid to fill it. OpenAI nests both under prompt_tokens;
++// Anthropic reports all three disjoint.
++func TestExtractOpenAIUsageSplitsCacheReadFromCacheCreation(t *testing.T) {
++	for _, tc := range []struct {
++		name                                          string
++		usage                                         string
++		wantInput, wantOutput, wantRead, wantCreation int64
++	}{
++		{
++			name: "cold turn writes the cache",
++			usage: `{"prompt_tokens":42760,"completion_tokens":4,
++			         "prompt_tokens_details":{"cached_tokens":18717,"cache_creation_tokens":24041}}`,
++			wantInput: 2, wantOutput: 4, wantRead: 18717, wantCreation: 24041,
++		},
++		{
++			name: "warm turn reads the cache",
++			usage: `{"prompt_tokens":42760,"completion_tokens":4,
++			         "prompt_tokens_details":{"cached_tokens":42758,"cache_creation_tokens":0}}`,
++			wantInput: 2, wantOutput: 4, wantRead: 42758, wantCreation: 0,
++		},
++		{
++			name:      "no cache details at all",
++			usage:     `{"prompt_tokens":100,"completion_tokens":7}`,
++			wantInput: 100, wantOutput: 7, wantRead: 0, wantCreation: 0,
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			in, out, read, creation := extractOpenAIUsage(gjson.Parse(tc.usage))
++			if in != tc.wantInput || out != tc.wantOutput || read != tc.wantRead || creation != tc.wantCreation {
++				t.Fatalf("got input=%d output=%d read=%d creation=%d, want %d/%d/%d/%d",
++					in, out, read, creation,
++					tc.wantInput, tc.wantOutput, tc.wantRead, tc.wantCreation)
++			}
++		})
++	}
++}
++
++func TestSetClaudeCacheUsageOmitsZeroCounters(t *testing.T) {
++	out := setClaudeCacheUsage([]byte(`{}`), 18717, 24041)
++	if got := gjson.GetBytes(out, "usage.cache_read_input_tokens").Int(); got != 18717 {
++		t.Fatalf("cache_read_input_tokens = %d", got)
++	}
++	if got := gjson.GetBytes(out, "usage.cache_creation_input_tokens").Int(); got != 24041 {
++		t.Fatalf("cache_creation_input_tokens = %d", got)
++	}
++
++	// A turn that neither read nor wrote the cache carries neither key, the
++	// way the Anthropic API omits them.
++	out = setClaudeCacheUsage([]byte(`{}`), 0, 0)
++	if gjson.GetBytes(out, "usage.cache_read_input_tokens").Exists() ||
++		gjson.GetBytes(out, "usage.cache_creation_input_tokens").Exists() {
++		t.Fatalf("zero counters must be omitted, got %s", out)
++	}
++}
+diff --git a/internal/translator/openai/claude/openai_claude_response.go b/internal/translator/openai/claude/openai_claude_response.go
+index 8acb6884..a52081ee 100644
+--- a/internal/translator/openai/claude/openai_claude_response.go
++++ b/internal/translator/openai/claude/openai_claude_response.go
+@@ -343,17 +343,15 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
+ 	// Only process if usage has actual values (not null)
+ 	if param.FinishReason != "" {
+ 		usage := root.Get("usage")
+-		var inputTokens, outputTokens, cachedTokens int64
++		var inputTokens, outputTokens, cachedTokens, cacheCreationTokens int64
+ 		if usage.Exists() && usage.Type != gjson.Null {
+-			inputTokens, outputTokens, cachedTokens = extractOpenAIUsage(usage)
++			inputTokens, outputTokens, cachedTokens, cacheCreationTokens = extractOpenAIUsage(usage)
+ 			// Send message_delta with usage
+ 			messageDeltaJSON := []byte(`{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+ 			messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "delta.stop_reason", mapOpenAIFinishReasonToAnthropic(effectiveOpenAIFinishReason(param)))
+ 			messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.input_tokens", inputTokens)
+ 			messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.output_tokens", outputTokens)
+-			if cachedTokens > 0 {
+-				messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.cache_read_input_tokens", cachedTokens)
+-			}
++			messageDeltaJSON = setClaudeCacheUsage(messageDeltaJSON, cachedTokens, cacheCreationTokens)
+ 			results = append(results, translatorcommon.AppendSSEEventBytes(nil, "message_delta", messageDeltaJSON, 2))
+ 			param.MessageDeltaSent = true
+ 
+@@ -481,12 +479,10 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
+ 
+ 	// Set usage information
+ 	if usage := root.Get("usage"); usage.Exists() {
+-		inputTokens, outputTokens, cachedTokens := extractOpenAIUsage(usage)
++		inputTokens, outputTokens, cachedTokens, cacheCreationTokens := extractOpenAIUsage(usage)
+ 		out, _ = sjson.SetBytes(out, "usage.input_tokens", inputTokens)
+ 		out, _ = sjson.SetBytes(out, "usage.output_tokens", outputTokens)
+-		if cachedTokens > 0 {
+-			out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
+-		}
++		out = setClaudeCacheUsage(out, cachedTokens, cacheCreationTokens)
+ 	}
+ 
+ 	return [][]byte{out}
+@@ -754,12 +750,10 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
+ 	}
+ 
+ 	if respUsage := root.Get("usage"); respUsage.Exists() {
+-		inputTokens, outputTokens, cachedTokens := extractOpenAIUsage(respUsage)
++		inputTokens, outputTokens, cachedTokens, cacheCreationTokens := extractOpenAIUsage(respUsage)
+ 		out, _ = sjson.SetBytes(out, "usage.input_tokens", inputTokens)
+ 		out, _ = sjson.SetBytes(out, "usage.output_tokens", outputTokens)
+-		if cachedTokens > 0 {
+-			out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
+-		}
++		out = setClaudeCacheUsage(out, cachedTokens, cacheCreationTokens)
+ 	}
+ 
+ 	if !stopReasonSet {
+@@ -777,22 +771,42 @@ func ClaudeTokenCount(ctx context.Context, count int64) []byte {
+ 	return translatorcommon.ClaudeInputTokensJSON(count)
+ }
+ 
+-func extractOpenAIUsage(usage gjson.Result) (int64, int64, int64) {
++// extractOpenAIUsage splits an OpenAI usage block into the Anthropic counters.
++// OpenAI counts prompt_tokens as the whole prompt with the cache figures as
++// subsets of it; Anthropic reports the three as disjoint, so both cache
++// counters come out of input_tokens.
++func extractOpenAIUsage(usage gjson.Result) (inputTokens, outputTokens, cachedTokens, cacheCreationTokens int64) {
+ 	if !usage.Exists() || usage.Type == gjson.Null {
+-		return 0, 0, 0
++		return 0, 0, 0, 0
+ 	}
+ 
+-	inputTokens := usage.Get("prompt_tokens").Int()
+-	outputTokens := usage.Get("completion_tokens").Int()
+-	cachedTokens := usage.Get("prompt_tokens_details.cached_tokens").Int()
++	inputTokens = usage.Get("prompt_tokens").Int()
++	outputTokens = usage.Get("completion_tokens").Int()
++	cachedTokens = usage.Get("prompt_tokens_details.cached_tokens").Int()
++	cacheCreationTokens = usage.Get("prompt_tokens_details.cache_creation_tokens").Int()
+ 
+-	if cachedTokens > 0 {
+-		if inputTokens >= cachedTokens {
+-			inputTokens -= cachedTokens
++	for _, cached := range [...]int64{cachedTokens, cacheCreationTokens} {
++		if cached <= 0 {
++			continue
++		}
++		if inputTokens >= cached {
++			inputTokens -= cached
+ 		} else {
+ 			inputTokens = 0
+ 		}
+ 	}
+ 
+-	return inputTokens, outputTokens, cachedTokens
++	return inputTokens, outputTokens, cachedTokens, cacheCreationTokens
++}
++
++// setClaudeCacheUsage writes the cache counters Anthropic clients read. A
++// counter that is zero is left off, the way the Anthropic API omits it.
++func setClaudeCacheUsage(out []byte, cachedTokens, cacheCreationTokens int64) []byte {
++	if cachedTokens > 0 {
++		out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
++	}
++	if cacheCreationTokens > 0 {
++		out, _ = sjson.SetBytes(out, "usage.cache_creation_input_tokens", cacheCreationTokens)
++	}
++	return out
+ }
+-- 
+2.43.0
+
