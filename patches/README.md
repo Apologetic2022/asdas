@@ -217,6 +217,35 @@ warm  input_tokens=2  output=3  cache_read=45651  cache_creation=128    quota=47
 Both rows fit `quota = input + read×0.1 + create×1.25 + out×5` exactly, which is
 the correct charge including the cache-write premium.
 
+### grok never had a cache to read
+
+grok's usage rows showed cache reads and never a cache write, which looked like
+a reporting gap. It was not: grok has no cache at all. Every `turn_ended` it
+produces carries `cache_read_tokens:0` and `cache_write_tokens:0`, against
+`cache_read_tokens:18184 cache_write_tokens:8558` for claude on the same harness
+and the same prompt. The reads were manufactured here.
+
+A segment that ends at a tool pause has no upstream report to bill from, so the
+ledger estimates it, and the estimate counted everything the run had already
+sent as a cache read. That is a good guess for a provider that caches and pure
+invention for one that does not — a five-turn grok tool loop reported a 95% hit
+rate over a cache that was never touched, understating what the run cost. It
+also modelled no write, so every estimated segment read from a cache that
+nothing in the ledger had ever written to, which is the "only reads, never
+creation" shape in the usage panel.
+
+Caching is now learned per model from the reports themselves and remembered for
+later runs; until a `turn_ended` shows cache activity, an estimate charges the
+whole prompt as input. For a model that does cache, the prefix already sent is
+the read and the growth beyond it is the write. After the fix a grok tool loop
+reports 0.0% across every turn and claude is unchanged at 63%.
+
+The closing segment needed a cap as well. It receives whatever the estimates got
+wrong plus the cache belonging to segments it never served, and was billing a
+44,658-token turn with a 56,560-token cache read — a 127% hit rate and a
+negative fresh-input figure once downstream subtracted. Cache is a subset of the
+prompt that carried it, so it is capped there.
+
 **The steering never named the substitute tool.** It said only that
 `mcp_`-prefixed tools work, leaving the model to work out that `mcp_Bash` is the
 shell it wanted. It does not: it calls the built-in `Shell`, gets refused, and

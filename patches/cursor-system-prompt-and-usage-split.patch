@@ -1,7 +1,7 @@
 From 30893555081e24d96c807ca7789c927c60f4f0f7 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:14:42 +0000
-Subject: [PATCH 1/6] cursor: report the four token classes as disjoint parts
+Subject: [PATCH 1/7] cursor: report the four token classes as disjoint parts
 
 The statistics store counts input, output, cache read and cache creation
 as disjoint and totals them by addition, the way every other executor
@@ -104,7 +104,7 @@ index 3a19fd0e..24b7ea20 100644
 From f62c023cabd5b5809283e73d0ce186744b043661 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:14:42 +0000
-Subject: [PATCH 2/6] cursor: deliver client system instructions where the
+Subject: [PATCH 2/7] cursor: deliver client system instructions where the
  harness reads them
 
 A system message from the client was emitted as a system row in the
@@ -290,7 +290,7 @@ index 00000000..c4d88586
 From ede7abb2a5092e29671c413644c43dd00cafe8b3 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:14:42 +0000
-Subject: [PATCH 3/6] cursor: refuse unbacked built-in tools uniformly
+Subject: [PATCH 3/7] cursor: refuse unbacked built-in tools uniformly
 
 Write answered success for files nothing could read back and Read
 answered file-not-found, so a run would write a file, fail to read it,
@@ -474,7 +474,7 @@ index 155678ca..a5a5ac74 100644
 From 0a4b49577d17c7c35ce60ad17be60da0997e0af1 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:31:48 +0000
-Subject: [PATCH 4/6] cursor: report the cache write where gateways actually
+Subject: [PATCH 4/7] cursor: report the cache write where gateways actually
  read it
 
 OpenAI has no field for a cache write, so the counter only reaches a
@@ -570,7 +570,7 @@ index 24b7ea20..5dafc60b 100644
 From dfa817754e51079e2e3031c3b0d18046d4b96c75 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:41:09 +0000
-Subject: [PATCH 5/6] cursor: keep Claude-shaped counters out of the OpenAI
+Subject: [PATCH 5/7] cursor: keep Claude-shaped counters out of the OpenAI
  usage payload
 
 Reporting claude_cache_creation_5_m_tokens beside prompt_tokens made the
@@ -680,7 +680,7 @@ index 5dafc60b..b6919799 100644
 From bc5cfd0eec424aca51e3ba50eb870acbb2ee173d Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:41:09 +0000
-Subject: [PATCH 6/6] cursor: name the MCP tool that replaces each built-in
+Subject: [PATCH 6/7] cursor: name the MCP tool that replaces each built-in
 
 The steering said only that mcp_-prefixed tools work, which leaves the
 model to guess that mcp_Bash is the shell it wanted. It guesses wrong:
@@ -790,6 +790,316 @@ index c4d88586..f7309c56 100644
 +		}
 +	}
 +}
+-- 
+2.43.0
+
+
+From 722cbcf977bea0505901e475fae5c23695da4122 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 10:57:17 +0000
+Subject: [PATCH 7/7] cursor: stop inventing a cache for providers that never
+ report one
+
+A segment that ends at a tool pause is billed from an estimate, and the
+estimate attributed everything the run had already sent to a cache read.
+For grok that is fiction: every turn_ended it produces carries
+cache_read_tokens:0 and cache_write_tokens:0, yet a five-turn tool loop
+reported a 95% hit rate and, because the estimate models no write at all,
+did it with reads against a cache nothing had written to. The run was
+billed as mostly cached when none of it was.
+
+Whether a provider caches is learned from its own reports and remembered
+per model; until one says so, an estimate charges the whole prompt as
+input. For a model that does cache, the prefix already sent is the read
+and the growth beyond it is the write, which is the shape a real
+turn_ended has.
+
+The closing segment also had to be capped. It absorbs whatever the
+estimates guessed wrong plus the cache of segments it did not serve, and
+was billing a 44658-token turn with a 56560-token cache read: a 127% hit
+rate and a negative fresh-input figure. Cache is a subset of the prompt
+that carried it.
+---
+ internal/cursor/session.go            |  1 +
+ internal/cursor/session_usage_test.go |  2 +
+ internal/cursor/usage.go              | 90 +++++++++++++++++++++++----
+ internal/cursor/usage_test.go         | 78 ++++++++++++++++++++---
+ 4 files changed, 153 insertions(+), 18 deletions(-)
+
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index f5a39500..818c7279 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -410,6 +410,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 	session.ID = uuid.NewString()
+ 	session.ConversationID = conversationID
+ 	session.Model = selection.ModelID
++	session.usage.model = selection.ModelID
+ 	session.renameToolsOnWire = claudeWireModel(selection.ModelID)
+ 	session.stream = stream
+ 	session.blobStore = blobStore
+diff --git a/internal/cursor/session_usage_test.go b/internal/cursor/session_usage_test.go
+index 2c48cf8d..87d104da 100644
+--- a/internal/cursor/session_usage_test.go
++++ b/internal/cursor/session_usage_test.go
+@@ -31,6 +31,8 @@ func drainEvents(t *testing.T, s *Session) []StreamEvent {
+ // segments must report it as a cache read.
+ func TestToolPauseSegmentsAlwaysReportUsage(t *testing.T) {
+ 	session := newUsageSession(40000)
++	// Only a provider already seen caching gets a cache split in an estimate.
++	session.usage.model = knownCachingModel(t)
+ 	session.outputChars = 120
+ 	session.endSegment("tool_calls")
+ 
+diff --git a/internal/cursor/usage.go b/internal/cursor/usage.go
+index a9de574f..ca012492 100644
+--- a/internal/cursor/usage.go
++++ b/internal/cursor/usage.go
+@@ -1,6 +1,11 @@
+ package cursor
+ 
+-import "encoding/json"
++import (
++	"encoding/json"
++	"sync"
++
++	log "github.com/sirupsen/logrus"
++)
+ 
+ // TokenUsage is a Cursor token breakdown. Despite the Anthropic-looking field
+ // names the counters are not disjoint: a turn_ended reporting
+@@ -56,10 +61,14 @@ type runUsage struct {
+ 	// A resumed segment resends that prefix, which the provider serves from
+ 	// its cache, so only the growth beyond it is a fresh read.
+ 	sentPrompt int64
++	// model is the wire model this run is talking to, used to look up whether
++	// the provider behind it has ever been seen caching anything.
++	model string
+ }
+ 
+ // upstream reduces a run-cumulative report to the part not yet billed.
+ func (r *runUsage) upstream(total TokenUsage, prompt int64) TokenUsage {
++	noteCacheBehaviour(r.model, total)
+ 	segment := TokenUsage{
+ 		InputTokens:      remaining(total.InputTokens, r.billed.InputTokens),
+ 		OutputTokens:     remaining(total.OutputTokens, r.billed.OutputTokens),
+@@ -67,22 +76,55 @@ func (r *runUsage) upstream(total TokenUsage, prompt int64) TokenUsage {
+ 		CacheWriteTokens: remaining(total.CacheWriteTokens, r.billed.CacheWriteTokens),
+ 		ReasoningTokens:  remaining(total.ReasoningTokens, r.billed.ReasoningTokens),
+ 	}
++	// Whatever the estimates guessed wrong about lands here, and the cumulative
++	// report covers segments this one did not serve, so the leftover cache can
++	// exceed this segment's own prompt. Left alone that bills a 44,658-token
++	// turn with a 56,560-token cache read, which reads as a 127% hit rate and a
++	// negative fresh-input figure. A segment can never read or write more cache
++	// than the prompt it sent, so cap it there; the shortfall is a rounding
++	// error against the run, not a row nobody can interpret.
++	segment.clampCacheToPrompt()
+ 	r.record(segment, prompt)
+ 	return segment
+ }
+ 
+-// estimate bills a segment that ended before any report arrived. The prefix
+-// the run already sent is counted as a cache read within the prompt, matching
+-// how Cursor reports a warm turn.
+-func (r *runUsage) estimate(prompt, output int64) TokenUsage {
+-	cached := r.sentPrompt
+-	if cached > prompt {
+-		cached = prompt
++// clampCacheToPrompt keeps the two cache counters within the prompt they are
++// subsets of, preferring to keep the read, which is the cheaper of the two and
++// the one a caller is most likely to be checking.
++func (u *TokenUsage) clampCacheToPrompt() {
++	room := u.PromptTokens()
++	if u.CacheReadTokens > room {
++		u.CacheReadTokens = room
++	}
++	if room -= u.CacheReadTokens; u.CacheWriteTokens > room {
++		u.CacheWriteTokens = room
+ 	}
++}
++
++// estimate bills a segment that ended before any report arrived.
++//
++// Only models the provider actually caches get a cache split. Attributing the
++// resent prefix to the cache unconditionally invented an entire cache column
++// for models that never cache: grok runs reported a 95% hit rate across a tool
++// loop while every turn_ended for them carries cache_read_tokens:0 and
++// cache_write_tokens:0. It also only ever produced reads, so a caching model
++// looked like it read a cache nothing had ever written to.
++//
++// For a model that does cache, the prefix already sent is a read and the growth
++// beyond it is what the provider writes to the cache on this turn, which is the
++// shape a real turn_ended reports.
++func (r *runUsage) estimate(prompt, output int64) TokenUsage {
+ 	segment := TokenUsage{
+-		InputTokens:     prompt,
+-		OutputTokens:    output,
+-		CacheReadTokens: cached,
++		InputTokens:  prompt,
++		OutputTokens: output,
++	}
++	if providerCaches(r.model) {
++		read := r.sentPrompt
++		if read > prompt {
++			read = prompt
++		}
++		segment.CacheReadTokens = read
++		segment.CacheWriteTokens = prompt - read
+ 	}
+ 	r.record(segment, prompt)
+ 	return segment
+@@ -95,6 +137,32 @@ func (r *runUsage) record(segment TokenUsage, prompt int64) {
+ 	}
+ }
+ 
++// Whether a model's provider caches prompts is not something the run can know
++// before its first report arrives, and Cursor exposes no capability flag for
++// it, so it is learned from the reports themselves and remembered for the next
++// run. A model is assumed not to cache until one of its turn_ended frames says
++// otherwise: claiming a cache that never existed understates the cost of every
++// segment, whereas the opposite error corrects itself on the closing segment,
++// where the cumulative report reconciles what the estimates already billed.
++var cachingProviders sync.Map // model -> struct{}
++
++func noteCacheBehaviour(model string, total TokenUsage) {
++	if model == "" || (total.CacheReadTokens == 0 && total.CacheWriteTokens == 0) {
++		return
++	}
++	if _, loaded := cachingProviders.LoadOrStore(model, struct{}{}); !loaded {
++		log.Debugf("cursor usage: %s reported cache activity, estimates for it may now split the prompt", model)
++	}
++}
++
++func providerCaches(model string) bool {
++	if model == "" {
++		return false
++	}
++	_, ok := cachingProviders.Load(model)
++	return ok
++}
++
+ func remaining(total, billed int64) int64 {
+ 	if total <= billed {
+ 		return 0
+diff --git a/internal/cursor/usage_test.go b/internal/cursor/usage_test.go
+index 1eeaeb0c..108b2633 100644
+--- a/internal/cursor/usage_test.go
++++ b/internal/cursor/usage_test.go
+@@ -6,17 +6,23 @@ import "testing"
+ // estimate, and the cumulative TurnEnded that closes the run only adds what
+ // those estimates missed, so the run totals Cursor's own numbers exactly.
+ func TestRunUsageReconcilesEstimatesWithCumulativeReport(t *testing.T) {
+-	var run runUsage
++	run := runUsage{model: knownCachingModel(t)}
+ 
+ 	first := run.estimate(40000, 30)
+ 	if first.InputTokens != 40000 || first.CacheReadTokens != 0 {
+ 		t.Fatalf("cold segment = %+v, want the whole prompt read fresh", first)
+ 	}
++	if first.CacheWriteTokens != 40000 {
++		t.Fatalf("cold segment cache write = %d, want the whole prompt written to cache", first.CacheWriteTokens)
++	}
+ 
+ 	second := run.estimate(42000, 25)
+ 	if second.CacheReadTokens != 40000 {
+ 		t.Fatalf("resumed segment cache read = %d, want the 40000 prefix already sent", second.CacheReadTokens)
+ 	}
++	if second.CacheWriteTokens != 2000 {
++		t.Fatalf("resumed segment cache write = %d, want the 2000 of growth", second.CacheWriteTokens)
++	}
+ 	if second.InputTokens != 42000 {
+ 		t.Fatalf("resumed segment prompt = %d, want the whole prompt, cache included", second.InputTokens)
+ 	}
+@@ -26,24 +32,82 @@ func TestRunUsageReconcilesEstimatesWithCumulativeReport(t *testing.T) {
+ 	if got, want := final.InputTokens, int64(130000-82000); got != want {
+ 		t.Fatalf("final input = %d, want %d", got, want)
+ 	}
+-	if got, want := final.CacheReadTokens, int64(120000-40000); got != want {
+-		t.Fatalf("final cache read = %d, want %d", got, want)
+-	}
+ 	if got, want := final.OutputTokens, int64(4000-55); got != want {
+ 		t.Fatalf("final output = %d, want %d", got, want)
+ 	}
++	// The 80000 of cache the estimates did not claim is more than this segment's
++	// own 48000-token prompt, and a segment cannot read more cache than it sent.
++	if got := final.CacheReadTokens; got != 48000 {
++		t.Fatalf("final cache read = %d, want it capped at the 48000 prompt", got)
++	}
+ 
+ 	if run.billed.InputTokens != total.InputTokens ||
+-		run.billed.CacheReadTokens != total.CacheReadTokens ||
+ 		run.billed.OutputTokens != total.OutputTokens {
+-		t.Fatalf("run billed %+v, want it to add up to the cumulative report %+v", run.billed, total)
++		t.Fatalf("run billed %+v, want input and output to add up to %+v", run.billed, total)
++	}
++}
++
++// No segment may claim to have read or written more cache than the prompt it
++// sent: downstream subtracts the two from the prompt to get the fresh input,
++// and an overflowing row shows up as a >100% hit rate and negative input.
++func TestSegmentNeverReportsMoreCacheThanItsPrompt(t *testing.T) {
++	run := runUsage{model: knownCachingModel(t)}
++	run.estimate(12499, 15)
++
++	final := run.upstream(TokenUsage{InputTokens: 57157, OutputTokens: 84, CacheReadTokens: 56560}, 44658)
++	if sum := final.CacheReadTokens + final.CacheWriteTokens; sum > final.PromptTokens() {
++		t.Fatalf("cache %d exceeds the segment prompt %d", sum, final.PromptTokens())
++	}
++}
++
++// knownCachingModel returns a model name the ledger has already seen caching,
++// which is the precondition for an estimate to split the prompt at all.
++func knownCachingModel(t *testing.T) string {
++	t.Helper()
++	name := "caching-" + t.Name()
++	noteCacheBehaviour(name, TokenUsage{CacheReadTokens: 1})
++	t.Cleanup(func() { cachingProviders.Delete(name) })
++	return name
++}
++
++// grok reports cache_read_tokens:0 and cache_write_tokens:0 on every
++// turn_ended. Attributing the resent prefix to a cache anyway invented a whole
++// cache column for it — a measured 95% hit rate across a tool loop that never
++// touched a cache — and understated what the run actually cost.
++func TestEstimateInventsNoCacheForAProviderThatNeverReportsOne(t *testing.T) {
++	run := runUsage{model: "grok-4.6-" + t.Name()}
++
++	run.estimate(12499, 51)
++	second := run.estimate(13147, 33)
++
++	if second.CacheReadTokens != 0 || second.CacheWriteTokens != 0 {
++		t.Fatalf("segment = %+v, want no cache attributed at all", second)
++	}
++	if second.InputTokens != 13147 {
++		t.Fatalf("input = %d, want the whole prompt charged as input", second.InputTokens)
++	}
++}
++
++// A report carrying cache is what teaches the ledger that this model's provider
++// caches, so later runs of the same model may split their estimates.
++func TestUpstreamReportTeachesTheLedgerThatAModelCaches(t *testing.T) {
++	name := "learner-" + t.Name()
++	t.Cleanup(func() { cachingProviders.Delete(name) })
++
++	if providerCaches(name) {
++		t.Fatal("a model must not be assumed to cache before anything says so")
++	}
++	run := runUsage{model: name}
++	run.upstream(TokenUsage{InputTokens: 500, CacheReadTokens: 400}, 500)
++	if !providerCaches(name) {
++		t.Fatal("a report carrying a cache read should have been remembered")
+ 	}
+ }
+ 
+ // Estimates that overshoot the cumulative report must not bill a negative
+ // segment, and must not be topped up again by the report.
+ func TestRunUsageClampsOvershootingEstimates(t *testing.T) {
+-	var run runUsage
++	run := runUsage{model: knownCachingModel(t)}
+ 	run.estimate(100000, 500)
+ 
+ 	final := run.upstream(TokenUsage{InputTokens: 10000, OutputTokens: 100}, 100000)
 -- 
 2.43.0
 
