@@ -217,13 +217,19 @@ warm  input_tokens=2  output=3  cache_read=45651  cache_creation=128    quota=47
 Both rows fit `quota = input + read×0.1 + create×1.25 + out×5` exactly, which is
 the correct charge including the cache-write premium.
 
-### grok never had a cache to read
+### grok's estimated cache was manufactured
+
+> Superseded in part by the next section. The reads described here were indeed
+> invented, but the conclusion that grok cannot cache was wrong: the frames read
+> `0` because the requests were going to the fast tier. The estimator fix below
+> stands, and the learning it introduced is what lets grok report a real cache
+> once it is off that tier.
 
 grok's usage rows showed cache reads and never a cache write, which looked like
-a reporting gap. It was not: grok has no cache at all. Every `turn_ended` it
-produces carries `cache_read_tokens:0` and `cache_write_tokens:0`, against
-`cache_read_tokens:18184 cache_write_tokens:8558` for claude on the same harness
-and the same prompt. The reads were manufactured here.
+a reporting gap. Every `turn_ended` it produced carried `cache_read_tokens:0`
+and `cache_write_tokens:0`, against `cache_read_tokens:18184
+cache_write_tokens:8558` for claude on the same harness and the same prompt. The
+reads were manufactured here.
 
 A segment that ends at a tool pause has no upstream report to bill from, so the
 ledger estimates it, and the estimate counted everything the run had already
@@ -237,8 +243,7 @@ creation" shape in the usage panel.
 Caching is now learned per model from the reports themselves and remembered for
 later runs; until a `turn_ended` shows cache activity, an estimate charges the
 whole prompt as input. For a model that does cache, the prefix already sent is
-the read and the growth beyond it is the write. After the fix a grok tool loop
-reports 0.0% across every turn and claude is unchanged at 63%.
+the read and the growth beyond it is the write.
 
 The closing segment needed a cap as well. It receives whatever the estimates got
 wrong plus the cache belonging to segments it never served, and was billing a
@@ -257,3 +262,68 @@ needed)`) and listing the built-ins by name; that wording is restored. Verify
 with `tests/colliding_tools_probe.py`, which registers tools called Bash, Write
 and Read — shadowing built-ins of the same name — and fails if the model touches
 a built-in.
+
+## Against the system-prompt/usage-split patch (base `722cbcf9`)
+
+`cursor-grok-fast-tier-and-cache-shape.patch`
+
+Apply last. It corrects the previous section: grok can cache, and caches very
+well. It was never being asked to.
+
+**Every grok request was going to the fast tier.** Cursor's catalog ships grok
+with `fast=true` already selected in the default variant, and the wire-id picker
+penalised only one direction of the mismatch — wanting fast and not getting it
+cost 5 points, while getting a fast variant nobody asked for cost nothing. So
+`grok-4.6` resolved to `cursor-grok-4.6-high-fast` for every caller, at score
+105. The fast tier is a different serving that answers without prompt caching,
+which is why the raw frames showed nothing to report:
+
+```
+requested "grok-4.6" -> wire "cursor-grok-4.6-high-fast"
+turn_ended:{input_tokens:31217 cache_read_tokens:0 cache_write_tokens:0}
+```
+
+A `fast` that came from the catalog default is now dropped rather than treated
+as a caller's choice, and an unrequested fast wire id is penalised enough that
+the effort bonus cannot select one. Dropping only the parameter — rather than
+discarding the whole variant, which was tried first — keeps the rest of the
+default, so the reasoning effort survives; discarding the variant silently
+demoted `grok-4.6` from `high` to `low`. The `-fast` suffix still reaches the
+fast tier, and a model offered only as fast still resolves, with a warning.
+
+Off the fast tier the same probe reads 31,104 of 31,305 prompt tokens from
+cache, and the four models checked all resolve to a standard variant:
+
+```
+grok-4.6          -> cursor-grok-4.6-high
+grok-4.5          -> cursor-grok-4.5-high
+claude-sonnet-4-5 -> claude-4.5-sonnet
+claude-sonnet-5   -> claude-sonnet-5-thinking-high
+```
+
+**grok reports a read and never a write, and that is correct.** xAI reports the
+cached portion of the prompt and has no cache-creation counter, because the
+uncached remainder is billed as ordinary input rather than at a premium.
+Anthropic reports both halves. The ledger held one bit per model — does this
+provider cache — which is too coarse: it made an estimate for grok invent a
+write, and a cache-creation charge, that nobody levies. The two counters are now
+learned separately, and an estimate attributes only the halves its provider has
+actually been seen reporting; anything unattributed stays plain input.
+
+Verify with `tests/usage_four_fields_probe.py` or the multi-turn probe below.
+Streaming and non-streaming, after the fix:
+
+```
+grok-4.6           t1 prompt= 31220 read=  1152 create=     0 fresh= 30068
+grok-4.6           t2 prompt= 31356 read= 31104 create=     0 fresh=   252
+grok-4.6           t3 prompt= 31427 read= 31232 create=     0 fresh=   195
+claude-sonnet-4-5  t1 prompt= 42651 read= 42518 create=   130 fresh=     3
+claude-sonnet-4-5  t2 prompt= 42669 read= 42518 create=   148 fresh=     3
+```
+
+Through NewAPI the warm turns bill about a quarter of the cold one
+(`quota` 8031 against 30452 for the same 31k prompt), and a grok tool loop
+reports usage on 6 of 6 segments at a 95% per-turn hit rate.
+
+grok's cache is best-effort with a short TTL, so an occasional cold turn in the
+middle of a conversation is upstream behaviour rather than a regression.

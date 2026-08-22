@@ -1,0 +1,426 @@
+From ec3276019cca7c996cf55b2a53e893573227feef Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 11:16:54 +0000
+Subject: [PATCH 1/2] cursor: stop defaulting grok to the fast tier
+
+Cursor's catalog ships grok with fast=true already selected in the default
+variant, and the wire-id picker only penalised the mismatch in one direction,
+so grok-4.6 resolved to cursor-grok-4.6-high-fast for every caller. The fast
+tier is a different serving that answers without prompt caching: a 31k prompt
+came back with cache_read_tokens:0 on every turn, so the whole prompt was
+billed fresh each time.
+
+Drop a fast that came from the catalog default rather than from the caller,
+keeping the rest of the default so the reasoning effort survives, and penalise
+an unrequested fast wire id enough that the effort bonus cannot select one.
+The -fast suffix still reaches the fast tier, and a model offered only as fast
+still resolves.
+
+Measured after the change: grok-4.6 goes out as cursor-grok-4.6-high and its
+continuation turns read 31,104 of 31,323 prompt tokens from cache.
+---
+ internal/cursor/agent.go            |  5 ++
+ internal/cursor/models.go           | 56 +++++++++++++++----
+ internal/cursor/models_fast_test.go | 84 +++++++++++++++++++++++++++++
+ 3 files changed, 134 insertions(+), 11 deletions(-)
+ create mode 100644 internal/cursor/models_fast_test.go
+
+diff --git a/internal/cursor/agent.go b/internal/cursor/agent.go
+index 1ad10f15..e91ec205 100644
+--- a/internal/cursor/agent.go
++++ b/internal/cursor/agent.go
+@@ -572,6 +572,11 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 		actionText = strings.TrimRight(actionText, "\n") + "\n\n[Tool constraint: " + note + "]"
+ 	}
+ 
++	// Which serving a request lands on is otherwise invisible, and it decides
++	// whether the prompt is cached at all.
++	log.Debugf("cursor run: requested %q -> wire %q (variant-string=%t, params=%v)",
++		model, selection.ModelID, selection.VariantStringRepr, selection.Parameters)
++
+ 	conversationID := uuid.NewString()
+ 	// Desktop / cursor2api do not set exclude_workspace_context by default;
+ 	// forcing it true is rejected for many accounts ("Workspace context
+diff --git a/internal/cursor/models.go b/internal/cursor/models.go
+index b2052d7b..4efcadea 100644
+--- a/internal/cursor/models.go
++++ b/internal/cursor/models.go
+@@ -12,6 +12,7 @@ import (
+ 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+ 	aiserverv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/aiserver/v1"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	log "github.com/sirupsen/logrus"
+ )
+ 
+ const (
+@@ -244,8 +245,14 @@ func matchUsableWireID(model CatalogModel, usable []usableModel) string {
+ 		hasFast := strings.Contains(idFold, "-fast")
+ 		if wantFast == hasFast {
+ 			score += 10
+-		} else if wantFast && !hasFast {
+-			score -= 5
++		} else {
++			// A -fast variant nobody asked for used to cost nothing here, so an
++			// effort match (+15) was enough to select one over the plain model.
++			// That is not a free speed-up: the fast tier is a different model
++			// serving, and on grok it comes back with no prompt caching at all.
++			// The penalty has to outweigh every other bonus so the variant is
++			// only ever chosen when it was actually requested.
++			score -= 30
+ 		}
+ 		if wantEffort != "" {
+ 			if strings.Contains(idFold, "-"+wantEffort) || strings.HasSuffix(idFold, wantEffort) {
+@@ -261,6 +268,13 @@ func matchUsableWireID(model CatalogModel, usable []usableModel) string {
+ 		}
+ 	}
+ 	if best.score >= 40 {
++		if strings.Contains(strings.ToLower(best.id), "-fast") && !wantFast {
++			// Nothing else matched, so the fast tier is all this account can
++			// reach for the model. Say so: it is the difference between a
++			// cached prompt and an uncached one, and it is otherwise invisible.
++			log.Warnf("cursor models: %q resolves to the fast variant %q because no standard variant is available", publicID, best.id)
++		}
++		log.Debugf("cursor models: %q -> wire %q (score %d)", publicID, best.id, best.score)
+ 		return best.id
+ 	}
+ 	return ""
+@@ -306,7 +320,7 @@ func normalizeAvailableModels(resp *aiserverv1.AvailableModelsResponse) []Catalo
+ 			ContextLimit: int(model.GetContextTokenLimit()),
+ 		}
+ 		if resp.GetUseModelParameters() && params != nil {
+-			entry.Parameters = params
++			entry.Parameters = dropFastDefault(params)
+ 		}
+ 		byID[id] = entry
+ 	}
+@@ -347,14 +361,7 @@ func defaultVariant(model *aiserverv1.AvailableModelsResponse_AvailableModel) *a
+ 			nonMax = append(nonMax, variant)
+ 		}
+ 	}
+-	parameterValue := func(variant *aiserverv1.AvailableModelsResponse_ModelVariantConfig, id string) string {
+-		for _, item := range variant.GetParameterValues() {
+-			if item.GetId() == id {
+-				return item.GetValue()
+-			}
+-		}
+-		return ""
+-	}
++	parameterValue := variantParameterValue
+ 	if thinkingSupported {
+ 		thinkingVariants := make([]*aiserverv1.AvailableModelsResponse_ModelVariantConfig, 0)
+ 		for _, variant := range nonMax {
+@@ -382,6 +389,33 @@ func defaultVariant(model *aiserverv1.AvailableModelsResponse_AvailableModel) *a
+ 	return variants[0]
+ }
+ 
++func variantParameterValue(variant *aiserverv1.AvailableModelsResponse_ModelVariantConfig, id string) string {
++	for _, item := range variant.GetParameterValues() {
++		if item.GetId() == id {
++			return item.GetValue()
++		}
++	}
++	return ""
++}
++
++// dropFastDefault removes a fast=true that came from the catalog's default
++// variant. Cursor ships grok with the fast tier pre-selected, which is a
++// different serving: it answers without prompt caching, so a long prompt is
++// billed fresh on every turn. Dropping the parameter keeps the rest of the
++// default (notably the reasoning effort) and lets the plain wire id be chosen;
++// callers who do want the fast tier still get it via the -fast suffix, which
++// sets the parameter explicitly.
++func dropFastDefault(params []ModelParameter) []ModelParameter {
++	out := params[:0]
++	for _, p := range params {
++		if strings.EqualFold(strings.TrimSpace(p.ID), "fast") {
++			continue
++		}
++		out = append(out, p)
++	}
++	return out
++}
++
+ func booleanParamValues(def *aiserverv1.ModelParameterDefinition) []string {
+ 	if def == nil || def.GetParameterType() == nil {
+ 		return nil
+diff --git a/internal/cursor/models_fast_test.go b/internal/cursor/models_fast_test.go
+new file mode 100644
+index 00000000..31e8e3b2
+--- /dev/null
++++ b/internal/cursor/models_fast_test.go
+@@ -0,0 +1,84 @@
++package cursor
++
++import "testing"
++
++// The fast tier is a different serving of the model, and on grok it comes back
++// with no prompt caching at all, so it must never be picked for a caller that
++// did not ask for it. It used to cost nothing in the score, which let the
++// effort bonus select it over the plain variant.
++func TestFastVariantIsNotChosenUnlessRequested(t *testing.T) {
++	usable := []usableModel{
++		{ID: "cursor-grok-4.6-high-fast"},
++		{ID: "cursor-grok-4.6-high"},
++	}
++
++	plain := CatalogModel{ID: "grok-4.6", Parameters: []ModelParameter{{ID: "effort", Value: "high"}}}
++	if got := matchUsableWireID(plain, usable); got != "cursor-grok-4.6-high" {
++		t.Fatalf("wire id = %q, want the non-fast variant", got)
++	}
++
++	// Reversing the catalog order must not change the answer.
++	if got := matchUsableWireID(plain, []usableModel{usable[1], usable[0]}); got != "cursor-grok-4.6-high" {
++		t.Fatalf("wire id = %q with the list reversed, want the non-fast variant", got)
++	}
++}
++
++func TestFastVariantIsChosenWhenRequested(t *testing.T) {
++	usable := []usableModel{
++		{ID: "cursor-grok-4.6-high"},
++		{ID: "cursor-grok-4.6-high-fast"},
++	}
++	asked := CatalogModel{ID: "grok-4.6", Parameters: []ModelParameter{
++		{ID: "effort", Value: "high"},
++		{ID: "fast", Value: "true"},
++	}}
++	if got := matchUsableWireID(asked, usable); got != "cursor-grok-4.6-high-fast" {
++		t.Fatalf("wire id = %q, want the fast variant the caller asked for", got)
++	}
++}
++
++// If the fast tier is the only thing the account can reach, it is still better
++// than failing the request outright.
++func TestFastVariantIsStillUsedWhenItIsTheOnlyOne(t *testing.T) {
++	usable := []usableModel{{ID: "cursor-grok-4.6-high-fast"}}
++	plain := CatalogModel{ID: "grok-4.6"}
++	if got := matchUsableWireID(plain, usable); got != "cursor-grok-4.6-high-fast" {
++		t.Fatalf("wire id = %q, want the only available variant", got)
++	}
++}
++
++// Cursor ships grok with the fast tier pre-selected in the catalog default.
++// Only the fast flag may be dropped: the reasoning effort that came with the
++// same default has to survive, or the model is silently downgraded.
++func TestCatalogDefaultDropsFastButKeepsEffort(t *testing.T) {
++	params := []ModelParameter{
++		{ID: "fast", Value: "true"},
++		{ID: "effort", Value: "high"},
++		{ID: "thinking", Value: "true"},
++	}
++	got := dropFastDefault(params)
++	for _, p := range got {
++		if p.ID == "fast" {
++			t.Fatal("fast survived the catalog default")
++		}
++	}
++	if len(got) != 2 || got[0].ID != "effort" || got[0].Value != "high" || got[1].ID != "thinking" {
++		t.Fatalf("effort/thinking did not survive: %v", got)
++	}
++}
++
++// The whole point of dropping the flag is that the plain wire id then wins.
++func TestGrokDefaultLandsOnTheStandardHighVariant(t *testing.T) {
++	usable := []usableModel{
++		{ID: "cursor-grok-4.6-high-fast"},
++		{ID: "cursor-grok-4.6-high"},
++		{ID: "cursor-grok-4.6-low"},
++	}
++	entry := CatalogModel{ID: "grok-4.6", Parameters: dropFastDefault([]ModelParameter{
++		{ID: "fast", Value: "true"},
++		{ID: "effort", Value: "high"},
++	})}
++	if got := matchUsableWireID(entry, usable); got != "cursor-grok-4.6-high" {
++		t.Fatalf("wire id = %q, want cursor-grok-4.6-high", got)
++	}
++}
+-- 
+2.43.0
+
+
+From 22792aebd2ea4d8c2ab5f51721fd3c4556535b50 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 11:16:54 +0000
+Subject: [PATCH 2/2] cursor: learn cache reads and writes separately per
+ provider
+
+The ledger recorded one bit per model: does this provider cache. That is too
+coarse. Anthropic reports both halves, while xAI reports only the cached
+portion of the prompt and never a write, because the uncached remainder is
+billed as ordinary input rather than at a cache-creation premium. Estimating
+the write half for grok invented a premium nobody charges.
+
+Track the two counters separately and let an estimate attribute only the halves
+its provider has actually been seen reporting; anything unattributed stays
+plain input, which is how it is priced.
+---
+ internal/cursor/usage.go      | 62 ++++++++++++++++++++++++-----------
+ internal/cursor/usage_test.go | 34 ++++++++++++++-----
+ 2 files changed, 68 insertions(+), 28 deletions(-)
+
+diff --git a/internal/cursor/usage.go b/internal/cursor/usage.go
+index ca012492..c6e8e911 100644
+--- a/internal/cursor/usage.go
++++ b/internal/cursor/usage.go
+@@ -103,28 +103,30 @@ func (u *TokenUsage) clampCacheToPrompt() {
+ 
+ // estimate bills a segment that ended before any report arrived.
+ //
+-// Only models the provider actually caches get a cache split. Attributing the
+-// resent prefix to the cache unconditionally invented an entire cache column
+-// for models that never cache: grok runs reported a 95% hit rate across a tool
+-// loop while every turn_ended for them carries cache_read_tokens:0 and
+-// cache_write_tokens:0. It also only ever produced reads, so a caching model
+-// looked like it read a cache nothing had ever written to.
+-//
+-// For a model that does cache, the prefix already sent is a read and the growth
+-// beyond it is what the provider writes to the cache on this turn, which is the
+-// shape a real turn_ended reports.
++// The split follows whatever the model's provider has been seen reporting, one
++// counter at a time. Attributing the resent prefix to the cache unconditionally
++// invented a cache column for models that never cache, and inventing the write
++// half for a provider that only reports reads bills a cache-creation premium
++// that xAI never charges. So the prefix already sent counts as a read only for
++// a provider that reports reads, and the growth beyond it counts as a write
++// only for a provider that reports writes; anything not attributed stays plain
++// input, which is how it is priced.
+ func (r *runUsage) estimate(prompt, output int64) TokenUsage {
+ 	segment := TokenUsage{
+ 		InputTokens:  prompt,
+ 		OutputTokens: output,
+ 	}
+-	if providerCaches(r.model) {
++	if shape := providerCacheShape(r.model); shape.reads || shape.writes {
+ 		read := r.sentPrompt
+ 		if read > prompt {
+ 			read = prompt
+ 		}
+-		segment.CacheReadTokens = read
+-		segment.CacheWriteTokens = prompt - read
++		if shape.reads {
++			segment.CacheReadTokens = read
++		}
++		if shape.writes {
++			segment.CacheWriteTokens = prompt - read
++		}
+ 	}
+ 	r.record(segment, prompt)
+ 	return segment
+@@ -144,23 +146,43 @@ func (r *runUsage) record(segment TokenUsage, prompt int64) {
+ // otherwise: claiming a cache that never existed understates the cost of every
+ // segment, whereas the opposite error corrects itself on the closing segment,
+ // where the cumulative report reconciles what the estimates already billed.
+-var cachingProviders sync.Map // model -> struct{}
++// cacheShape records what a model's provider has actually been seen reporting.
++// The two counters are learned separately because they do not travel together:
++// Anthropic reports both a read and a write, while xAI reports only the cached
++// portion of the prompt and never a write, since it has no premium
++// cache-creation charge for the rest. Estimating a write for grok would invent
++// a cost the provider never billed.
++type cacheShape struct {
++	reads  bool
++	writes bool
++}
++
++var cachingProviders sync.Map // model -> cacheShape
+ 
+ func noteCacheBehaviour(model string, total TokenUsage) {
+ 	if model == "" || (total.CacheReadTokens == 0 && total.CacheWriteTokens == 0) {
+ 		return
+ 	}
+-	if _, loaded := cachingProviders.LoadOrStore(model, struct{}{}); !loaded {
+-		log.Debugf("cursor usage: %s reported cache activity, estimates for it may now split the prompt", model)
++	shape := providerCacheShape(model)
++	seen := shape
++	shape.reads = shape.reads || total.CacheReadTokens > 0
++	shape.writes = shape.writes || total.CacheWriteTokens > 0
++	if shape != seen {
++		cachingProviders.Store(model, shape)
++		log.Debugf("cursor usage: %s reports cache reads=%t writes=%t, estimates now follow", model, shape.reads, shape.writes)
+ 	}
+ }
+ 
+-func providerCaches(model string) bool {
++func providerCacheShape(model string) cacheShape {
+ 	if model == "" {
+-		return false
++		return cacheShape{}
++	}
++	if v, ok := cachingProviders.Load(model); ok {
++		if shape, ok := v.(cacheShape); ok {
++			return shape
++		}
+ 	}
+-	_, ok := cachingProviders.Load(model)
+-	return ok
++	return cacheShape{}
+ }
+ 
+ func remaining(total, billed int64) int64 {
+diff --git a/internal/cursor/usage_test.go b/internal/cursor/usage_test.go
+index 108b2633..dfa30b49 100644
+--- a/internal/cursor/usage_test.go
++++ b/internal/cursor/usage_test.go
+@@ -65,17 +65,16 @@ func TestSegmentNeverReportsMoreCacheThanItsPrompt(t *testing.T) {
+ func knownCachingModel(t *testing.T) string {
+ 	t.Helper()
+ 	name := "caching-" + t.Name()
+-	noteCacheBehaviour(name, TokenUsage{CacheReadTokens: 1})
++	noteCacheBehaviour(name, TokenUsage{CacheReadTokens: 1, CacheWriteTokens: 1})
+ 	t.Cleanup(func() { cachingProviders.Delete(name) })
+ 	return name
+ }
+ 
+-// grok reports cache_read_tokens:0 and cache_write_tokens:0 on every
+-// turn_ended. Attributing the resent prefix to a cache anyway invented a whole
+-// cache column for it — a measured 95% hit rate across a tool loop that never
+-// touched a cache — and understated what the run actually cost.
++// A provider that has never reported a cache gets none invented for it.
++// Attributing the resent prefix to a cache anyway produced a measured 95% hit
++// rate across a tool loop that never touched a cache, and understated the run.
+ func TestEstimateInventsNoCacheForAProviderThatNeverReportsOne(t *testing.T) {
+-	run := runUsage{model: "grok-4.6-" + t.Name()}
++	run := runUsage{model: "uncached-" + t.Name()}
+ 
+ 	run.estimate(12499, 51)
+ 	second := run.estimate(13147, 33)
+@@ -94,16 +93,35 @@ func TestUpstreamReportTeachesTheLedgerThatAModelCaches(t *testing.T) {
+ 	name := "learner-" + t.Name()
+ 	t.Cleanup(func() { cachingProviders.Delete(name) })
+ 
+-	if providerCaches(name) {
++	if shape := providerCacheShape(name); shape.reads || shape.writes {
+ 		t.Fatal("a model must not be assumed to cache before anything says so")
+ 	}
+ 	run := runUsage{model: name}
+ 	run.upstream(TokenUsage{InputTokens: 500, CacheReadTokens: 400}, 500)
+-	if !providerCaches(name) {
++	if !providerCacheShape(name).reads {
+ 		t.Fatal("a report carrying a cache read should have been remembered")
+ 	}
+ }
+ 
++// xAI reports the cached portion of the prompt and never a write, because the
++// uncached remainder is billed as ordinary input rather than at a
++// cache-creation premium. Estimating a write for grok invents that premium.
++func TestEstimatesFollowAProviderThatReportsReadsButNoWrites(t *testing.T) {
++	name := "grok-4.6-" + t.Name()
++	t.Cleanup(func() { cachingProviders.Delete(name) })
++
++	run := runUsage{model: name}
++	run.upstream(TokenUsage{InputTokens: 31305, CacheReadTokens: 31104}, 31305)
++
++	next := run.estimate(31376, 18)
++	if next.CacheReadTokens == 0 {
++		t.Fatal("grok reports reads, so the resent prefix should be attributed to one")
++	}
++	if next.CacheWriteTokens != 0 {
++		t.Fatalf("cache write = %d, want none for a provider that never reports one", next.CacheWriteTokens)
++	}
++}
++
+ // Estimates that overshoot the cumulative report must not bill a negative
+ // segment, and must not be topped up again by the report.
+ func TestRunUsageClampsOvershootingEstimates(t *testing.T) {
+-- 
+2.43.0
+
