@@ -406,3 +406,90 @@ full. CPA does not read the `beta` query parameter at all — the difference was
 ordering. Those were the first requests carrying that tool-laden prefix, and
 Anthropic's cache is not immediately readable after the write. Re-run warm, the
 shape reads 48,534 of 48,689 on every pass regardless of the flag.
+
+## cursor-agent-loop-cache-and-usage.patch
+
+The report was that during a task's *working* phase the context that should be
+cached was written over and over and never read, and that reading only started
+once the task finished and the model summarised. The gateway's own log agrees:
+`input 0, cache creation 42.9K, cache read 0` on the working steps, `input 2,
+cache read 80.1K` on the turns that opened and closed the task.
+
+A probe reproduced it exactly — six steps of a tool loop, each step its own
+request, each reporting its entire prompt as a cache creation:
+
+```
+step      input      read    create       sum
+1             0         0     18163     18163
+2             0         0     18241     18241
+...
+6             0         0     18344     18344
+```
+
+The same conversation *without* tools cached perfectly, which located the
+fault: a run that pauses for client tools was not resuming, so upstream got a
+fresh conversation id and genuinely re-cached the prompt every step.
+
+Three things had to be fixed, in three commits.
+
+**The checkpoint could not be found in time.** It is stored a moment after the
+reply reaches the client, and an agent's next step arrives inside that window.
+A pending marker exists precisely so a lookup waits for the in-flight store,
+but it was announced under one key while the store wrote two — and the second,
+the client's own request prefix, is the only key a client that rewrites the
+assistant turn can match, which is what agent front-ends do when they reformat
+tool calls. The boundary probe also never waited, on an assumption that only
+the turn-end transcript could be pending.
+
+**Two models fought over one key.** The cache was keyed by account alone, but a
+checkpoint is pinned upstream to the model that opened it. Agent clients open
+every conversation with the same system prompt and first user message, so
+models collided constantly: the later one overwrote the earlier one's
+checkpoint, and the loser found a checkpoint it could not use — which *also*
+vetoed the boundary probe, so it never looked for its own. The cache is now
+scoped by model, which makes the mismatch unreachable rather than handled.
+
+**The estimate invented the write.** A tool-paused segment gets no report from
+Cursor and is billed from an estimate that counts what the run has sent; a
+resumed run has sent nothing, so the whole prompt looked like growth and the
+growth was called a cache write. The Anthropic counters are disjoint, so a
+write that swallows the growth pins `input_tokens` at exactly zero — the
+`input 0 / creation 42.9K` rows — and bills each phantom write at the creation
+premium. The ledger is now seeded with the prefix the checkpoint covers, and
+writes are not estimated at all: what upstream commits to its cache is
+upstream's decision, so the growth stays plain input, and the run's closing
+report carries the real creation figure.
+
+A fourth defect surfaced while verifying: the non-streaming path never resized
+the session's prompt on a continuation, so four steps of a loop whose prompt
+grew past 16,600 tokens all reported the same 16,498 with `input 0`. Both entry
+points now share one function instead of each keeping a copy.
+
+Measured on the deployed build, every step its own request, streaming and
+non-streaming, three models — `input` is the growth this step added, `read` is
+the cached prefix, and no step invents a creation:
+
+```
+claude-opus-5 stream   1  16498      0    0   |  2   47  16498  0  |  3   78  16545  0
+claude-opus-5 block    1  16498      0    0   |  2   52  16498  0  |  3   72  16550  0
+grok-4.6      stream   1  16498      0    0   |  2   92  16498  0  |  3  153  16590  0
+```
+
+Step 1 is genuinely cold. NewAPI's own log rows agree, which is the panel the
+report came from:
+
+```
+    input    output  cache_rd  cache_wr
+    16498        26         0         0
+       39        88     16498         0
+       67       109     16537         0
+       63        89     16604         0
+        0      1263    142531     31946
+```
+
+The last row is the turn that ended without a tool call, where the cumulative
+upstream report lands and carries the real cache creation.
+
+`tests/agent_tool_loop_cache_probe.py` drives this shape. It echoes back the
+exact `tool_use` id and input the gateway emitted; a probe that invents an id
+cannot match the parked session and measures a path no real client takes.

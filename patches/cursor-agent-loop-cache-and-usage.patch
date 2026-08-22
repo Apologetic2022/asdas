@@ -1,0 +1,1243 @@
+From 4f71a16bb407aca975bdbc250b55318027594e5a Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 13:57:20 +0000
+Subject: [PATCH 1/3] cursor: let an agent's tool loop resume its conversation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An agent's next step arrives about a second after the reply, and the
+checkpoint that would let it resume lands in that window. Three things
+made it miss:
+
+The pending marker that exists to make a lookup wait for an in-flight
+store was announced under one key while the store wrote two. The second
+key is the client's own request prefix, and it is the only one a client
+that rewrites the assistant turn can match — which is what an agent
+front-end does when it reformats tool calls. Announce every key the
+store will write.
+
+The boundary probe never waited at all, on the assumption that only the
+exact turn-end transcript could be pending. With the request prefix now
+announced too, that no longer holds, so the probe notes the longest
+boundary whose store is in flight and waits for that one.
+
+The cache was keyed by account alone, but a checkpoint is a resumable
+upstream conversation and upstream pins each to the model that opened
+it. Agent clients open every conversation with the same system prompt
+and first user message, so two models routinely collided: whichever ran
+last overwrote the other's checkpoint, and the loser then found one it
+could not use and — because a model mismatch also vetoed the boundary
+probe — replayed its whole history uncached for the rest of the
+conversation. Scope the cache by model, which makes the mismatch
+unreachable rather than merely handled.
+
+Together these were why a task's working steps re-sent everything under
+a fresh upstream conversation id: on the panel every step of an agent's
+work wrote its whole prompt to cache and read none of it, while the
+plain turns that opened and closed the task cached normally.
+---
+ internal/cursor/agent.go                   |  65 +++++++++--
+ internal/cursor/conversation_cache.go      |  70 ++++++++---
+ internal/cursor/conversation_cache_test.go |  62 +++++-----
+ internal/cursor/resume_race_test.go        | 129 +++++++++++++++++++++
+ internal/cursor/session.go                 |  92 +++++++++------
+ 5 files changed, 325 insertions(+), 93 deletions(-)
+ create mode 100644 internal/cursor/resume_race_test.go
+
+diff --git a/internal/cursor/agent.go b/internal/cursor/agent.go
+index e91ec205..b235540e 100644
+--- a/internal/cursor/agent.go
++++ b/internal/cursor/agent.go
+@@ -8,6 +8,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/google/uuid"
+ 	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
+@@ -243,26 +244,68 @@ func foldTurnTailText(tail []ChatMessage) string {
+ // instruction to send. Resuming it anyway would replay the finished turn and
+ // the model would answer that stale context instead of the request in hand. A
+ // shorter boundary can still carry a real tail, so the probe keeps walking.
+-func lookupPrefixResume(accountKey, wireModelID string, messages []ChatMessage) (*convEntry, string, string, bool) {
++// The matched prefix is returned alongside the checkpoint: it is the part of
++// the transcript upstream has already been sent and will serve from its own
++// cache, which is what lets the ledger bill this turn as a read rather than as
++// a fresh write of the whole prompt.
++func lookupPrefixResume(accountKey, wireModelID string, messages []ChatMessage) (*convEntry, string, string, []ChatMessage, bool) {
++	scope := convScope(accountKey, wireModelID)
+ 	echo := echoTranscript(messages)
+ 	prefixes := conversationPrefixFingerprints(echo)
+-	for i := len(echo); i >= 1; i-- {
+-		entry, ok := defaultConversationCache.LookupNoWait(accountKey, prefixes[i])
+-		if !ok {
+-			continue
+-		}
++
++	// resolved reports what a boundary yields once its entry is in hand.
++	// stop is true when no shorter boundary can help either.
++	resolved := func(i int, entry *convEntry) (*convEntry, string, string, []ChatMessage, bool, bool) {
+ 		if entry.model != wireModelID {
+-			// The conversation is pinned to another model upstream; an older
+-			// boundary would be, too.
+-			return nil, "", "", false
++			// Unreachable while the cache is scoped by model; kept because
++			// resuming a conversation pinned to another model upstream would
++			// answer from the wrong one.
++			log.Warnf("cursor: checkpoint for %s found under %s's scope, ignoring", entry.model, wireModelID)
++			return nil, "", "", nil, false, false
+ 		}
+ 		text := foldTurnTailText(echo[i:])
+ 		if strings.TrimSpace(text) == "" {
++			log.Debugf("cursor resume probe: boundary %d/%d folds to an empty tail, skipping", i, len(echo))
++			return nil, "", "", nil, false, false
++		}
++		return entry, prefixes[i], text, echo[:i], true, true
++	}
++
++	// The checkpoint for the turn this request continues is written a moment
++	// after the reply reaches the client, and an agent's next step arrives
++	// inside that window. Note the longest boundary whose store is in flight
++	// so it can be waited for rather than missed.
++	waitIdx, waitCh := 0, (chan struct{})(nil)
++	for i := len(echo); i >= 1; i-- {
++		entry, ok := defaultConversationCache.LookupNoWait(scope, prefixes[i])
++		if !ok {
++			if waitCh == nil {
++				if ch := defaultConversationCache.PendingWait(scope, prefixes[i]); ch != nil {
++					waitIdx, waitCh = i, ch
++				}
++			}
+ 			continue
+ 		}
+-		return entry, prefixes[i], text, true
++		if e, fp, text, prefix, ok, stop := resolved(i, entry); stop {
++			return e, fp, text, prefix, ok
++		}
++	}
++
++	if waitCh == nil {
++		log.Debugf("cursor resume probe: %d boundaries, none stored or pending (scope=%q longest fp=%.8s)", len(echo), scope, prefixes[len(echo)])
++		return nil, "", "", nil, false
++	}
++	select {
++	case <-waitCh:
++	case <-time.After(convPendingWait):
++	}
++	entry, ok := defaultConversationCache.LookupNoWait(scope, prefixes[waitIdx])
++	if !ok {
++		log.Debugf("cursor resume probe: boundary %d/%d still absent after waiting for its store", waitIdx, len(echo))
++		return nil, "", "", nil, false
+ 	}
+-	return nil, "", "", false
++	e, fp, text, prefix, hit, _ := resolved(waitIdx, entry)
++	return e, fp, text, prefix, hit
+ }
+ 
+ // resolveRunModelDetails applies catalog overrides to a model selection and
+diff --git a/internal/cursor/conversation_cache.go b/internal/cursor/conversation_cache.go
+index b60c6914..5e450805 100644
+--- a/internal/cursor/conversation_cache.go
++++ b/internal/cursor/conversation_cache.go
+@@ -104,15 +104,33 @@ func conversationReuseEnabled() bool {
+ 	return true
+ }
+ 
+-func convCacheKey(accountKey, fingerprint string) string {
+-	return accountKey + "\x00" + fingerprint
++func convCacheKey(scope, fingerprint string) string {
++	return scope + "\x00" + fingerprint
+ }
+ 
+-func (c *conversationCache) Lookup(accountKey, fingerprint string) (*convEntry, bool) {
+-	if accountKey == "" || fingerprint == "" {
++// convScope namespaces the conversation cache by model. A checkpoint is a
++// resumable upstream conversation, and upstream pins each one to the model
++// that opened it, so a checkpoint is only ever usable by that model.
++//
++// Keyed by account alone, two models that see the same transcript collided —
++// and agent clients make that the normal case, because every conversation
++// opens with the same system prompt and the same first user message. Whichever
++// model ran last overwrote the other's checkpoint, and the loser then found a
++// checkpoint pinned to a model it could not use and replayed its whole history
++// uncached for the rest of the conversation. Scoping by model gives each its
++// own entry, so neither evicts nor blocks the other.
++func convScope(accountKey, wireModelID string) string {
++	if accountKey == "" {
++		return ""
++	}
++	return accountKey + "\x00" + wireModelID
++}
++
++func (c *conversationCache) Lookup(scope, fingerprint string) (*convEntry, bool) {
++	if scope == "" || fingerprint == "" {
+ 		return nil, false
+ 	}
+-	key := convCacheKey(accountKey, fingerprint)
++	key := convCacheKey(scope, fingerprint)
+ 	entry, ok, wait := c.lookupOnce(key)
+ 	if ok {
+ 		return entry, ok
+@@ -135,17 +153,33 @@ func (c *conversationCache) Lookup(accountKey, fingerprint string) (*convEntry,
+ // LookupNoWait returns a stored entry without blocking on an in-flight store.
+ // Fallback boundary probes use it: they hash several candidate prefixes, and
+ // only the exact turn-end transcript could ever be pending.
+-func (c *conversationCache) LookupNoWait(accountKey, fingerprint string) (*convEntry, bool) {
+-	if accountKey == "" || fingerprint == "" {
++func (c *conversationCache) LookupNoWait(scope, fingerprint string) (*convEntry, bool) {
++	if scope == "" || fingerprint == "" {
+ 		return nil, false
+ 	}
+-	key := convCacheKey(accountKey, fingerprint)
++	key := convCacheKey(scope, fingerprint)
+ 	if entry, ok, _ := c.lookupOnce(key); ok {
+ 		return entry, ok
+ 	}
+ 	return c.loadPersisted(key)
+ }
+ 
++// PendingWait returns the channel that closes when an announced store for this
++// key lands, or nil when nothing is in flight. It lets a caller probing many
++// candidate keys find the one worth waiting for without blocking on each.
++func (c *conversationCache) PendingWait(scope, fingerprint string) chan struct{} {
++	if scope == "" || fingerprint == "" {
++		return nil
++	}
++	key := convCacheKey(scope, fingerprint)
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if marker := c.pending[key]; marker != nil {
++		return marker.ch
++	}
++	return nil
++}
++
+ // lookupOnce returns the live entry for key, or the pending-store channel a
+ // caller may wait on when the entry is not there yet.
+ func (c *conversationCache) lookupOnce(key string) (*convEntry, bool, chan struct{}) {
+@@ -168,15 +202,15 @@ func (c *conversationCache) lookupOnce(key string) (*convEntry, bool, chan struc
+ 	return nil, false, nil
+ }
+ 
+-// BeginPending announces that the checkpoint for (accountKey, fingerprint) is
++// BeginPending announces that the checkpoint for (scope, fingerprint) is
+ // about to be stored, so a concurrent lookup for the same transcript waits
+ // for it instead of missing. The returned resolve func must be called exactly
+ // when the store happened or was abandoned; it is safe to call more than once.
+-func (c *conversationCache) BeginPending(accountKey, fingerprint string) func() {
+-	if accountKey == "" || fingerprint == "" {
++func (c *conversationCache) BeginPending(scope, fingerprint string) func() {
++	if scope == "" || fingerprint == "" {
+ 		return func() {}
+ 	}
+-	key := convCacheKey(accountKey, fingerprint)
++	key := convCacheKey(scope, fingerprint)
+ 	marker := &pendingMarker{ch: make(chan struct{})}
+ 	c.mu.Lock()
+ 	// A stale marker for the same key (e.g. a retried or duplicate turn) is
+@@ -198,12 +232,12 @@ func (c *conversationCache) BeginPending(accountKey, fingerprint string) func()
+ 	}
+ }
+ 
+-func (c *conversationCache) Store(accountKey, fingerprint string, entry *convEntry) {
+-	if accountKey == "" || fingerprint == "" || entry == nil || entry.state == nil {
++func (c *conversationCache) Store(scope, fingerprint string, entry *convEntry) {
++	if scope == "" || fingerprint == "" || entry == nil || entry.state == nil {
+ 		return
+ 	}
+ 	entry.expiresAt = time.Now().Add(convCacheTTL)
+-	key := convCacheKey(accountKey, fingerprint)
++	key := convCacheKey(scope, fingerprint)
+ 	c.mu.Lock()
+ 	if len(c.entries) >= convCacheMaxSize {
+ 		c.pruneLocked()
+@@ -213,11 +247,11 @@ func (c *conversationCache) Store(accountKey, fingerprint string, entry *convEnt
+ 	persistConvEntry(key, entry)
+ }
+ 
+-func (c *conversationCache) Invalidate(accountKey, fingerprint string) {
+-	if accountKey == "" || fingerprint == "" {
++func (c *conversationCache) Invalidate(scope, fingerprint string) {
++	if scope == "" || fingerprint == "" {
+ 		return
+ 	}
+-	key := convCacheKey(accountKey, fingerprint)
++	key := convCacheKey(scope, fingerprint)
+ 	c.mu.Lock()
+ 	delete(c.entries, key)
+ 	c.mu.Unlock()
+diff --git a/internal/cursor/conversation_cache_test.go b/internal/cursor/conversation_cache_test.go
+index d59c5d92..59fb418b 100644
+--- a/internal/cursor/conversation_cache_test.go
++++ b/internal/cursor/conversation_cache_test.go
+@@ -50,8 +50,8 @@ func TestLookupTurnBoundaryResumeFoldsToolTail(t *testing.T) {
+ 	}
+ 	fp := conversationFingerprint(stored)
+ 	state := &agentv1.ConversationStateStructure{Turns: [][]byte{[]byte("turn")}}
+-	defaultConversationCache.Store("acct-boundary", fp, &convEntry{conversationID: "conv-b", state: state, model: "claude-sonnet-5"})
+-	defer defaultConversationCache.Invalidate("acct-boundary", fp)
++	defaultConversationCache.Store(convScope("acct-boundary", "claude-sonnet-5"), fp, &convEntry{conversationID: "conv-b", state: state, model: "claude-sonnet-5"})
++	defer defaultConversationCache.Invalidate(convScope("acct-boundary", "claude-sonnet-5"), fp)
+ 
+ 	// Turn 2 called a tool, the live session was lost, and the continuation
+ 	// request now ends with the tool result plus the synthetic replay note.
+@@ -63,7 +63,7 @@ func TestLookupTurnBoundaryResumeFoldsToolTail(t *testing.T) {
+ 		ChatMessage{Role: "tool", Name: "Shell", ToolCallID: "c1", Content: "a.txt full output"},
+ 		ChatMessage{Role: "user", Content: replayNoteMarker + " Their results are below.\n<tool_result>a.txt</tool_result>"},
+ 	)
+-	entry, gotFp, folded, ok := lookupPrefixResume("acct-boundary", "claude-sonnet-5", continuation)
++	entry, gotFp, folded, _, ok := lookupPrefixResume("acct-boundary", "claude-sonnet-5", continuation)
+ 	if !ok || entry == nil || entry.conversationID != "conv-b" || gotFp != fp {
+ 		t.Fatalf("expected boundary resume hit, got ok=%v entry=%+v", ok, entry)
+ 	}
+@@ -76,8 +76,9 @@ func TestLookupTurnBoundaryResumeFoldsToolTail(t *testing.T) {
+ 		t.Fatalf("folded tail must skip the synthetic replay note, got %q", folded)
+ 	}
+ 
+-	// A checkpoint pinned to another model cannot be continued.
+-	if _, _, _, ok = lookupPrefixResume("acct-boundary", "grok-4.6", continuation); ok {
++	// A checkpoint pinned to another model cannot be continued: the cache is
++	// scoped per model, so another model's probe does not even see this entry.
++	if _, _, _, _, ok = lookupPrefixResume("acct-boundary", "grok-4.6", continuation); ok {
+ 		t.Fatalf("boundary resume must refuse a model mismatch")
+ 	}
+ }
+@@ -113,8 +114,8 @@ func TestLookupPrefixResumeSurvivesClientDivergence(t *testing.T) {
+ 	}
+ 	fp := conversationFingerprint(requestPrefix)
+ 	state := &agentv1.ConversationStateStructure{Turns: [][]byte{[]byte("turn")}}
+-	defaultConversationCache.Store("acct-div", fp, &convEntry{conversationID: "conv-div", state: state, model: "claude-opus-5"})
+-	defer defaultConversationCache.Invalidate("acct-div", fp)
++	defaultConversationCache.Store(convScope("acct-div", "claude-opus-5"), fp, &convEntry{conversationID: "conv-div", state: state, model: "claude-opus-5"})
++	defer defaultConversationCache.Invalidate(convScope("acct-div", "claude-opus-5"), fp)
+ 
+ 	// The client re-sends its prefix verbatim but the appended assistant
+ 	// message merges a tool call from another branch (an id this gateway
+@@ -127,7 +128,7 @@ func TestLookupPrefixResumeSurvivesClientDivergence(t *testing.T) {
+ 		ChatMessage{Role: "tool", ToolCallID: "tooluse_foreign", Content: "todo stored"},
+ 		ChatMessage{Role: "tool", ToolCallID: "toolu_B", Content: "a.txt"},
+ 	)
+-	entry, gotFp, folded, ok := lookupPrefixResume("acct-div", "claude-opus-5", diverged)
++	entry, gotFp, folded, _, ok := lookupPrefixResume("acct-div", "claude-opus-5", diverged)
+ 	if !ok || entry == nil || entry.conversationID != "conv-div" || gotFp != fp {
+ 		t.Fatalf("expected prefix resume hit, got ok=%v entry=%+v", ok, entry)
+ 	}
+@@ -140,7 +141,7 @@ func TestLookupPrefixResumeSurvivesClientDivergence(t *testing.T) {
+ 	// A request the checkpoint already covers end to end must not resume:
+ 	// there is nothing left to ask, so replaying the finished turn would
+ 	// answer stale context instead of this request.
+-	if _, _, _, ok = lookupPrefixResume("acct-div", "claude-opus-5", requestPrefix); ok {
++	if _, _, _, _, ok = lookupPrefixResume("acct-div", "claude-opus-5", requestPrefix); ok {
+ 		t.Fatal("a fully covered request must miss so it runs fresh")
+ 	}
+ }
+@@ -159,12 +160,12 @@ func TestLookupPrefixResumeSkipsCoveredBoundaryForShorterOne(t *testing.T) {
+ 	shortFp := conversationFingerprint(echoTranscript(firstTurn))
+ 	fullFp := conversationFingerprint(echoTranscript(repeat))
+ 	state := &agentv1.ConversationStateStructure{Turns: [][]byte{[]byte("turn")}}
+-	defaultConversationCache.Store("acct-skip", shortFp, &convEntry{conversationID: "conv-short", state: state, model: "claude-opus-5"})
+-	defaultConversationCache.Store("acct-skip", fullFp, &convEntry{conversationID: "conv-full", state: state, model: "claude-opus-5"})
+-	defer defaultConversationCache.Invalidate("acct-skip", shortFp)
+-	defer defaultConversationCache.Invalidate("acct-skip", fullFp)
++	defaultConversationCache.Store(convScope("acct-skip", "claude-opus-5"), shortFp, &convEntry{conversationID: "conv-short", state: state, model: "claude-opus-5"})
++	defaultConversationCache.Store(convScope("acct-skip", "claude-opus-5"), fullFp, &convEntry{conversationID: "conv-full", state: state, model: "claude-opus-5"})
++	defer defaultConversationCache.Invalidate(convScope("acct-skip", "claude-opus-5"), shortFp)
++	defer defaultConversationCache.Invalidate(convScope("acct-skip", "claude-opus-5"), fullFp)
+ 
+-	entry, gotFp, folded, ok := lookupPrefixResume("acct-skip", "claude-opus-5", repeat)
++	entry, gotFp, folded, _, ok := lookupPrefixResume("acct-skip", "claude-opus-5", repeat)
+ 	if !ok || entry == nil {
+ 		t.Fatal("expected the shorter boundary to resume")
+ 	}
+@@ -188,6 +189,7 @@ func TestStorePauseSnapshotKeysRequestPrefixAndTranscript(t *testing.T) {
+ 		ConversationID: "conv-pause",
+ 		Model:          "claude-opus-5",
+ 		accountKey:     "acct-pause",
++		convScope:      convScope("acct-pause", "claude-opus-5"),
+ 		transcript:     append([]ChatMessage(nil), request...),
+ 		requestKey:     conversationFingerprint(request),
+ 		checkpoint:     &agentv1.ConversationStateStructure{Turns: [][]byte{[]byte("turn")}},
+@@ -198,7 +200,7 @@ func TestStorePauseSnapshotKeysRequestPrefixAndTranscript(t *testing.T) {
+ 	session.storePauseSnapshot()
+ 
+ 	// Findable under the client's request prefix…
+-	entry, ok := defaultConversationCache.Lookup("acct-pause", session.requestKey)
++	entry, ok := defaultConversationCache.Lookup(convScope("acct-pause", "claude-opus-5"), session.requestKey)
+ 	if !ok || entry.conversationID != "conv-pause" {
+ 		t.Fatalf("pause snapshot must be stored under the request prefix, ok=%v", ok)
+ 	}
+@@ -206,30 +208,30 @@ func TestStorePauseSnapshotKeysRequestPrefixAndTranscript(t *testing.T) {
+ 	withCall := append(append([]ChatMessage(nil), request...),
+ 		ChatMessage{Role: "assistant", ToolCalls: []ToolCall{{ID: "toolu_A", Name: "terminal", Arguments: map[string]any{"command": "ls"}}}})
+ 	transcriptFp := conversationFingerprint(withCall)
+-	if _, ok = defaultConversationCache.Lookup("acct-pause", transcriptFp); !ok {
++	if _, ok = defaultConversationCache.Lookup(convScope("acct-pause", "claude-opus-5"), transcriptFp); !ok {
+ 		t.Fatalf("pause snapshot must be stored under the paused transcript")
+ 	}
+ 
+ 	// A second pause without a newer checkpoint is a no-op.
+-	defaultConversationCache.Invalidate("acct-pause", session.requestKey)
++	defaultConversationCache.Invalidate(convScope("acct-pause", "claude-opus-5"), session.requestKey)
+ 	session.storePauseSnapshot()
+-	if _, ok = defaultConversationCache.Lookup("acct-pause", session.requestKey); ok {
++	if _, ok = defaultConversationCache.Lookup(convScope("acct-pause", "claude-opus-5"), session.requestKey); ok {
+ 		t.Fatalf("pause snapshot must not rewrite without a newer checkpoint")
+ 	}
+ 	// A newer checkpoint stores again; a finished turn does not.
+ 	session.ckptCount++
+ 	session.turnEnded = true
+ 	session.storePauseSnapshot()
+-	if _, ok = defaultConversationCache.Lookup("acct-pause", session.requestKey); ok {
++	if _, ok = defaultConversationCache.Lookup(convScope("acct-pause", "claude-opus-5"), session.requestKey); ok {
+ 		t.Fatalf("pause snapshot must not run after turn end")
+ 	}
+ 	session.turnEnded = false
+ 	session.storePauseSnapshot()
+-	if _, ok = defaultConversationCache.Lookup("acct-pause", session.requestKey); !ok {
++	if _, ok = defaultConversationCache.Lookup(convScope("acct-pause", "claude-opus-5"), session.requestKey); !ok {
+ 		t.Fatalf("a newer checkpoint must be mirrored again")
+ 	}
+-	defaultConversationCache.Invalidate("acct-pause", session.requestKey)
+-	defaultConversationCache.Invalidate("acct-pause", transcriptFp)
++	defaultConversationCache.Invalidate(convScope("acct-pause", "claude-opus-5"), session.requestKey)
++	defaultConversationCache.Invalidate(convScope("acct-pause", "claude-opus-5"), transcriptFp)
+ }
+ 
+ func TestEchoTranscriptStripsReplayNote(t *testing.T) {
+@@ -456,6 +458,7 @@ func TestSessionTranscriptSnapshot(t *testing.T) {
+ 		ConversationID: "conv-snap",
+ 		Model:          "grok-4.6",
+ 		accountKey:     "acct-snap",
++		convScope:      convScope("acct-snap", "grok-4.6"),
+ 		transcript: []ChatMessage{
+ 			{Role: "system", Content: "sys"},
+ 			{Role: "user", Content: "hello"},
+@@ -475,7 +478,7 @@ func TestSessionTranscriptSnapshot(t *testing.T) {
+ 		{Role: "user", Content: "hello"},
+ 		{Role: "assistant", Content: "hi there"},
+ 	})
+-	entry, ok := defaultConversationCache.Lookup("acct-snap", fingerprint)
++	entry, ok := defaultConversationCache.Lookup(convScope("acct-snap", "grok-4.6"), fingerprint)
+ 	if !ok {
+ 		t.Fatalf("snapshot not found under the echoed-transcript fingerprint")
+ 	}
+@@ -487,7 +490,7 @@ func TestSessionTranscriptSnapshot(t *testing.T) {
+ 	if len(defaultConversationCache.entries) != cacheBefore+1 {
+ 		t.Fatalf("snapshot must only be stored once")
+ 	}
+-	defaultConversationCache.Invalidate("acct-snap", fingerprint)
++	defaultConversationCache.Invalidate(convScope("acct-snap", "grok-4.6"), fingerprint)
+ }
+ 
+ func TestSessionSnapshotCheckpointCompleteness(t *testing.T) {
+@@ -499,6 +502,7 @@ func TestSessionSnapshotCheckpointCompleteness(t *testing.T) {
+ 			ConversationID: "conv-" + id,
+ 			Model:          "grok-4.6",
+ 			accountKey:     "acct-" + id,
++			convScope:      convScope("acct-"+id, "grok-4.6"),
+ 			transcript:     []ChatMessage{{Role: "user", Content: "hi " + id}},
+ 			checkpoint:     &agentv1.ConversationStateStructure{Turns: [][]byte{[]byte("turn")}},
+ 		}
+@@ -518,10 +522,10 @@ func TestSessionSnapshotCheckpointCompleteness(t *testing.T) {
+ 	pre.ckptAfterEnd = false
+ 	pre.outputAfterCkpt = false
+ 	pre.storeConversationSnapshot()
+-	if _, ok := defaultConversationCache.Lookup("acct-pre", fingerprintFor("pre")); !ok {
++	if _, ok := defaultConversationCache.Lookup(convScope("acct-pre", "grok-4.6"), fingerprintFor("pre")); !ok {
+ 		t.Fatalf("pre-turn_ended checkpoint with no trailing output must be stored")
+ 	}
+-	defaultConversationCache.Invalidate("acct-pre", fingerprintFor("pre"))
++	defaultConversationCache.Invalidate(convScope("acct-pre", "grok-4.6"), fingerprintFor("pre"))
+ 
+ 	// Output streamed after the last checkpoint and no post-end checkpoint
+ 	// arrived: the checkpoint may be missing that output, so skip the store.
+@@ -529,7 +533,7 @@ func TestSessionSnapshotCheckpointCompleteness(t *testing.T) {
+ 	stale.ckptAfterEnd = false
+ 	stale.outputAfterCkpt = true
+ 	stale.storeConversationSnapshot()
+-	if _, ok := defaultConversationCache.Lookup("acct-stale", fingerprintFor("stale")); ok {
++	if _, ok := defaultConversationCache.Lookup(convScope("acct-stale", "grok-4.6"), fingerprintFor("stale")); ok {
+ 		t.Fatalf("a checkpoint with output after it must not be stored")
+ 	}
+ 
+@@ -538,8 +542,8 @@ func TestSessionSnapshotCheckpointCompleteness(t *testing.T) {
+ 	post.ckptAfterEnd = true
+ 	post.outputAfterCkpt = true
+ 	post.storeConversationSnapshot()
+-	if _, ok := defaultConversationCache.Lookup("acct-post", fingerprintFor("post")); !ok {
++	if _, ok := defaultConversationCache.Lookup(convScope("acct-post", "grok-4.6"), fingerprintFor("post")); !ok {
+ 		t.Fatalf("post-turn_ended checkpoint must be stored")
+ 	}
+-	defaultConversationCache.Invalidate("acct-post", fingerprintFor("post"))
++	defaultConversationCache.Invalidate(convScope("acct-post", "grok-4.6"), fingerprintFor("post"))
+ }
+diff --git a/internal/cursor/resume_race_test.go b/internal/cursor/resume_race_test.go
+new file mode 100644
+index 00000000..db2d9339
+--- /dev/null
++++ b/internal/cursor/resume_race_test.go
+@@ -0,0 +1,129 @@
++package cursor
++
++import (
++	"testing"
++	"time"
++
++	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
++)
++
++func newTestEntry(model string) *convEntry {
++	return &convEntry{
++		conversationID: "conv-" + model,
++		state:          &agentv1.ConversationStateStructure{},
++		model:          model,
++	}
++}
++
++// The store lands a moment after the reply reaches the client, and an agent's
++// next step arrives inside that window. The boundary probe used never to wait,
++// so the step missed a checkpoint that was already announced, replayed the
++// whole conversation under a fresh upstream id, and wrote its entire prompt to
++// cache instead of reading it.
++func TestBoundaryProbeWaitsForAnAnnouncedStore(t *testing.T) {
++	const account = "acct-race"
++	const model = "claude-opus-5"
++
++	opening := []ChatMessage{{Role: "user", Content: "Investigate the repo."}}
++	requestKey := conversationFingerprint(opening)
++	t.Cleanup(func() { defaultConversationCache.Invalidate(convScope(account, model), requestKey) })
++
++	scope := convScope(account, model)
++	resolve := beginPendingAll(scope, []string{requestKey})
++
++	// The client rewrote the assistant turn, so only the request-prefix
++	// boundary can match.
++	continuation := []ChatMessage{
++		opening[0],
++		{Role: "assistant", Content: "Step 1."},
++		{Role: "tool", Content: "file_1.txt"},
++	}
++
++	go func() {
++		time.Sleep(30 * time.Millisecond)
++		defaultConversationCache.Store(scope, requestKey, newTestEntry(model))
++		resolve()
++	}()
++
++	entry, gotFp, folded, prefix, ok := lookupPrefixResume(account, model, continuation)
++	if !ok {
++		t.Fatal("the probe gave up on a checkpoint whose store had been announced")
++	}
++	if gotFp != requestKey {
++		t.Fatalf("fingerprint = %.8s, want the request-prefix key %.8s", gotFp, requestKey)
++	}
++	if entry.conversationID != "conv-"+model {
++		t.Fatalf("resumed the wrong conversation: %s", entry.conversationID)
++	}
++	if folded == "" {
++		t.Fatal("the un-checkpointed tail folded to nothing")
++	}
++	if len(prefix) != 1 {
++		t.Fatalf("matched prefix has %d messages, want the 1 the checkpoint covers", len(prefix))
++	}
++}
++
++// Agent clients open every conversation with the same system prompt and the
++// same first user message, so two models routinely produce the same
++// fingerprint. Keyed by account alone they overwrote each other's checkpoints
++// and each then found one pinned to the other, so both replayed their whole
++// history uncached for the rest of the conversation.
++func TestTwoModelsDoNotEvictEachOthersCheckpoint(t *testing.T) {
++	const account = "acct-shared-opening"
++	opening := []ChatMessage{{Role: "user", Content: "Investigate the repo."}}
++	fp := conversationFingerprint(opening)
++
++	for _, model := range []string{"claude-opus-5", "grok-4.6"} {
++		scope := convScope(account, model)
++		defaultConversationCache.Store(scope, fp, newTestEntry(model))
++		t.Cleanup(func() { defaultConversationCache.Invalidate(scope, fp) })
++	}
++
++	continuation := append(append([]ChatMessage(nil), opening...),
++		ChatMessage{Role: "assistant", Content: "Step 1."},
++		ChatMessage{Role: "tool", Content: "file_1.txt"},
++	)
++
++	for _, model := range []string{"claude-opus-5", "grok-4.6"} {
++		entry, _, _, _, ok := lookupPrefixResume(account, model, continuation)
++		if !ok {
++			t.Fatalf("%s lost its checkpoint to the other model", model)
++		}
++		if entry.conversationID != "conv-"+model {
++			t.Fatalf("%s resumed %s, which belongs to another model", model, entry.conversationID)
++		}
++	}
++}
++
++// Waiting must not be unconditional: with nothing in flight the probe returns
++// promptly rather than parking for the pending timeout.
++func TestBoundaryProbeDoesNotWaitWhenNothingIsInFlight(t *testing.T) {
++	messages := []ChatMessage{
++		{Role: "user", Content: "nothing was ever stored for this"},
++		{Role: "assistant", Content: "reply"},
++		{Role: "tool", Content: "result"},
++	}
++
++	start := time.Now()
++	if _, _, _, _, ok := lookupPrefixResume("acct-empty", "claude-opus-5", messages); ok {
++		t.Fatal("resumed a conversation that was never stored")
++	}
++	if elapsed := time.Since(start); elapsed > convPendingWait/2 {
++		t.Fatalf("probe took %s with no store in flight; it should not have waited", elapsed)
++	}
++}
++
++// The announce has to cover every key the store writes, or a client that
++// rewrites the assistant turn waits on a key nobody announced.
++func TestEveryStoredCheckpointKeyIsAlsoAnnounced(t *testing.T) {
++	keys := checkpointKeys("transcript-fp", "request-fp")
++	if len(keys) != 2 || keys[0] != "transcript-fp" || keys[1] != "request-fp" {
++		t.Fatalf("keys = %v, want both the transcript and the request prefix", keys)
++	}
++	if got := checkpointKeys("same", "same"); len(got) != 1 {
++		t.Fatalf("keys = %v, want the duplicate collapsed", got)
++	}
++	if got := checkpointKeys("transcript-fp", ""); len(got) != 1 {
++		t.Fatalf("keys = %v, want no empty key", got)
++	}
++}
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index e09358d7..cabcafe3 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -174,7 +174,11 @@ type Session struct {
+ 	// the latest ConversationStateStructure the server pushed for this run;
+ 	// replaying it under the same conversation id continues the conversation
+ 	// and keeps Cursor's provider prompt cache warm.
+-	accountKey      string
++	accountKey string
++	// convScope is the conversation cache namespace for this run: the account
++	// and the model together, because a checkpoint is only resumable by the
++	// model it was opened with.
++	convScope       string
+ 	transcript      []ChatMessage
+ 	segText         strings.Builder
+ 	segCalls        []ToolCall
+@@ -290,6 +294,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 	var blobStore map[string][]byte
+ 	var conversationID string
+ 	session.accountKey = accountKeyFromCredentials(creds)
++	session.convScope = convScope(session.accountKey, selection.ModelID)
+ 	if !session.allowImages && conversationReuseEnabled() && session.accountKey != "" {
+ 		// The stored fingerprint always ends at the previous assistant reply,
+ 		// so the lookup must treat the whole trailing run of user messages as
+@@ -300,19 +305,14 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 		userText := joinedUserText(turn)
+ 		var entry *convEntry
+ 		var fingerprint string
+-		modelMismatch := ""
+ 		if len(prefix) > 0 && userText != "" {
+ 			fingerprint = conversationFingerprint(prefix)
+-			if found, ok := defaultConversationCache.Lookup(session.accountKey, fingerprint); ok {
+-				if found.model == selection.ModelID {
+-					entry = found
+-				} else {
+-					modelMismatch = found.model
+-				}
++			if found, ok := defaultConversationCache.Lookup(session.convScope, fingerprint); ok {
++				entry = found
+ 			}
+ 		}
+ 		resumeMode := "turn"
+-		if entry == nil && modelMismatch == "" {
++		if entry == nil {
+ 			// No checkpoint for the trailing-user-run split. Probe every
+ 			// message boundary for the longest stored prefix: a tool-result
+ 			// continuation whose live session is gone ends in tool messages,
+@@ -320,7 +320,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 			// call, and a client may have rewritten its recent history.
+ 			// Folding the un-checkpointed tail into the resumed turn keeps
+ 			// the provider cache for everything before it.
+-			if found, fp, folded, ok := lookupPrefixResume(session.accountKey, selection.ModelID, messages); ok {
++			if found, fp, folded, _, ok := lookupPrefixResume(session.accountKey, selection.ModelID, messages); ok {
+ 				entry, fingerprint, userText = found, fp, folded
+ 				resumeMode = "fold"
+ 			}
+@@ -341,11 +341,6 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 			} else {
+ 				log.Warnf("cursor: checkpoint found but resume request build failed, replaying full history: %v", errResume)
+ 			}
+-		case modelMismatch != "":
+-			// Model switched mid-conversation: the checkpointed upstream
+-			// conversation is pinned to another model, so it cannot be
+-			// continued. Info because it explains a full re-bill.
+-			log.Infof("cursor: checkpoint model mismatch, replaying full history (account=%s have=%s want=%s)", session.accountKey, modelMismatch, selection.ModelID)
+ 		case historyHasAssistant(messages):
+ 			// A follow-up turn with no checkpoint replays the entire
+ 			// history uncached; log it so cache misses are visible in
+@@ -384,7 +379,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 	if err != nil && session.resumed {
+ 		// A rejected checkpoint must not wedge the conversation: drop the
+ 		// cached entry and rebuild the run from the full request history.
+-		defaultConversationCache.Invalidate(session.accountKey, session.resumeKey)
++		defaultConversationCache.Invalidate(session.convScope, session.resumeKey)
+ 		session.resumed = false
+ 		session.resumeKey = ""
+ 		log.Warnf("cursor: checkpoint resume rejected, rebuilding conversation: %v", err)
+@@ -811,19 +806,12 @@ func (s *Session) storeConversationSnapshot() {
+ 	convID := s.ConversationID
+ 	model := s.Model
+ 	accountKey := s.accountKey
++	scope := s.convScope
+ 	requestKey := s.requestKey
+ 	s.mu.Unlock()
+-	fingerprint := conversationFingerprint(transcript)
+-	keys := []string{fingerprint}
+-	// Also key the checkpoint by the client's own request prefix: a client
+-	// that rewrites the reply (merging parallel tool calls, dropping a
+-	// discarded sample) still re-sends its prefix verbatim, and the prefix
+-	// probe finds the conversation there.
+-	if requestKey != "" && requestKey != fingerprint {
+-		keys = append(keys, requestKey)
+-	}
++	keys := checkpointKeys(conversationFingerprint(transcript), requestKey)
+ 	for _, key := range keys {
+-		defaultConversationCache.Store(accountKey, key, &convEntry{
++		defaultConversationCache.Store(scope, key, &convEntry{
+ 			conversationID: convID,
+ 			state:          state,
+ 			blobs:          blobs,
+@@ -831,7 +819,7 @@ func (s *Session) storeConversationSnapshot() {
+ 		})
+ 	}
+ 	s.resolvePending()
+-	log.Infof("cursor: stored conversation checkpoint conv=%s account=%s turns=%d keys=%d", convID, accountKey, len(state.GetTurns()), len(keys))
++	log.Infof("cursor: stored conversation checkpoint conv=%s account=%s scope=%q turns=%d keys=%d fp=%.8s", convID, accountKey, scope, len(state.GetTurns()), len(keys), keys[0])
+ }
+ 
+ // storePauseSnapshot mirrors the latest mid-turn checkpoint into the
+@@ -861,15 +849,13 @@ func (s *Session) storePauseSnapshot() {
+ 	convID := s.ConversationID
+ 	model := s.Model
+ 	accountKey := s.accountKey
++	scope := s.convScope
+ 	requestKey := s.requestKey
+ 	transcript := s.finalTranscriptLocked()
+ 	s.mu.Unlock()
+-	keys := []string{conversationFingerprint(transcript)}
+-	if requestKey != "" && requestKey != keys[0] {
+-		keys = append(keys, requestKey)
+-	}
++	keys := checkpointKeys(conversationFingerprint(transcript), requestKey)
+ 	for _, key := range keys {
+-		defaultConversationCache.Store(accountKey, key, &convEntry{
++		defaultConversationCache.Store(scope, key, &convEntry{
+ 			conversationID: convID,
+ 			state:          state,
+ 			blobs:          blobs,
+@@ -945,6 +931,34 @@ func usageEvent(u TokenUsage) StreamEvent {
+ 	}
+ }
+ 
++// checkpointKeys lists the keys one checkpoint is filed under. Besides the
++// final transcript, a checkpoint is keyed by the client's own request prefix:
++// a client that rewrites the reply (merging parallel tool calls, dropping a
++// discarded sample) still re-sends its prefix verbatim, and the prefix probe
++// finds the conversation there. The announce and the store share this so a key
++// can never be stored without having been announced.
++func checkpointKeys(transcriptFingerprint, requestKey string) []string {
++	keys := []string{transcriptFingerprint}
++	if requestKey != "" && requestKey != transcriptFingerprint {
++		keys = append(keys, requestKey)
++	}
++	return keys
++}
++
++// beginPendingAll announces an in-flight store for every key and returns one
++// resolve func releasing all of them.
++func beginPendingAll(scope string, keys []string) func() {
++	resolvers := make([]func(), 0, len(keys))
++	for _, key := range keys {
++		resolvers = append(resolvers, defaultConversationCache.BeginPending(scope, key))
++	}
++	return func() {
++		for _, resolve := range resolvers {
++			resolve()
++		}
++	}
++}
++
+ // resolvePending releases the pending-store marker, waking lookups that were
+ // waiting for this turn's checkpoint. Safe to call at any point after
+ // turn_ended, including when the store was abandoned.
+@@ -969,7 +983,7 @@ func (s *Session) fail(err error) {
+ 	// server would not restore; dropping it makes the client's retry rebuild
+ 	// the conversation from scratch instead of looping on the same failure.
+ 	if resumedNoOutput {
+-		defaultConversationCache.Invalidate(s.accountKey, s.resumeKey)
++		defaultConversationCache.Invalidate(s.convScope, s.resumeKey)
+ 	}
+ 	if finished {
+ 		log.Debugf("cursor session torn down after a finished turn: id=%s err=%v", s.ID, err)
+@@ -1282,9 +1296,17 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
+ 			// released to the client: a follow-up request that echoes this
+ 			// transcript can arrive faster than the trailing checkpoint, and
+ 			// the pending marker makes its lookup wait instead of miss.
++			//
++			// Announce every key the store will write, not just the final
++			// transcript. A client that rewrites the assistant turn — which is
++			// what an agent front-end does when it reformats tool calls — can
++			// never match that key and has to match the request prefix
++			// instead. That one had no marker, so its lookup missed a
++			// checkpoint that landed a second later, and the whole
++			// conversation replayed under a fresh upstream id: every step of a
++			// tool loop wrote its entire prompt to cache and read none of it.
+ 			if !s.allowImages && conversationReuseEnabled() && s.accountKey != "" && !s.snapshotStored && s.pendingResolve == nil {
+-				fingerprint := conversationFingerprint(s.finalTranscriptLocked())
+-				s.pendingResolve = defaultConversationCache.BeginPending(s.accountKey, fingerprint)
++				s.pendingResolve = beginPendingAll(s.convScope, checkpointKeys(conversationFingerprint(s.finalTranscriptLocked()), s.requestKey))
+ 			}
+ 			s.mu.Unlock()
+ 			s.emit(ev)
+-- 
+2.43.0
+
+
+From 6c9361e1f96a701d5d8cb9c51b1a4cbfaaab1ab4 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 13:57:36 +0000
+Subject: [PATCH 2/3] cursor: bill a resumed segment against the prefix it
+ resumed from
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A segment that pauses for client tools gets no report from Cursor, so it
+is billed from an estimate. The estimate counted what this run had sent,
+and a resumed run has sent nothing yet — so a step that continued a
+checkpointed conversation looked entirely new.
+
+Two things fell out of that. The prefix the checkpoint already carries
+upstream, which upstream serves from its own cache, was credited to
+nobody; and the growth beyond it was called a cache write, because the
+whole prompt looked like growth. On the wire the Anthropic counters are
+disjoint, so a write that swallows the growth leaves input_tokens at
+exactly zero: an agent's working steps each reported input 0, cache
+creation 42.9K and cache read 0, on a prompt that was in fact almost
+entirely cached, and every one of those phantom writes was billed at the
+creation premium.
+
+Seed the ledger with the prefix the checkpoint covers, and stop
+estimating writes at all. Which part of a prompt upstream commits to its
+cache is upstream's decision — it writes at the breakpoints the request
+marks and leaves the tail past the last one uncached — so the growth
+stays plain input, which is both how it is priced and what it is. The
+run's closing report carries the true creation figure and reconciles it,
+so nothing is lost.
+
+With the learned read/write shape no longer deciding anything, the
+machinery that tracked it goes too.
+---
+ internal/cursor/session.go            | 16 +++++-
+ internal/cursor/session_usage_test.go |  3 +-
+ internal/cursor/usage.go              | 68 +++++------------------
+ internal/cursor/usage_test.go         | 79 +++++----------------------
+ 4 files changed, 45 insertions(+), 121 deletions(-)
+
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index cabcafe3..3e083879 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -305,10 +305,13 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 		userText := joinedUserText(turn)
+ 		var entry *convEntry
+ 		var fingerprint string
++		// cachedPrefix is the history the checkpoint already carries upstream.
++		var cachedPrefix []ChatMessage
+ 		if len(prefix) > 0 && userText != "" {
+ 			fingerprint = conversationFingerprint(prefix)
+ 			if found, ok := defaultConversationCache.Lookup(session.convScope, fingerprint); ok {
+ 				entry = found
++				cachedPrefix = prefix
+ 			}
+ 		}
+ 		resumeMode := "turn"
+@@ -320,8 +323,8 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 			// call, and a client may have rewritten its recent history.
+ 			// Folding the un-checkpointed tail into the resumed turn keeps
+ 			// the provider cache for everything before it.
+-			if found, fp, folded, _, ok := lookupPrefixResume(session.accountKey, selection.ModelID, messages); ok {
+-				entry, fingerprint, userText = found, fp, folded
++			if found, fp, folded, matched, ok := lookupPrefixResume(session.accountKey, selection.ModelID, messages); ok {
++				entry, fingerprint, userText, cachedPrefix = found, fp, folded, matched
+ 				resumeMode = "fold"
+ 			}
+ 		}
+@@ -332,6 +335,15 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
+ 				clientMsg, blobStore, conversationID = cm, bs, cid
+ 				session.resumed = true
+ 				session.resumeKey = fingerprint
++				// Upstream already holds this prefix and serves it from its own
++				// cache, but the ledger counts what *this run* has sent, and a
++				// resumed run has sent nothing yet. Left at zero, an estimated
++				// segment called the entire prompt a fresh cache write: an
++				// agent step reported input=0, read=0, create=18,163 on every
++				// turn of a loop that was in fact ~99% cached, and billed the
++				// creation premium each time. Seed it with the prefix the
++				// checkpoint covers so only the new tail is charged.
++				session.usage.sentPrompt = EstimatePromptTokens(cachedPrefix, tools)
+ 				// The resume forks this conversation away from any live
+ 				// session still parked on it waiting for tool results that
+ 				// will never come; release that stream instead of leaking it
+diff --git a/internal/cursor/session_usage_test.go b/internal/cursor/session_usage_test.go
+index 87d104da..27292250 100644
+--- a/internal/cursor/session_usage_test.go
++++ b/internal/cursor/session_usage_test.go
+@@ -31,8 +31,7 @@ func drainEvents(t *testing.T, s *Session) []StreamEvent {
+ // segments must report it as a cache read.
+ func TestToolPauseSegmentsAlwaysReportUsage(t *testing.T) {
+ 	session := newUsageSession(40000)
+-	// Only a provider already seen caching gets a cache split in an estimate.
+-	session.usage.model = knownCachingModel(t)
++	session.usage.model = "claude-opus-5"
+ 	session.outputChars = 120
+ 	session.endSegment("tool_calls")
+ 
+diff --git a/internal/cursor/usage.go b/internal/cursor/usage.go
+index 5d6b4d97..f56f973a 100644
+--- a/internal/cursor/usage.go
++++ b/internal/cursor/usage.go
+@@ -2,9 +2,6 @@ package cursor
+ 
+ import (
+ 	"encoding/json"
+-	"sync"
+-
+-	log "github.com/sirupsen/logrus"
+ )
+ 
+ // TokenUsage is a Cursor token breakdown. Despite the Anthropic-looking field
+@@ -61,14 +58,12 @@ type runUsage struct {
+ 	// A resumed segment resends that prefix, which the provider serves from
+ 	// its cache, so only the growth beyond it is a fresh read.
+ 	sentPrompt int64
+-	// model is the wire model this run is talking to, used to look up whether
+-	// the provider behind it has ever been seen caching anything.
++	// model is the wire model this run is talking to.
+ 	model string
+ }
+ 
+ // upstream reduces a run-cumulative report to the part not yet billed.
+ func (r *runUsage) upstream(total TokenUsage, prompt int64) TokenUsage {
+-	noteCacheBehaviour(r.model, total)
+ 	segment := TokenUsage{
+ 		InputTokens:      remaining(total.InputTokens, r.billed.InputTokens),
+ 		OutputTokens:     remaining(total.OutputTokens, r.billed.OutputTokens),
+@@ -111,11 +106,20 @@ func (u *TokenUsage) clampCacheToPrompt() {
+ // That is the "probes cache, real work doesn't" shape — a probe is one turn and
+ // gets a real report, while an agent's turns pause for tools and are estimated.
+ //
+-// A cache write is not assumed. It carries a creation premium that xAI never
+-// charges, so the growth beyond the prefix only becomes a write once this
+-// provider has been seen reporting one; until then it stays plain input, which
+-// is how it is priced. The run's closing report reconciles the difference, so
+-// at worst one run's writes land on its final segment.
++// A cache write is never estimated. Which part of a prompt upstream commits to
++// its cache is upstream's decision — it writes at the breakpoints the request
++// marks, and the tail past the last one stays uncached — so calling the whole
++// growth a write is a guess, and it was the wrong one twice over. On the wire
++// the three Anthropic counters are disjoint, so a write that swallows all the
++// growth leaves input_tokens at exactly zero: every step of an agent's work
++// showed "input 0, cache creation 42.9K, cache read 0" while the run was in
++// fact almost entirely cached, and each of those phantom writes was billed at
++// the creation premium.
++//
++// Left out, the growth stays plain input, which is both how it is priced and
++// what it looks like: input is the new tokens this step actually added. The
++// run's closing report carries the true creation figure and reconciles it onto
++// the final segment, so nothing is lost.
+ func (r *runUsage) estimate(prompt, output int64) TokenUsage {
+ 	read := r.sentPrompt
+ 	if read > prompt {
+@@ -126,9 +130,6 @@ func (r *runUsage) estimate(prompt, output int64) TokenUsage {
+ 		OutputTokens:    output,
+ 		CacheReadTokens: read,
+ 	}
+-	if providerCacheShape(r.model).writes {
+-		segment.CacheWriteTokens = prompt - read
+-	}
+ 	r.record(segment, prompt)
+ 	return segment
+ }
+@@ -147,45 +148,6 @@ func (r *runUsage) record(segment TokenUsage, prompt int64) {
+ // otherwise: claiming a cache that never existed understates the cost of every
+ // segment, whereas the opposite error corrects itself on the closing segment,
+ // where the cumulative report reconciles what the estimates already billed.
+-// cacheShape records what a model's provider has actually been seen reporting.
+-// The two counters are learned separately because they do not travel together:
+-// Anthropic reports both a read and a write, while xAI reports only the cached
+-// portion of the prompt and never a write, since it has no premium
+-// cache-creation charge for the rest. Estimating a write for grok would invent
+-// a cost the provider never billed.
+-type cacheShape struct {
+-	reads  bool
+-	writes bool
+-}
+-
+-var cachingProviders sync.Map // model -> cacheShape
+-
+-func noteCacheBehaviour(model string, total TokenUsage) {
+-	if model == "" || (total.CacheReadTokens == 0 && total.CacheWriteTokens == 0) {
+-		return
+-	}
+-	shape := providerCacheShape(model)
+-	seen := shape
+-	shape.reads = shape.reads || total.CacheReadTokens > 0
+-	shape.writes = shape.writes || total.CacheWriteTokens > 0
+-	if shape != seen {
+-		cachingProviders.Store(model, shape)
+-		log.Debugf("cursor usage: %s reports cache reads=%t writes=%t, estimates now follow", model, shape.reads, shape.writes)
+-	}
+-}
+-
+-func providerCacheShape(model string) cacheShape {
+-	if model == "" {
+-		return cacheShape{}
+-	}
+-	if v, ok := cachingProviders.Load(model); ok {
+-		if shape, ok := v.(cacheShape); ok {
+-			return shape
+-		}
+-	}
+-	return cacheShape{}
+-}
+-
+ func remaining(total, billed int64) int64 {
+ 	if total <= billed {
+ 		return 0
+diff --git a/internal/cursor/usage_test.go b/internal/cursor/usage_test.go
+index 1a4adab9..01fe7945 100644
+--- a/internal/cursor/usage_test.go
++++ b/internal/cursor/usage_test.go
+@@ -6,23 +6,17 @@ import "testing"
+ // estimate, and the cumulative TurnEnded that closes the run only adds what
+ // those estimates missed, so the run totals Cursor's own numbers exactly.
+ func TestRunUsageReconcilesEstimatesWithCumulativeReport(t *testing.T) {
+-	run := runUsage{model: knownCachingModel(t)}
++	run := runUsage{model: "claude-opus-5"}
+ 
+ 	first := run.estimate(40000, 30)
+ 	if first.InputTokens != 40000 || first.CacheReadTokens != 0 {
+ 		t.Fatalf("cold segment = %+v, want the whole prompt read fresh", first)
+ 	}
+-	if first.CacheWriteTokens != 40000 {
+-		t.Fatalf("cold segment cache write = %d, want the whole prompt written to cache", first.CacheWriteTokens)
+-	}
+ 
+ 	second := run.estimate(42000, 25)
+ 	if second.CacheReadTokens != 40000 {
+ 		t.Fatalf("resumed segment cache read = %d, want the 40000 prefix already sent", second.CacheReadTokens)
+ 	}
+-	if second.CacheWriteTokens != 2000 {
+-		t.Fatalf("resumed segment cache write = %d, want the 2000 of growth", second.CacheWriteTokens)
+-	}
+ 	if second.InputTokens != 42000 {
+ 		t.Fatalf("resumed segment prompt = %d, want the whole prompt, cache included", second.InputTokens)
+ 	}
+@@ -51,7 +45,7 @@ func TestRunUsageReconcilesEstimatesWithCumulativeReport(t *testing.T) {
+ // sent: downstream subtracts the two from the prompt to get the fresh input,
+ // and an overflowing row shows up as a >100% hit rate and negative input.
+ func TestSegmentNeverReportsMoreCacheThanItsPrompt(t *testing.T) {
+-	run := runUsage{model: knownCachingModel(t)}
++	run := runUsage{model: "claude-opus-5"}
+ 	run.estimate(12499, 15)
+ 
+ 	final := run.upstream(TokenUsage{InputTokens: 57157, OutputTokens: 84, CacheReadTokens: 56560}, 44658)
+@@ -60,16 +54,6 @@ func TestSegmentNeverReportsMoreCacheThanItsPrompt(t *testing.T) {
+ 	}
+ }
+ 
+-// knownCachingModel returns a model name the ledger has already seen caching,
+-// which is the precondition for an estimate to split the prompt at all.
+-func knownCachingModel(t *testing.T) string {
+-	t.Helper()
+-	name := "caching-" + t.Name()
+-	noteCacheBehaviour(name, TokenUsage{CacheReadTokens: 1, CacheWriteTokens: 1})
+-	t.Cleanup(func() { cachingProviders.Delete(name) })
+-	return name
+-}
+-
+ // The read must not wait to be confirmed. Cache behaviour is learned from a
+ // run's closing report, so gating the read on it meant the first run after
+ // every restart billed its whole prompt as fresh input — the "probes cache,
+@@ -89,62 +73,29 @@ func TestEstimateCreditsTheResentPrefixWithoutWaitingToLearn(t *testing.T) {
+ 	}
+ }
+ 
+-// A write carries a creation premium, so unlike the read it is only attributed
+-// once this provider has actually been seen reporting one.
+-func TestEstimateWaitsForProofBeforeBillingACacheWrite(t *testing.T) {
+-	run := runUsage{model: "reads-only-" + t.Name()}
++// Which part of a prompt upstream commits to its cache is upstream's decision,
++// so an estimate never guesses at one. On the wire the Anthropic counters are
++// disjoint, so a guessed write that swallowed all the growth pinned
++// input_tokens at zero on every step of an agent's work, and billed each
++// phantom write at the creation premium.
++func TestEstimateNeverInventsACacheWrite(t *testing.T) {
++	run := runUsage{model: "claude-opus-5"}
+ 
+ 	run.estimate(12499, 51)
+-	if second := run.estimate(13147, 33); second.CacheWriteTokens != 0 {
+-		t.Fatalf("cache write = %d, want none before the provider reports one", second.CacheWriteTokens)
+-	}
+-
+-	learned := runUsage{model: knownCachingModel(t)}
+-	learned.estimate(12499, 51)
+-	if second := learned.estimate(13147, 33); second.CacheWriteTokens != 13147-12499 {
+-		t.Fatalf("cache write = %d, want the growth beyond the prefix", second.CacheWriteTokens)
+-	}
+-}
+-
+-// A report carrying cache is what teaches the ledger that this model's provider
+-// caches, so later runs of the same model may split their estimates.
+-func TestUpstreamReportTeachesTheLedgerThatAModelCaches(t *testing.T) {
+-	name := "learner-" + t.Name()
+-	t.Cleanup(func() { cachingProviders.Delete(name) })
+-
+-	if shape := providerCacheShape(name); shape.reads || shape.writes {
+-		t.Fatal("a model must not be assumed to cache before anything says so")
+-	}
+-	run := runUsage{model: name}
+-	run.upstream(TokenUsage{InputTokens: 500, CacheReadTokens: 400}, 500)
+-	if !providerCacheShape(name).reads {
+-		t.Fatal("a report carrying a cache read should have been remembered")
+-	}
+-}
+-
+-// xAI reports the cached portion of the prompt and never a write, because the
+-// uncached remainder is billed as ordinary input rather than at a
+-// cache-creation premium. Estimating a write for grok invents that premium.
+-func TestEstimatesFollowAProviderThatReportsReadsButNoWrites(t *testing.T) {
+-	name := "grok-4.6-" + t.Name()
+-	t.Cleanup(func() { cachingProviders.Delete(name) })
+-
+-	run := runUsage{model: name}
+-	run.upstream(TokenUsage{InputTokens: 31305, CacheReadTokens: 31104}, 31305)
++	second := run.estimate(13147, 33)
+ 
+-	next := run.estimate(31376, 18)
+-	if next.CacheReadTokens == 0 {
+-		t.Fatal("grok reports reads, so the resent prefix should be attributed to one")
++	if second.CacheWriteTokens != 0 {
++		t.Fatalf("cache write = %d, want none: only upstream knows what it cached", second.CacheWriteTokens)
+ 	}
+-	if next.CacheWriteTokens != 0 {
+-		t.Fatalf("cache write = %d, want none for a provider that never reports one", next.CacheWriteTokens)
++	if got, want := second.InputTokens-second.CacheReadTokens, int64(13147-12499); got != want {
++		t.Fatalf("fresh input = %d, want the %d of growth this step added", got, want)
+ 	}
+ }
+ 
+ // Estimates that overshoot the cumulative report must not bill a negative
+ // segment, and must not be topped up again by the report.
+ func TestRunUsageClampsOvershootingEstimates(t *testing.T) {
+-	run := runUsage{model: knownCachingModel(t)}
++	run := runUsage{model: "claude-opus-5"}
+ 	run.estimate(100000, 500)
+ 
+ 	final := run.upstream(TokenUsage{InputTokens: 10000, OutputTokens: 100}, 100000)
+-- 
+2.43.0
+
+
+From 8efec9d31420646941fe3c388b634b0fad17204e Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 13:57:48 +0000
+Subject: [PATCH 3/3] cursor: resize the prompt on a non-streaming continuation
+ too
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Both entry points hand tool results to the live session that asked for
+them, and each carried its own copy of the steps. The non-streaming copy
+was missing the one that resizes the session's prompt to the request's
+history, so every continuation was billed with the prompt its run opened
+with — a prompt wholly inside the prefix already sent, which made the
+segment report its entire prompt as a cache read, input_tokens 0, and
+none of the growth the tool results added. Four steps of a loop whose
+prompt grew past 16,600 tokens all reported the same 16,498.
+
+Move the shared steps into one function both call, so the two cannot
+drift apart again.
+---
+ internal/cursor/session.go                   | 28 +++++++++++++++++---
+ internal/runtime/executor/cursor_executor.go |  8 +-----
+ 2 files changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index 3e083879..c5680d2d 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -1913,13 +1913,33 @@ func buildMcpToolDefinitions(tools []ToolDefinition, renameOnWire bool) []*agent
+ }
+ 
+ // RunChat performs a text/tool Cursor Agent segment and returns the collected result.
++// ResumeWithToolResults hands tool results to the live session that asked for
++// them, after resizing that session's prompt to this request's history.
++//
++// Both entry points go through it. They used to carry their own copy of these
++// steps and the non-streaming copy was missing the resize, so every
++// non-streaming continuation was billed with the prompt its run opened with —
++// a prompt wholly inside the prefix already sent, which made the segment
++// report its entire prompt as a cache read, input_tokens 0, and none of the
++// growth the tool results added.
++func ResumeWithToolResults(messages []ChatMessage, tools []ToolDefinition, results []ToolResult) (*Session, error) {
++	session, err := DefaultSessionManager().ResolveForToolResults(results)
++	if err != nil {
++		return nil, err
++	}
++	// The resumed segment's prompt is this request's history, grown by the
++	// tool results the previous segment asked for.
++	session.SetPromptTokens(EstimatePromptTokens(messages, tools))
++	if err = session.SubmitToolResults(results); err != nil {
++		return nil, err
++	}
++	return session, nil
++}
++
+ func RunChat(ctx context.Context, creds AccountCredentials, model string, messages []ChatMessage, tools []ToolDefinition, opts ...SessionOption) (*ChatResult, error) {
+ 	results := extractToolResults(messages)
+ 	if len(results) > 0 {
+-		session, err := DefaultSessionManager().ResolveForToolResults(results)
+-		if err == nil {
+-			err = session.SubmitToolResults(results)
+-		}
++		session, err := ResumeWithToolResults(messages, tools, results)
+ 		switch {
+ 		case err == nil:
+ 			return session.CollectSegment(ctx)
+diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
+index 47ef9c7b..b434dd8f 100644
+--- a/internal/runtime/executor/cursor_executor.go
++++ b/internal/runtime/executor/cursor_executor.go
+@@ -836,13 +836,7 @@ func extractChatImageInputs(body []byte) ([]cursorlib.ReferenceImage, error) {
+ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, opts ...cursorlib.SessionOption) (*cursorlib.Session, error) {
+ 	results := trailingToolResults(messages)
+ 	if len(results) > 0 {
+-		session, err := cursorlib.DefaultSessionManager().ResolveForToolResults(results)
+-		if err == nil {
+-			// The resumed segment's prompt is this request's history, grown by
+-			// the tool results the previous segment asked for.
+-			session.SetPromptTokens(cursorlib.EstimatePromptTokens(messages, tools))
+-			err = session.SubmitToolResults(results)
+-		}
++		session, err := cursorlib.ResumeWithToolResults(messages, tools, results)
+ 		switch {
+ 		case err == nil:
+ 			return session, nil
+-- 
+2.43.0
+
