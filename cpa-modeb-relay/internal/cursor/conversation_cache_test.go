@@ -94,12 +94,12 @@ func TestBoundaryLookupWaitsForTrailingCheckpoint(t *testing.T) {
 		resolve()
 	}()
 
-	entry, gotFingerprint, folded, prefix, ok := lookupPrefixResume(account, model, continuation)
+	entry, gotFingerprint, tail, prefix, ok := lookupPrefixResume(account, model, continuation)
 	if !ok || entry.conversationID != "conv-race" {
 		t.Fatal("a follow-up must wait for the announced checkpoint store")
 	}
-	if gotFingerprint != fp || folded == "" || len(prefix) != 1 {
-		t.Fatalf("unexpected boundary result fp=%q folded=%q prefix=%d", gotFingerprint, folded, len(prefix))
+	if gotFingerprint != fp || len(tail) != 2 || len(prefix) != 1 {
+		t.Fatalf("unexpected boundary result fp=%q tail=%d prefix=%d", gotFingerprint, len(tail), len(prefix))
 	}
 }
 

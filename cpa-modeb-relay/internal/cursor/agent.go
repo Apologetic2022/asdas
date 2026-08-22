@@ -244,83 +244,29 @@ func joinedUserText(turn []ChatMessage) string {
 	return strings.Join(parts, "\n\n")
 }
 
-const foldTurnTailResultLimit = 20000
-
-// foldTurnTailText turns a structured tail that is newer than the latest
-// checkpoint into the one text action accepted by a resumed Agent run.
-func foldTurnTailText(tail []ChatMessage) string {
-	var builder strings.Builder
-	toolActivity := false
-	write := func(text string) {
-		if strings.TrimSpace(text) == "" {
-			return
-		}
-		if builder.Len() > 0 {
-			builder.WriteString("\n\n")
-		}
-		builder.WriteString(text)
-	}
-	for i := range tail {
-		msg := &tail[i]
-		switch msg.Role {
-		case "user", "system":
-			write(msg.Content)
-		case "assistant":
-			if strings.TrimSpace(msg.Content) != "" {
-				write("[your reply so far]\n" + msg.Content)
-			}
-			for j := range msg.ToolCalls {
-				toolActivity = true
-				call := &msg.ToolCalls[j]
-				args := "{}"
-				if len(call.Arguments) > 0 {
-					if payload, err := json.Marshal(call.Arguments); err == nil {
-						args = string(payload)
-					}
-				}
-				write(fmt.Sprintf("[called tool %s id=%s arguments=%s]",
-					strings.TrimSpace(call.Name), normalizeFingerprintToolID(call.ID), args))
-			}
-		case "tool":
-			toolActivity = true
-			content := msg.Content
-			if len(content) > foldTurnTailResultLimit {
-				content = content[:foldTurnTailResultLimit] + "\n… (truncated)"
-			}
-			write(fmt.Sprintf("[tool result %s id=%s]\n%s",
-				strings.TrimSpace(msg.Name), normalizeFingerprintToolID(msg.ToolCallID), content))
-		}
-	}
-	if toolActivity {
-		write("[The tool calls above have already run; continue the task from their results and do not repeat them.]")
-	}
-	return builder.String()
-}
-
 // lookupPrefixResume finds the longest stored checkpoint that leaves a real
 // tail to execute. It also waits for an announced in-flight store, closing the
 // race between a fast follow-up request and Cursor's trailing checkpoint.
-func lookupPrefixResume(accountKey, wireModelID string, messages []ChatMessage) (*convEntry, string, string, []ChatMessage, bool) {
+func lookupPrefixResume(accountKey, wireModelID string, messages []ChatMessage) (*convEntry, string, []ChatMessage, []ChatMessage, bool) {
 	scope := convScope(accountKey, wireModelID)
 	echo := echoTranscript(messages)
 	prefixes := conversationPrefixFingerprints(echo)
-	resolved := func(i int, entry *convEntry) (*convEntry, string, string, []ChatMessage, bool) {
+	resolved := func(i int, entry *convEntry) (*convEntry, string, []ChatMessage, []ChatMessage, bool) {
 		if entry == nil || entry.model != wireModelID {
-			return nil, "", "", nil, false
+			return nil, "", nil, nil, false
 		}
-		text := foldTurnTailText(echo[i:])
-		if strings.TrimSpace(text) == "" {
-			return nil, "", "", nil, false
+		if i >= len(echo) {
+			return nil, "", nil, nil, false
 		}
-		return entry, prefixes[i], text, echo[:i], true
+		return entry, prefixes[i], echo[i:], echo[:i], true
 	}
 
 	waitIndex := 0
 	var wait <-chan struct{}
 	for i := len(echo); i >= 1; i-- {
 		if entry, ok := defaultConversationCache.LookupNoWait(scope, prefixes[i]); ok {
-			if found, fingerprint, text, prefix, hit := resolved(i, entry); hit {
-				return found, fingerprint, text, prefix, true
+			if found, fingerprint, tail, prefix, hit := resolved(i, entry); hit {
+				return found, fingerprint, tail, prefix, true
 			}
 			continue
 		}
@@ -331,7 +277,7 @@ func lookupPrefixResume(accountKey, wireModelID string, messages []ChatMessage) 
 		}
 	}
 	if wait == nil {
-		return nil, "", "", nil, false
+		return nil, "", nil, nil, false
 	}
 	select {
 	case <-wait:
@@ -339,7 +285,7 @@ func lookupPrefixResume(accountKey, wireModelID string, messages []ChatMessage) 
 	}
 	entry, ok := defaultConversationCache.LookupNoWait(scope, prefixes[waitIndex])
 	if !ok {
-		return nil, "", "", nil, false
+		return nil, "", nil, nil, false
 	}
 	return resolved(waitIndex, entry)
 }

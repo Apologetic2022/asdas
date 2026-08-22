@@ -116,6 +116,12 @@ type Session struct {
 	pauseCkptStored int
 	pendingResolve  func()
 
+	// Fable sometimes prints the gateway's historical "[called tool ...]"
+	// notation as prose instead of issuing MCP args. The filter converts only
+	// markers naming a tool this session actually advertised.
+	textToolFilter     *textToolCallFilter
+	syntheticTextCalls int
+
 	// turnEndedSeen records that the pre-tool segment already delivered its
 	// TurnEnded (and usage). When it did not, the TurnEnded that surfaces
 	// right after tool results are submitted belongs to the previous segment
@@ -155,6 +161,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 	var blobStore map[string][]byte
 	var conversationID string
 	var cachedPrefix []ChatMessage
+	var nativeTail []ChatMessage
 	resumed := false
 	resumeKey := ""
 	if conversationReuseEnabled() && scope != "" {
@@ -170,19 +177,27 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		}
 		resumeMode := "turn"
 		if entry == nil {
-			if found, fingerprint, folded, matched, ok := lookupPrefixResume(accountKey, selection.ModelID, messages); ok {
-				entry, resumeKey, userText, cachedPrefix = found, fingerprint, folded, matched
-				resumeMode = "fold"
+			if found, fingerprint, tail, matched, ok := lookupPrefixResume(accountKey, selection.ModelID, messages); ok {
+				entry, resumeKey, nativeTail, cachedPrefix = found, fingerprint, tail, matched
+				resumeMode = "native-tail"
 			}
 		}
 		if entry != nil {
-			cm, blobs, id, errResume := buildResumeRunRequest(model, entry, userText, tools, opts.ToolChoice)
+			var cm *agentv1.AgentClientMessage
+			var blobs map[string][]byte
+			var id string
+			var errResume error
+			if len(nativeTail) > 0 {
+				cm, blobs, id, errResume = buildNativeTailResumeRequest(model, entry, nativeTail, tools, opts.ToolChoice)
+			} else {
+				cm, blobs, id, errResume = buildResumeRunRequest(model, entry, userText, tools, opts.ToolChoice)
+			}
 			if errResume == nil {
 				clientMsg, blobStore, conversationID = cm, blobs, id
 				resumed = true
 				log.Infof("cursor: resuming conversation %s from checkpoint (account=%s model=%s mode=%s)", id, accountKey, selection.ModelID, resumeMode)
 			} else {
-				log.Warnf("cursor: checkpoint found but resume request build failed, replaying full history: %v", errResume)
+				log.Warnf("cursor: native checkpoint resume build failed, replaying full native history: %v", errResume)
 			}
 		}
 	}
@@ -270,6 +285,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		transcript:     echoTranscript(messages),
 		resumed:        resumed,
 		resumeKey:      resumeKey,
+		textToolFilter: &textToolCallFilter{},
 	}
 	session.requestKey = conversationFingerprint(session.transcript)
 	if resumed {
@@ -337,6 +353,62 @@ func (s *Session) markOutput(chars int) {
 	s.outputAfterCkpt = true
 	s.outputChars += chars
 	s.mu.Unlock()
+}
+
+func (s *Session) emitVisibleText(text string) {
+	if text == "" {
+		return
+	}
+	s.mu.Lock()
+	s.contentSinceResume = true
+	s.everOutput = true
+	s.outputAfterCkpt = true
+	s.outputChars += len(text)
+	s.segText.WriteString(text)
+	s.mu.Unlock()
+	s.emit(StreamEvent{Type: "text_delta", Text: text})
+}
+
+// handleModelTextDelta keeps pseudo-tool records out of assistant prose. A
+// recognized marker becomes the same tool_call event clients receive for an
+// MCP exec. It is intentionally not bound as a live pending exec: Cursor never
+// opened one, so the client's result will take the checkpoint-rebuild path.
+func (s *Session) handleModelTextDelta(text string) {
+	outputs := s.textToolFilter.rewrite(text, func(name string) *ToolDefinition {
+		return s.lookupTool(name, "")
+	})
+	for i := range outputs {
+		output := &outputs[i]
+		if output.call == nil {
+			s.emitVisibleText(output.text)
+			continue
+		}
+		s.mu.Lock()
+		s.contentSinceResume = true
+		s.everOutput = true
+		s.outputAfterCkpt = true
+		s.outputChars += toolCallChars(*output.call)
+		s.segCalls = append(s.segCalls, *output.call)
+		s.syntheticTextCalls++
+		s.mu.Unlock()
+		log.Warnf("cursor: converted textual tool marker to tool_call id=%s tool=%s model=%s", output.call.ID, output.call.Name, s.Model)
+		s.emit(StreamEvent{Type: "tool_call", ToolCall: output.call})
+	}
+}
+
+func (s *Session) flushTextToolFilter() {
+	if text := s.textToolFilter.flush(); text != "" {
+		s.emitVisibleText(text)
+	}
+}
+
+func (s *Session) finishReason(defaultReason string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.syntheticTextCalls > 0 {
+		return "tool_calls"
+	}
+	return defaultReason
 }
 
 // setPromptTokens updates the run's prompt size for a resumed segment, whose
@@ -516,6 +588,7 @@ func (s *Session) resolvePending() {
 // endSegment closes a segment, billing it from an estimate when Cursor
 // reported nothing for it (the run is still open, waiting on client tools).
 func (s *Session) endSegment(reason string) {
+	s.flushTextToolFilter()
 	s.mu.Lock()
 	var segment TokenUsage
 	if s.segmentBilled.Empty() {
@@ -674,6 +747,7 @@ func (s *Session) readLoop(ctx context.Context) {
 				}
 			}
 		}
+		s.flushTextToolFilter()
 		s.flushAssistantSegment()
 		s.storePauseSnapshot()
 		s.beginWaitingTools()
@@ -703,8 +777,9 @@ func (s *Session) processChunk(decoder *Decoder, chunk readChunk) (endForTools b
 						return false, true
 					}
 				}
+				s.flushTextToolFilter()
 				s.storeConversationSnapshot()
-				s.endSegment("stop")
+				s.endSegment(s.finishReason("stop"))
 				_ = s.closeNow()
 				return false, true
 			}
@@ -724,8 +799,9 @@ func (s *Session) processChunk(decoder *Decoder, chunk readChunk) (endForTools b
 		}
 	}
 	if chunk.err == io.EOF {
+		s.flushTextToolFilter()
 		s.storeConversationSnapshot()
-		s.endSegment("stop")
+		s.endSegment(s.finishReason("stop"))
 		_ = s.closeNow()
 		return false, true
 	}
@@ -922,6 +998,7 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 	s.contentSinceResume = false
 	s.segmentBilled = TokenUsage{}
 	s.outputChars = 0
+	s.syntheticTextCalls = 0
 	s.mu.Unlock()
 	s.resumeReading()
 	return nil
@@ -1007,17 +1084,13 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 	case *agentv1.AgentServerMessage_InteractionUpdate:
 		switch u := m.InteractionUpdate.Message.(type) {
 		case *agentv1.InteractionUpdate_TextDelta:
-			text := u.TextDelta.GetText()
-			s.markOutput(len(text))
-			s.mu.Lock()
-			s.segText.WriteString(text)
-			s.mu.Unlock()
-			s.emit(StreamEvent{Type: "text_delta", Text: text})
+			s.handleModelTextDelta(u.TextDelta.GetText())
 		case *agentv1.InteractionUpdate_ThinkingDelta:
 			text := u.ThinkingDelta.GetText()
 			s.markOutput(len(text))
 			s.emit(StreamEvent{Type: "thinking_delta", Text: text})
 		case *agentv1.InteractionUpdate_TurnEnded:
+			s.flushTextToolFilter()
 			total := TokenUsage{}
 			if u.TurnEnded.InputTokens != nil {
 				total.InputTokens = *u.TurnEnded.InputTokens
@@ -1047,6 +1120,7 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			segment := s.usage.upstream(total, s.promptTokens)
 			s.segmentBilled.add(segment)
 			ev := usageEvent(segment)
+			syntheticTextCalls := s.syntheticTextCalls
 			if pendingCount == 0 && !waiting && !swallow {
 				s.turnEnded = true
 				if conversationReuseEnabled() && s.convScope != "" && !s.snapshotStored && s.pendingResolve == nil {
@@ -1071,7 +1145,11 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 				return false, nil
 			}
 			s.emit(ev)
-			s.endSegment("stop")
+			reason := "stop"
+			if syntheticTextCalls > 0 {
+				reason = "tool_calls"
+			}
+			s.endSegment(reason)
 			go s.finishAfterCheckpoint()
 		case *agentv1.InteractionUpdate_ToolCallStarted,
 			*agentv1.InteractionUpdate_PartialToolCall,
