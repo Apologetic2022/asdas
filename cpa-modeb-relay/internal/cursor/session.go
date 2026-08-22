@@ -1584,6 +1584,10 @@ func extractToolResults(messages []ChatMessage) []ToolResult {
 	start := -1
 	for i := len(messages) - 1; i >= 0; i-- {
 		switch messages[i].Role {
+		case "system":
+			// Claude Code appends reminders (for example total-token state)
+			// after tool_result rows. They do not make this a new user turn.
+			continue
 		case "tool":
 			start = i
 			continue

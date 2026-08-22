@@ -258,8 +258,9 @@ func patchNativeToolResults(state *agentv1.ConversationStateStructure, blobs map
 }
 
 // buildNativeTailResumeRequest applies the uncheckpointed request tail as
-// native Cursor turns. If the tail ends in tool results it uses ResumeAction;
-// if it ends in new user rows those become the next UserMessageAction.
+// native Cursor turns. A tool-result tail is followed by an explicit
+// continuation action so a rebuilt stream consumes the historical result;
+// new user rows become the next UserMessageAction directly.
 func buildNativeTailResumeRequest(model string, entry *convEntry, tail []ChatMessage, tools []ToolDefinition, choice ToolChoice) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
 	if entry == nil || entry.state == nil {
 		return nil, nil, "", fmt.Errorf("cursor: native resume has no checkpoint")
@@ -321,6 +322,13 @@ func buildNativeTailResumeRequest(model string, entry *convEntry, tail []ChatMes
 		state.RootPromptMessagesJson = append(state.RootPromptMessagesJson, systemRows...)
 	}
 	userText := joinedUserText(trailingUsers)
+	if userText == "" && len(results) > 0 {
+		// A dead live stream cannot consume the MCP result event directly.
+		// The result is embedded in the native turn above; this action tells
+		// the replacement run to process it instead of treating the request
+		// as an empty/no-op resume.
+		userText = resumeContinuationPrompt
+	}
 	if !nativeChanged && userText == "" {
 		return nil, nil, "", fmt.Errorf("cursor: tail cannot be represented as native conversation turns")
 	}

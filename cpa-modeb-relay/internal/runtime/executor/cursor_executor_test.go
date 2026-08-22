@@ -40,7 +40,8 @@ func TestTrailingToolCallIDs(t *testing.T) {
 	claude := []byte(`{"messages":[
 		{"role":"user","content":"hi"},
 		{"role":"assistant","content":[{"type":"tool_use","id":"c2","name":"f","input":{}}]},
-		{"role":"user","content":[{"type":"tool_result","tool_use_id":"c2","content":"ok"}]}
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"c2","content":"ok"}]},
+		{"role":"system","content":"<total_tokens>100 tokens left</total_tokens>"}
 	]}`)
 	if ids := trailingToolCallIDs(claude); len(ids) != 1 || ids[0] != "c2" {
 		t.Fatalf("claude trailing ids = %#v", ids)
@@ -48,6 +49,30 @@ func TestTrailingToolCallIDs(t *testing.T) {
 	plain := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
 	if ids := trailingToolCallIDs(plain); len(ids) != 0 {
 		t.Fatalf("plain request should have no trailing ids, got %#v", ids)
+	}
+}
+
+func TestRestoreClaudeSystemMessageRoles(t *testing.T) {
+	original := []byte(`{"messages":[
+		{"role":"user","content":"这个html给我删除"},
+		{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"bash","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"permission denied"}]},
+		{"role":"system","content":"<total_tokens>15000000 tokens left</total_tokens>"}
+	]}`)
+	messages := []cursorlib.ChatMessage{
+		{Role: "user", Content: "这个html给我删除"},
+		{Role: "assistant", ToolCalls: []cursorlib.ToolCall{{ID: "c1", Name: "bash"}}},
+		{Role: "tool", ToolCallID: "c1", Content: "permission denied"},
+		{Role: "user", Content: "<system-reminder>\n<total_tokens>15000000 tokens left</total_tokens>\n</system-reminder>"},
+	}
+
+	restoreClaudeSystemMessageRoles(messages, original)
+
+	if got := messages[3].Role; got != "system" {
+		t.Fatalf("translated reminder role = %q, want system", got)
+	}
+	if got := messages[0].Role; got != "user" {
+		t.Fatalf("real user role changed to %q", got)
 	}
 }
 

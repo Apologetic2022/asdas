@@ -61,12 +61,15 @@ func TestNativeTailResumePatchesToolResultWithoutTextReplay(t *testing.T) {
 	message, replayBlobs, _, err := buildNativeTailResumeRequest(
 		"claude-fable-5",
 		entry,
-		[]ChatMessage{{
-			Role:       "tool",
-			Name:       "Write",
-			ToolCallID: "toolu_fable_write",
-			Content:    "file created",
-		}},
+		[]ChatMessage{
+			{
+				Role:       "tool",
+				Name:       "Write",
+				ToolCallID: "toolu_fable_write",
+				Content:    "file created",
+			},
+			{Role: "system", Content: "<total_tokens>15000000 tokens left</total_tokens>"},
+		},
 		[]ToolDefinition{{Name: "Write"}},
 		ToolChoice{},
 	)
@@ -74,8 +77,8 @@ func TestNativeTailResumePatchesToolResultWithoutTextReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := message.GetRunRequest()
-	if run.GetAction().GetResumeAction() == nil {
-		t.Fatalf("tool-result continuation must use native ResumeAction: %+v", run.GetAction())
+	if got := run.GetAction().GetUserMessageAction().GetUserMessage().GetText(); got != resumeContinuationPrompt {
+		t.Fatalf("tool-result continuation action = %q", got)
 	}
 	if got := nativeToolResultsFromState(t, run.GetConversationState(), replayBlobs)["toolu_fable_write"]; got != "file created" {
 		t.Fatalf("native tool result = %q", got)
@@ -113,8 +116,8 @@ func TestNativeTailResumeAppendsCompletedToolTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := message.GetRunRequest()
-	if run.GetAction().GetResumeAction() == nil {
-		t.Fatal("completed native tool turn must continue with ResumeAction")
+	if got := run.GetAction().GetUserMessageAction().GetUserMessage().GetText(); got != resumeContinuationPrompt {
+		t.Fatalf("completed native tool turn continuation = %q", got)
 	}
 	if len(run.GetConversationState().GetTurns()) != 1 {
 		t.Fatalf("native turns = %d, want 1", len(run.GetConversationState().GetTurns()))

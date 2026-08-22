@@ -16,6 +16,7 @@ import (
 	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
@@ -69,6 +70,10 @@ func trailingToolCallIDs(payload []byte) []string {
 	for i := len(items) - 1; i >= 0; i-- {
 		item := items[i]
 		switch item.Get("role").String() {
+		case "system":
+			// Claude Code appends message-level system reminders after a
+			// tool_result. They do not end the tool-result run.
+			continue
 		case "tool":
 			if id := item.Get("tool_call_id").String(); id != "" {
 				ids = append(ids, id)
@@ -127,6 +132,9 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	messages, err := extractChatMessages(body)
 	if err != nil {
 		return resp, err
+	}
+	if from.String() == "claude" {
+		restoreClaudeSystemMessageRoles(messages, req.Payload)
 	}
 	tools := extractTools(body)
 	sessOpts := cursorlib.SessionOptions{
@@ -194,6 +202,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	messages, err := extractChatMessages(body)
 	if err != nil {
 		return nil, err
+	}
+	if from.String() == "claude" {
+		restoreClaudeSystemMessageRoles(messages, req.Payload)
 	}
 	tools := extractTools(body)
 	sessOpts := cursorlib.SessionOptions{
@@ -741,6 +752,32 @@ func extractChatMessages(body []byte) ([]cursorlib.ChatMessage, error) {
 		return nil, fmt.Errorf("cursor: no usable chat messages")
 	}
 	return out, nil
+}
+
+// The Claude->OpenAI compatibility translator wraps message-level system rows
+// as user-visible <system-reminder> messages. Cursor needs their original role:
+// otherwise a reminder after a tool_result looks like a new user action, so the
+// live MCP result is never submitted and the model reports an "empty" answer.
+func restoreClaudeSystemMessageRoles(messages []cursorlib.ChatMessage, original []byte) {
+	remaining := make(map[string]int)
+	for _, item := range gjson.GetBytes(original, "messages").Array() {
+		if item.Get("role").String() != "system" {
+			continue
+		}
+		if text, ok := translatorcommon.ClaudeMessageSystemReminderText(item.Get("content")); ok {
+			remaining[text]++
+		}
+	}
+	if len(remaining) == 0 {
+		return
+	}
+	for i := range messages {
+		if messages[i].Role != "user" || remaining[messages[i].Content] == 0 {
+			continue
+		}
+		messages[i].Role = "system"
+		remaining[messages[i].Content]--
+	}
 }
 
 func extractTools(body []byte) []cursorlib.ToolDefinition {

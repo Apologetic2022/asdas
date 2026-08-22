@@ -15,9 +15,10 @@ func TestExtractToolResultsTrailingOnly(t *testing.T) {
 		{Role: "user", Content: "again"},
 		{Role: "assistant", Content: "", ToolCalls: []ToolCall{{ID: "c1", Name: "get_weather", Arguments: map[string]any{"city": "NY"}}}},
 		{Role: "tool", ToolCallID: "c1", Name: "get_weather", Content: `{"ok":true}`},
+		{Role: "system", Content: "<total_tokens>15000000 tokens left</total_tokens>"},
 	}
 	got := extractToolResults(messages)
-	if len(got) != 1 || got[0].ToolCallID != "c1" {
+	if len(got) != 1 || got[0].ToolCallID != "c1" || got[0].Content != `{"ok":true}` {
 		t.Fatalf("expected trailing c1, got %#v", got)
 	}
 }
