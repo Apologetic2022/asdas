@@ -327,3 +327,82 @@ reports usage on 6 of 6 segments at a 95% per-turn hit rate.
 
 grok's cache is best-effort with a short TTL, so an occasional cold turn in the
 middle of a conversation is upstream behaviour rather than a regression.
+
+## Against the grok fast-tier patch (base `22792aeb`)
+
+`cursor-upstream-status-and-cache-amnesia.patch`
+
+Apply last. Two findings from production traffic: a wave of 500s, and the
+report that probe requests cache while real work does not.
+
+**Every upstream refusal was a 500.** Three distinct rejections were hiding
+behind one status in the request logs:
+
+| count | Connect code | what Cursor said |
+|---|---|---|
+| 89 | `resource_exhausted` | Change your role to use agents |
+| 25 | `invalid_argument` | Request blocked by Anthropic / provider policy |
+| 2 | `not_found` | Model name is not valid: "claude-haiku-4-5" |
+
+Only the first is even arguably transient, and none of them is an internal
+server error. The status is not cosmetic: NewAPI reads it, and on a 500 it
+treats the upstream as broken, retries, and can take the channel out of
+rotation — so an account that was simply out of agent quota generated a retry
+storm against the quota it had run out of. The Connect code now maps to the
+status that means the same thing (429 / 400 / 404 / 401 / 403 / 503 / 504),
+with a bad gateway for anything unrecognised, since the failure came from
+upstream rather than from this process either way.
+
+`IterSegment` needed a fix to go with it. `fail()` raises the typed error on
+`errCh` and then emits an error event, so both are usually ready and `select`
+picks between them at random; the event branch rebuilt the error from its text,
+which dropped the status and produced a 500 anyway. The typed error is now
+preferred.
+
+Verified: a request for a model the account cannot reach answers `404` with
+`not_found_error` instead of `500`, and no 500 has been logged since.
+
+**Probes cached and real work did not, because the ledger forgot on restart.**
+The previous patch gated the estimated cache read on behaviour learned from
+upstream reports. Those reports only arrive when a run closes, so after every
+restart the ledger knew nothing, and any segment that paused for tools billed
+its whole prompt as fresh input. Production logs show exactly that: requests of
+119,303 tokens reporting `{"input_tokens":119303}` with no cache in either
+direction, 130 of 340 requests reading nothing at all.
+
+That asymmetry is the whole reported symptom. A probe is a single turn that
+gets a real upstream report, so it cached; an agent's turns pause for tools and
+are estimated, so they did not. The gate was introduced on the belief that grok
+cannot cache, which the fast-tier patch disproved.
+
+The read goes back to being unconditional, as it was in the `modeb-relay`
+lineage this ledger came from: Cursor caches the prompt prefix for every
+provider measured here, so the prefix a run has already sent is a read. The
+write does not go back — it carries a creation premium xAI never charges, so
+the growth beyond the prefix stays plain input until this provider has been
+seen reporting a write, and the run's closing report reconciles the rest.
+
+Measured on a freshly restarted process, so the ledger knows nothing, on the
+*first* run of each model — both were 0% for the entire first run before:
+
+```
+grok-4.6    t1  0.0%   t2 95.1%   t3 95.4%   t4 95.6%   t5 95.8%   t6 95.9%
+claude-4-5  t1  0.0%   t2 63.5%
+```
+
+Turn 1 is genuinely cold: nothing has been sent yet, so there is no prefix to
+have read.
+
+Two probes ship with this: `tests/agent_shape_messages_probe.py` drives
+`/v1/messages` the way an agent client does — system blocks with
+`cache_control`, a tools array, and a tool_use/tool_result exchange — rather
+than the plain single-turn shape a probe uses, and
+`tests/analyze_request_log_cache.py` summarises the gateway's own request logs
+by size band so probe traffic and real work can be compared directly.
+
+One thing that looked like a bug and was not: the tools shape appeared never to
+read cache, twice in a row, while the same request with `?beta=true` read it in
+full. CPA does not read the `beta` query parameter at all — the difference was
+ordering. Those were the first requests carrying that tool-laden prefix, and
+Anthropic's cache is not immediately readable after the write. Re-run warm, the
+shape reads 48,534 of 48,689 on every pass regardless of the flag.

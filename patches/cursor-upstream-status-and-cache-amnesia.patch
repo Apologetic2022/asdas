@@ -1,0 +1,392 @@
+From 314c8c0f175ce40363b8021ea2ed7c4d62a6710a Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 11:33:01 +0000
+Subject: [PATCH 1/2] cursor: answer upstream refusals with the status they
+ mean
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Every error Cursor closed a run with reached the client as a 500. Three
+distinct upstream refusals were hiding behind that in production: 89 runs
+rejected with resource_exhausted ("Change your role to use agents"), 25 blocked
+by the provider's content policy with invalid_argument, and a not_found for a
+model the account cannot reach.
+
+A 500 tells the gateway in front of this one that the server is broken and the
+request is worth retrying, so an account that was simply out of agent quota
+produced a retry storm against the quota it had run out of, and the channel was
+a candidate for being taken out of rotation. The Connect code is now mapped to
+the status that means the same thing — 429, 400, 404, and a bad gateway for
+anything unrecognised, since the failure came from upstream either way.
+
+IterSegment also had to prefer the typed error over the error event: fail()
+raises both, select picked between them at random, and rebuilding the error
+from the event text dropped the status again.
+
+Measured: a request for a model the account lacks now answers 404 with
+not_found_error instead of 500.
+---
+ internal/cursor/connect_error.go      | 86 +++++++++++++++++++++++++++
+ internal/cursor/connect_error_test.go | 80 +++++++++++++++++++++++++
+ internal/cursor/session.go            | 14 ++++-
+ 3 files changed, 179 insertions(+), 1 deletion(-)
+ create mode 100644 internal/cursor/connect_error.go
+ create mode 100644 internal/cursor/connect_error_test.go
+
+diff --git a/internal/cursor/connect_error.go b/internal/cursor/connect_error.go
+new file mode 100644
+index 00000000..8f5a268a
+--- /dev/null
++++ b/internal/cursor/connect_error.go
+@@ -0,0 +1,86 @@
++package cursor
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++)
++
++// ConnectError is an error Cursor closed a run with. It carries the upstream
++// Connect code so the gateway can answer with a status that means what
++// happened, instead of the blanket 500 every one of these used to become.
++//
++// The status matters beyond tidiness. A gateway in front of this one reads it:
++// on a 500 NewAPI treats the upstream as broken, retries the request, and can
++// take the channel out of rotation — so an account that is simply out of agent
++// quota produced a retry storm that burned more of the quota it had run out of.
++// A 429 tells it to back off, and a 400 tells it not to bother retrying at all.
++type ConnectError struct {
++	// Code is the Connect status Cursor sent, e.g. "resource_exhausted".
++	Code string
++	// Title and Detail are the human-readable pair Cursor puts in its error
++	// details, e.g. "Change your role to use agents".
++	Title  string
++	Detail string
++	// Raw is the whole error payload, kept so nothing is lost.
++	Raw string
++}
++
++func (e *ConnectError) Error() string {
++	return fmt.Sprintf("cursor connect end-stream error: %s", e.Raw)
++}
++
++// StatusCode maps the Connect code onto the HTTP status that means the same
++// thing. Anything unrecognised is a bad gateway rather than an internal error:
++// the failure came from upstream, not from this process.
++func (e *ConnectError) StatusCode() int {
++	switch e.Code {
++	case "resource_exhausted":
++		return http.StatusTooManyRequests
++	case "invalid_argument", "failed_precondition", "out_of_range":
++		return http.StatusBadRequest
++	case "not_found":
++		return http.StatusNotFound
++	case "permission_denied":
++		return http.StatusForbidden
++	case "unauthenticated":
++		return http.StatusUnauthorized
++	case "unavailable":
++		return http.StatusServiceUnavailable
++	case "deadline_exceeded":
++		return http.StatusGatewayTimeout
++	case "unimplemented":
++		return http.StatusNotImplemented
++	default:
++		return http.StatusBadGateway
++	}
++}
++
++// newConnectError parses Cursor's end-stream error payload. A payload that does
++// not parse still produces an error carrying the raw text, so a shape change
++// upstream degrades to a bad gateway rather than losing the failure.
++func newConnectError(payload json.RawMessage) *ConnectError {
++	out := &ConnectError{Raw: string(payload)}
++	var body struct {
++		Code    string `json:"code"`
++		Details []struct {
++			Debug struct {
++				Details struct {
++					Title  string `json:"title"`
++					Detail string `json:"detail"`
++				} `json:"details"`
++			} `json:"debug"`
++		} `json:"details"`
++	}
++	if err := json.Unmarshal(payload, &body); err != nil {
++		return out
++	}
++	out.Code = body.Code
++	for _, detail := range body.Details {
++		if title := detail.Debug.Details.Title; title != "" && out.Title == "" {
++			out.Title = title
++			out.Detail = detail.Debug.Details.Detail
++		}
++	}
++	return out
++}
+diff --git a/internal/cursor/connect_error_test.go b/internal/cursor/connect_error_test.go
+new file mode 100644
+index 00000000..98ebd31e
+--- /dev/null
++++ b/internal/cursor/connect_error_test.go
+@@ -0,0 +1,80 @@
++package cursor
++
++import (
++	"encoding/json"
++	"net/http"
++	"testing"
++)
++
++// Every upstream refusal used to reach the client as a 500, which tells a
++// gateway in front of this one that the server is broken and the request is
++// worth retrying. Two of these are neither.
++func TestConnectErrorStatusMatchesTheUpstreamCode(t *testing.T) {
++	cases := []struct {
++		name    string
++		payload string
++		want    int
++		title   string
++	}{
++		{
++			name:    "out of agent quota",
++			payload: `{"code":"resource_exhausted","message":"Error","details":[{"type":"aiserver.v1.ErrorDetails","debug":{"error":"ERROR_GPT_4_VISION_PREVIEW_RATE_LIMIT","details":{"title":"Change your role to use agents","detail":"Your role does not have access to agents."}}}]}`,
++			want:    http.StatusTooManyRequests,
++			title:   "Change your role to use agents",
++		},
++		{
++			name:    "blocked by the provider's policy",
++			payload: `{"code":"invalid_argument","message":"Error","details":[{"type":"aiserver.v1.ErrorDetails","debug":{"error":"ERROR_OPENAI","details":{"title":"Request blocked by Anthropic","detail":"Try a less sensitive prompt."}}}]}`,
++			want:    http.StatusBadRequest,
++			title:   "Request blocked by Anthropic",
++		},
++		{
++			name:    "model the account cannot reach",
++			payload: `{"code":"not_found","message":"Error","details":[{"type":"aiserver.v1.ErrorDetails","debug":{"error":"ERROR_BAD_MODEL_NAME","details":{"title":"AI Model Not Found","detail":"Model name is not valid: \"claude-haiku-4-5\""}}}]}`,
++			want:    http.StatusNotFound,
++			title:   "AI Model Not Found",
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			err := newConnectError(json.RawMessage(tc.payload))
++			if got := err.StatusCode(); got != tc.want {
++				t.Fatalf("status = %d, want %d", got, tc.want)
++			}
++			if err.Title != tc.title {
++				t.Fatalf("title = %q, want %q", err.Title, tc.title)
++			}
++			if err.Error() == "" {
++				t.Fatal("the raw payload must survive into the message")
++			}
++		})
++	}
++}
++
++// A payload this code has never seen still came from upstream, so it is a bad
++// gateway rather than an internal error, and it must not be swallowed.
++func TestUnrecognisedConnectErrorIsABadGateway(t *testing.T) {
++	for _, payload := range []string{`{"code":"some_new_code"}`, `not json at all`} {
++		err := newConnectError(json.RawMessage(payload))
++		if got := err.StatusCode(); got != http.StatusBadGateway {
++			t.Fatalf("payload %q: status = %d, want %d", payload, got, http.StatusBadGateway)
++		}
++		if err.Raw != payload {
++			t.Fatalf("payload %q was lost", payload)
++		}
++	}
++}
++
++// The handler picks the status with a direct type assertion, so the error has
++// to arrive as this type rather than wrapped in another one.
++func TestConnectErrorSatisfiesTheStatusInterface(t *testing.T) {
++	var err error = newConnectError(json.RawMessage(`{"code":"unavailable"}`))
++	se, ok := err.(interface{ StatusCode() int })
++	if !ok {
++		t.Fatal("a handler cannot read the status off this error")
++	}
++	if se.StatusCode() != http.StatusServiceUnavailable {
++		t.Fatalf("status = %d, want %d", se.StatusCode(), http.StatusServiceUnavailable)
++	}
++}
+diff --git a/internal/cursor/session.go b/internal/cursor/session.go
+index 818c7279..e09358d7 100644
+--- a/internal/cursor/session.go
++++ b/internal/cursor/session.go
+@@ -635,7 +635,7 @@ func (s *Session) processChunk(decoder *Decoder, chunk readChunk) (endForTools b
+ 					}
+ 					_ = json.Unmarshal(env.Payload, &trailer)
+ 					if len(trailer.Error) > 0 && string(trailer.Error) != "null" {
+-						s.fail(fmt.Errorf("cursor connect end-stream error: %s", string(trailer.Error)))
++						s.fail(newConnectError(trailer.Error))
+ 						return false, true
+ 					}
+ 				}
+@@ -1071,6 +1071,18 @@ func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) e
+ 				return nil
+ 			}
+ 			if ev.Type == "error" {
++				// fail() puts the typed error on errCh just before emitting
++				// this event, so both are usually ready and select picks
++				// between them at random. Prefer the typed one: it is what
++				// carries the upstream status, and rebuilding the error from
++				// the event's text would downgrade every failure to a 500.
++				select {
++				case err := <-s.errCh:
++					if err != nil {
++						return err
++					}
++				default:
++				}
+ 				return fmt.Errorf("cursor: %s", ev.Message)
+ 			}
+ 		}
+-- 
+2.43.0
+
+
+From 280530205fa107c4291b2fd2aa4f227fe4b3ee52 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 11:33:01 +0000
+Subject: [PATCH 2/2] cursor: credit the resent prefix without waiting to learn
+ the model caches
+
+Gating the estimated cache read on learned behaviour gave every restart
+amnesia. Cache behaviour is learned from a run's closing report, so until one
+arrived for that exact model, a segment that paused for tools billed its whole
+prompt as fresh input: production logs show 119,303-token requests reporting
+input_tokens with no cache in either direction.
+
+That is the reported "probes cache, real work doesn't" split. A probe is a
+single turn that gets a real upstream report, while an agent's turns pause for
+tools and are estimated, so the amnesia only ever showed on real work.
+
+Cursor caches the prompt prefix for every provider measured here, and the
+lineage this ledger came from credited the prefix unconditionally, so the read
+goes back to being the default. The write does not: it carries a creation
+premium xAI never charges, so the growth beyond the prefix stays plain input
+until this provider has been seen reporting a write. The closing report
+reconciles the rest.
+
+Measured on a cold process, first run: grok holds 95% from the second turn,
+claude 63.5%. Both were 0% for the whole first run before.
+---
+ internal/cursor/usage.go      | 43 ++++++++++++++++++-----------------
+ internal/cursor/usage_test.go | 35 +++++++++++++++++++++-------
+ 2 files changed, 49 insertions(+), 29 deletions(-)
+
+diff --git a/internal/cursor/usage.go b/internal/cursor/usage.go
+index c6e8e911..5d6b4d97 100644
+--- a/internal/cursor/usage.go
++++ b/internal/cursor/usage.go
+@@ -103,30 +103,31 @@ func (u *TokenUsage) clampCacheToPrompt() {
+ 
+ // estimate bills a segment that ended before any report arrived.
+ //
+-// The split follows whatever the model's provider has been seen reporting, one
+-// counter at a time. Attributing the resent prefix to the cache unconditionally
+-// invented a cache column for models that never cache, and inventing the write
+-// half for a provider that only reports reads bills a cache-creation premium
+-// that xAI never charges. So the prefix already sent counts as a read only for
+-// a provider that reports reads, and the growth beyond it counts as a write
+-// only for a provider that reports writes; anything not attributed stays plain
+-// input, which is how it is priced.
++// The prefix the run has already pushed upstream is counted as a cache read.
++// Cursor caches the prompt prefix for every provider measured here, so this is
++// the right prior, and it must not wait to be confirmed: the counters are
++// learned from a run's closing report, so gating on them left the first run
++// after every restart reporting a six-figure prompt as entirely fresh input.
++// That is the "probes cache, real work doesn't" shape — a probe is one turn and
++// gets a real report, while an agent's turns pause for tools and are estimated.
++//
++// A cache write is not assumed. It carries a creation premium that xAI never
++// charges, so the growth beyond the prefix only becomes a write once this
++// provider has been seen reporting one; until then it stays plain input, which
++// is how it is priced. The run's closing report reconciles the difference, so
++// at worst one run's writes land on its final segment.
+ func (r *runUsage) estimate(prompt, output int64) TokenUsage {
++	read := r.sentPrompt
++	if read > prompt {
++		read = prompt
++	}
+ 	segment := TokenUsage{
+-		InputTokens:  prompt,
+-		OutputTokens: output,
++		InputTokens:     prompt,
++		OutputTokens:    output,
++		CacheReadTokens: read,
+ 	}
+-	if shape := providerCacheShape(r.model); shape.reads || shape.writes {
+-		read := r.sentPrompt
+-		if read > prompt {
+-			read = prompt
+-		}
+-		if shape.reads {
+-			segment.CacheReadTokens = read
+-		}
+-		if shape.writes {
+-			segment.CacheWriteTokens = prompt - read
+-		}
++	if providerCacheShape(r.model).writes {
++		segment.CacheWriteTokens = prompt - read
+ 	}
+ 	r.record(segment, prompt)
+ 	return segment
+diff --git a/internal/cursor/usage_test.go b/internal/cursor/usage_test.go
+index dfa30b49..1a4adab9 100644
+--- a/internal/cursor/usage_test.go
++++ b/internal/cursor/usage_test.go
+@@ -70,20 +70,39 @@ func knownCachingModel(t *testing.T) string {
+ 	return name
+ }
+ 
+-// A provider that has never reported a cache gets none invented for it.
+-// Attributing the resent prefix to a cache anyway produced a measured 95% hit
+-// rate across a tool loop that never touched a cache, and understated the run.
+-func TestEstimateInventsNoCacheForAProviderThatNeverReportsOne(t *testing.T) {
+-	run := runUsage{model: "uncached-" + t.Name()}
++// The read must not wait to be confirmed. Cache behaviour is learned from a
++// run's closing report, so gating the read on it meant the first run after
++// every restart billed its whole prompt as fresh input — the "probes cache,
++// real work doesn't" report, since a probe is one turn and gets a real report
++// while an agent's turns pause for tools and are estimated.
++func TestEstimateCreditsTheResentPrefixWithoutWaitingToLearn(t *testing.T) {
++	run := runUsage{model: "never-reported-" + t.Name()}
+ 
+ 	run.estimate(12499, 51)
+ 	second := run.estimate(13147, 33)
+ 
+-	if second.CacheReadTokens != 0 || second.CacheWriteTokens != 0 {
+-		t.Fatalf("segment = %+v, want no cache attributed at all", second)
++	if second.CacheReadTokens != 12499 {
++		t.Fatalf("cache read = %d, want the 12499-token prefix already sent", second.CacheReadTokens)
+ 	}
+ 	if second.InputTokens != 13147 {
+-		t.Fatalf("input = %d, want the whole prompt charged as input", second.InputTokens)
++		t.Fatalf("input = %d, want the whole prompt, the cache being a subset", second.InputTokens)
++	}
++}
++
++// A write carries a creation premium, so unlike the read it is only attributed
++// once this provider has actually been seen reporting one.
++func TestEstimateWaitsForProofBeforeBillingACacheWrite(t *testing.T) {
++	run := runUsage{model: "reads-only-" + t.Name()}
++
++	run.estimate(12499, 51)
++	if second := run.estimate(13147, 33); second.CacheWriteTokens != 0 {
++		t.Fatalf("cache write = %d, want none before the provider reports one", second.CacheWriteTokens)
++	}
++
++	learned := runUsage{model: knownCachingModel(t)}
++	learned.estimate(12499, 51)
++	if second := learned.estimate(13147, 33); second.CacheWriteTokens != 13147-12499 {
++		t.Fatalf("cache write = %d, want the growth beyond the prefix", second.CacheWriteTokens)
+ 	}
+ }
+ 
+-- 
+2.43.0
+
