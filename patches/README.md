@@ -176,6 +176,36 @@ images and attached reference images are backed here. Everything else now gets
 the same actionable refusal as Shell and Glob, naming the tools that do work,
 so the tool surface is at least coherent.
 
+**The cache write reached no gateway.** OpenAI has no field for a cache write,
+so the counter only travels under a vendor extension, and the name chosen above
+(`prompt_tokens_details.cache_creation_tokens`) is not one NewAPI's OpenAI
+parser has a slot for. Asking NewAPI what it parsed settles it — its
+`billing_usage.openai_usage` echo contains `prompt_tokens_details` with only
+`cached_tokens`, `text_tokens`, `audio_tokens` and `image_tokens`, and carries
+`claude_cache_creation_5_m_tokens` as a sibling of `prompt_tokens` instead. So
+every cold turn arrived at the gateway looking like a turn that never cached and
+was billed at the full input rate: 73,699 prompt tokens at $0.148 next to an
+otherwise identical warm turn at $0.0156. Emitting
+`claude_cache_creation_5_m_tokens` fixes it — NewAPI then records
+`cache_write_tokens` alongside `cache_tokens`.
+
+The Anthropic spellings are deliberately not emitted here. On this endpoint
+`prompt_tokens` already contains the cached part, and `cache_creation_input_tokens`
+is defined as disjoint from `input_tokens`, so a gateway reading the disjoint
+name beside an inclusive `prompt_tokens` would count those tokens twice. Tested
+against NewAPI: adding it changed nothing there anyway.
+
 Verify with `tests/usage_four_fields_probe.py`, which reconstructs the panel's
 four columns from the wire and fails if they do not add up, and with
 `tests/builtin_tools_probe.py`.
+
+### A note on channel type
+
+The remaining discrepancy is not in this gateway. A NewAPI channel of type 1
+(OpenAI) converts a Claude Messages request to OpenAI, and converting the
+response back copies the inclusive `prompt_tokens` straight into Anthropic's
+`input_tokens` and leaves the flat `cache_creation_input_tokens` at zero, so a
+Claude client double counts the cached prefix. Pointing a type 14 (Anthropic)
+channel at the same gateway skips that hop and reports all four fields exactly:
+`input_tokens` disjoint, both cache counters populated, cold-to-warm cost
+falling about sevenfold on the same prompt.

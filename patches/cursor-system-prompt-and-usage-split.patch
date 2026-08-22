@@ -1,7 +1,7 @@
 From 30893555081e24d96c807ca7789c927c60f4f0f7 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:14:42 +0000
-Subject: [PATCH 1/3] cursor: report the four token classes as disjoint parts
+Subject: [PATCH 1/4] cursor: report the four token classes as disjoint parts
 
 The statistics store counts input, output, cache read and cache creation
 as disjoint and totals them by addition, the way every other executor
@@ -104,7 +104,7 @@ index 3a19fd0e..24b7ea20 100644
 From f62c023cabd5b5809283e73d0ce186744b043661 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:14:42 +0000
-Subject: [PATCH 2/3] cursor: deliver client system instructions where the
+Subject: [PATCH 2/4] cursor: deliver client system instructions where the
  harness reads them
 
 A system message from the client was emitted as a system row in the
@@ -290,7 +290,7 @@ index 00000000..c4d88586
 From ede7abb2a5092e29671c413644c43dd00cafe8b3 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:14:42 +0000
-Subject: [PATCH 3/3] cursor: refuse unbacked built-in tools uniformly
+Subject: [PATCH 3/4] cursor: refuse unbacked built-in tools uniformly
 
 Write answered success for files nothing could read back and Read
 answered file-not-found, so a run would write a file, fail to read it,
@@ -467,6 +467,102 @@ index 155678ca..a5a5ac74 100644
  	}
  }
  
+-- 
+2.43.0
+
+
+From 0a4b49577d17c7c35ce60ad17be60da0997e0af1 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 10:31:48 +0000
+Subject: [PATCH 4/4] cursor: report the cache write where gateways actually
+ read it
+
+OpenAI has no field for a cache write, so the counter only reaches a
+downstream gateway under a vendor extension name. It was being emitted as
+prompt_tokens_details.cache_creation_tokens, which NewAPI's OpenAI parser
+has no slot for, so every cold turn arrived looking like a turn that
+never cached and was billed at the full input rate -- roughly ten times
+the cost of the warm turn beside it. NewAPI reads
+claude_cache_creation_5_m_tokens beside prompt_tokens; emit that too.
+
+Not the Anthropic spellings: on this endpoint prompt_tokens already
+contains the cached part, and a gateway reading a disjoint Anthropic name
+beside an inclusive prompt_tokens would count those tokens twice.
+---
+ internal/runtime/executor/cursor_executor.go  | 11 +++++--
+ .../runtime/executor/cursor_usage_test.go     | 33 +++++++++++++++++++
+ 2 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
+index 841894ef..efd3ed31 100644
+--- a/internal/runtime/executor/cursor_executor.go
++++ b/internal/runtime/executor/cursor_executor.go
+@@ -1532,11 +1532,18 @@ func openAIUsagePayload(tokens cursorlib.TokenUsage) map[string]any {
+ 		"prompt_tokens":     prompt,
+ 		"completion_tokens": tokens.OutputTokens,
+ 		"total_tokens":      prompt + tokens.OutputTokens,
++		// OpenAI itself has nowhere to report a cache write, so the counter has
++		// to travel under the name gateways actually read. Downstream billing
++		// looks for claude_cache_creation_5_m_tokens beside prompt_tokens;
++		// prompt_tokens_details.cache_creation_tokens is what the rest of this
++		// repository parses. Emitting only the latter is why a cold turn was
++		// billed at the full input rate: the write was reported nowhere the
++		// gateway looked, so it looked like a turn that never cached.
++		"claude_cache_creation_5_m_tokens": tokens.CacheWriteTokens,
+ 		"prompt_tokens_details": map[string]any{
+ 			// Both counters are subsets of prompt_tokens and mean opposite
+ 			// things: cached_tokens was served from the cache, the other was
+-			// written into it. Reporting only the read makes a cold turn
+-			// indistinguishable from one that never cached at all.
++			// written into it.
+ 			"cached_tokens":         tokens.CacheReadTokens,
+ 			"cache_creation_tokens": tokens.CacheWriteTokens,
+ 		},
+diff --git a/internal/runtime/executor/cursor_usage_test.go b/internal/runtime/executor/cursor_usage_test.go
+index 24b7ea20..5dafc60b 100644
+--- a/internal/runtime/executor/cursor_usage_test.go
++++ b/internal/runtime/executor/cursor_usage_test.go
+@@ -33,7 +33,40 @@ func TestOpenAIUsagePayloadTreatsCachedTokensAsPartOfThePrompt(t *testing.T) {
+ 	if details["cached_tokens"].(int64) > payload["prompt_tokens"].(int64) {
+ 		t.Fatal("cached tokens must be a subset of the prompt")
+ 	}
++}
++
++// OpenAI has no field for a cache write, so gateways read it from vendor
++// extensions. Reporting the write under only one spelling is how a cold turn
++// ended up billed at the full input rate: NewAPI looks for
++// claude_cache_creation_5_m_tokens beside prompt_tokens, found nothing there,
++// and recorded no cache activity at all.
++func TestOpenAIUsagePayloadReportsTheCacheWriteWhereGatewaysReadIt(t *testing.T) {
++	payload := openAIUsagePayload(cursorlib.TokenUsage{
++		InputTokens:      56783,
++		OutputTokens:     3,
++		CacheReadTokens:  24093,
++		CacheWriteTokens: 32688,
++	})
+ 
++	// Deliberately not the Anthropic spellings (cache_creation_input_tokens):
++	// on this endpoint prompt_tokens already contains the cached part, and a
++	// gateway reading a disjoint Anthropic name beside an inclusive
++	// prompt_tokens would add the same tokens in twice.
++	got, ok := payload["claude_cache_creation_5_m_tokens"].(int64)
++	if !ok || got != 32688 {
++		t.Fatalf("claude_cache_creation_5_m_tokens = %v, want 32688", payload["claude_cache_creation_5_m_tokens"])
++	}
++	if _, exists := payload["cache_creation_input_tokens"]; exists {
++		t.Fatal("the disjoint Anthropic name must not appear beside an inclusive prompt_tokens")
++	}
++	details := payload["prompt_tokens_details"].(map[string]any)
++	if got := details["cache_creation_tokens"].(int64); got != 32688 {
++		t.Fatalf("prompt_tokens_details.cache_creation_tokens = %d, want 32688", got)
++	}
++	// The write is a subset of the prompt, never an addition to it.
++	if details["cached_tokens"].(int64)+32688 > payload["prompt_tokens"].(int64) {
++		t.Fatal("read plus write must not exceed the prompt")
++	}
+ }
+ 
+ // The statistics store counts the four token classes as disjoint and adds them
 -- 
 2.43.0
 
