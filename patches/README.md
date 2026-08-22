@@ -176,36 +176,55 @@ images and attached reference images are backed here. Everything else now gets
 the same actionable refusal as Shell and Glob, naming the tools that do work,
 so the tool surface is at least coherent.
 
-**The cache write reached no gateway.** OpenAI has no field for a cache write,
-so the counter only travels under a vendor extension, and the name chosen above
-(`prompt_tokens_details.cache_creation_tokens`) is not one NewAPI's OpenAI
-parser has a slot for. Asking NewAPI what it parsed settles it — its
-`billing_usage.openai_usage` echo contains `prompt_tokens_details` with only
-`cached_tokens`, `text_tokens`, `audio_tokens` and `image_tokens`, and carries
-`claude_cache_creation_5_m_tokens` as a sibling of `prompt_tokens` instead. So
-every cold turn arrived at the gateway looking like a turn that never cached and
-was billed at the full input rate: 73,699 prompt tokens at $0.148 next to an
-otherwise identical warm turn at $0.0156. Emitting
-`claude_cache_creation_5_m_tokens` fixes it — NewAPI then records
-`cache_write_tokens` alongside `cache_tokens`.
+**No Claude-shaped counter may sit beside an inclusive `prompt_tokens`.** OpenAI
+has no field for a cache write, so it is tempting to borrow a vendor name that
+gateways already read — NewAPI takes `claude_cache_creation_5_m_tokens` as a
+sibling of `prompt_tokens`, and emitting it does make the write visible. It also
+silently changes how NewAPI reads everything else. Fitting its recorded quota
+against the two candidate formulas settles it:
 
-The Anthropic spellings are deliberately not emitted here. On this endpoint
-`prompt_tokens` already contains the cached part, and `cache_creation_input_tokens`
-is defined as disjoint from `input_tokens`, so a gateway reading the disjoint
-name beside an inclusive `prompt_tokens` would count those tokens twice. Tested
-against NewAPI: adding it changed nothing there anyway.
+| payload | logged prompt / read / create | quota | inclusive model | disjoint model |
+|---|---|---|---|---|
+| without the field | 45781 / 24093 / 0 | 24112 | **24112** | 48205 |
+| with the field | 45781 / 24093 / 21686 | 75313 | 29534 | **75313** |
+
+`quota = prompt + read×0.1 + create×1.25 + out×5` — the moment a Claude counter
+appears, NewAPI treats `prompt_tokens` as Anthropic's disjoint input and charges
+the inclusive prompt at the full rate *and* the cache counters on top. That is
+the ten-fold cost gap between two otherwise identical rows in the usage panel:
+$0.176 against $0.0166 for the same 79,144-token prompt. The field is removed
+again; the write still travels inside `prompt_tokens_details`, where it is
+unambiguously a subset, and where NewAPI leaves the inclusive reading alone.
 
 Verify with `tests/usage_four_fields_probe.py`, which reconstructs the panel's
-four columns from the wire and fails if they do not add up, and with
-`tests/builtin_tools_probe.py`.
+four columns from the wire and fails if they do not add up.
 
-### A note on channel type
+### Channel type is the actual fix for Claude clients
 
-The remaining discrepancy is not in this gateway. A NewAPI channel of type 1
-(OpenAI) converts a Claude Messages request to OpenAI, and converting the
-response back copies the inclusive `prompt_tokens` straight into Anthropic's
-`input_tokens` and leaves the flat `cache_creation_input_tokens` at zero, so a
-Claude client double counts the cached prefix. Pointing a type 14 (Anthropic)
-channel at the same gateway skips that hop and reports all four fields exactly:
-`input_tokens` disjoint, both cache counters populated, cold-to-warm cost
-falling about sevenfold on the same prompt.
+An OpenAI-shaped payload cannot report a cache write to NewAPI without breaking
+its billing, so Claude models should not take that path at all. A NewAPI channel
+of type 1 converts a Claude Messages request to OpenAI and back, which copies
+the inclusive `prompt_tokens` into Anthropic's `input_tokens` and leaves the flat
+`cache_creation_input_tokens` at zero. Pointing a type 14 (Anthropic) channel at
+the same gateway skips the hop entirely, and `/v1/messages` already reports the
+four classes disjointly:
+
+```
+cold  input_tokens=2  output=3  cache_read=24093  cache_creation=21686  quota=29534
+warm  input_tokens=2  output=3  cache_read=45651  cache_creation=128    quota=4742
+```
+
+Both rows fit `quota = input + read×0.1 + create×1.25 + out×5` exactly, which is
+the correct charge including the cache-write premium.
+
+**The steering never named the substitute tool.** It said only that
+`mcp_`-prefixed tools work, leaving the model to work out that `mcp_Bash` is the
+shell it wanted. It does not: it calls the built-in `Shell`, gets refused, and
+spends a segment deciding whether to trust the refusal — which reaches the user
+as a transcript full of "this built-in tool is not available" and a model
+speculating that its logs are fake. `modeb-relay` had already solved this in
+`97bde9d`, enumerating the mapping (`mcp_Bash (use this whenever Bash is
+needed)`) and listing the built-ins by name; that wording is restored. Verify
+with `tests/colliding_tools_probe.py`, which registers tools called Bash, Write
+and Read — shadowing built-ins of the same name — and fails if the model touches
+a built-in.

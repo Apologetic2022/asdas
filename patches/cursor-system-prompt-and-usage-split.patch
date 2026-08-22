@@ -1,7 +1,7 @@
 From 30893555081e24d96c807ca7789c927c60f4f0f7 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:14:42 +0000
-Subject: [PATCH 1/4] cursor: report the four token classes as disjoint parts
+Subject: [PATCH 1/6] cursor: report the four token classes as disjoint parts
 
 The statistics store counts input, output, cache read and cache creation
 as disjoint and totals them by addition, the way every other executor
@@ -104,7 +104,7 @@ index 3a19fd0e..24b7ea20 100644
 From f62c023cabd5b5809283e73d0ce186744b043661 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:14:42 +0000
-Subject: [PATCH 2/4] cursor: deliver client system instructions where the
+Subject: [PATCH 2/6] cursor: deliver client system instructions where the
  harness reads them
 
 A system message from the client was emitted as a system row in the
@@ -290,7 +290,7 @@ index 00000000..c4d88586
 From ede7abb2a5092e29671c413644c43dd00cafe8b3 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:14:42 +0000
-Subject: [PATCH 3/4] cursor: refuse unbacked built-in tools uniformly
+Subject: [PATCH 3/6] cursor: refuse unbacked built-in tools uniformly
 
 Write answered success for files nothing could read back and Read
 answered file-not-found, so a run would write a file, fail to read it,
@@ -474,7 +474,7 @@ index 155678ca..a5a5ac74 100644
 From 0a4b49577d17c7c35ce60ad17be60da0997e0af1 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 22 Aug 2026 10:31:48 +0000
-Subject: [PATCH 4/4] cursor: report the cache write where gateways actually
+Subject: [PATCH 4/6] cursor: report the cache write where gateways actually
  read it
 
 OpenAI has no field for a cache write, so the counter only reaches a
@@ -563,6 +563,233 @@ index 24b7ea20..5dafc60b 100644
  }
  
  // The statistics store counts the four token classes as disjoint and adds them
+-- 
+2.43.0
+
+
+From dfa817754e51079e2e3031c3b0d18046d4b96c75 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 10:41:09 +0000
+Subject: [PATCH 5/6] cursor: keep Claude-shaped counters out of the OpenAI
+ usage payload
+
+Reporting claude_cache_creation_5_m_tokens beside prompt_tokens made the
+cache write visible to NewAPI, but it also told NewAPI to read the whole
+payload as Anthropic, where the input figure excludes the cache. It then
+charged this inclusive prompt_tokens at the full rate and added the cache
+counters on top. Fitting its billing against the quota it recorded
+confirms the flip exactly: 75313 charged where 29534 was owed, against
+2658 before the field existed, which matches the inclusive formula to the
+token.
+
+The write still travels inside prompt_tokens_details, where it is
+unambiguously a subset. Anthropic clients get the disjoint figures from
+/v1/messages, which reports all four classes correctly.
+---
+ internal/runtime/executor/cursor_executor.go  | 15 ++++----
+ .../runtime/executor/cursor_usage_test.go     | 34 +++++++++----------
+ 2 files changed, 24 insertions(+), 25 deletions(-)
+
+diff --git a/internal/runtime/executor/cursor_executor.go b/internal/runtime/executor/cursor_executor.go
+index efd3ed31..47ef9c7b 100644
+--- a/internal/runtime/executor/cursor_executor.go
++++ b/internal/runtime/executor/cursor_executor.go
+@@ -1532,14 +1532,13 @@ func openAIUsagePayload(tokens cursorlib.TokenUsage) map[string]any {
+ 		"prompt_tokens":     prompt,
+ 		"completion_tokens": tokens.OutputTokens,
+ 		"total_tokens":      prompt + tokens.OutputTokens,
+-		// OpenAI itself has nowhere to report a cache write, so the counter has
+-		// to travel under the name gateways actually read. Downstream billing
+-		// looks for claude_cache_creation_5_m_tokens beside prompt_tokens;
+-		// prompt_tokens_details.cache_creation_tokens is what the rest of this
+-		// repository parses. Emitting only the latter is why a cold turn was
+-		// billed at the full input rate: the write was reported nowhere the
+-		// gateway looked, so it looked like a turn that never cached.
+-		"claude_cache_creation_5_m_tokens": tokens.CacheWriteTokens,
++		// No Claude-shaped counter belongs beside prompt_tokens here. A gateway
++		// that sees one reads the whole payload as Anthropic, where the input
++		// figure excludes the cache, and then charges this inclusive
++		// prompt_tokens at the full rate *and* the cache counters on top --
++		// measured at 75313 billed against 29534 actually owed. The cache write
++		// only travels inside prompt_tokens_details, where it is unambiguously
++		// a subset. Anthropic clients get the disjoint figures from /v1/messages.
+ 		"prompt_tokens_details": map[string]any{
+ 			// Both counters are subsets of prompt_tokens and mean opposite
+ 			// things: cached_tokens was served from the cache, the other was
+diff --git a/internal/runtime/executor/cursor_usage_test.go b/internal/runtime/executor/cursor_usage_test.go
+index 5dafc60b..b6919799 100644
+--- a/internal/runtime/executor/cursor_usage_test.go
++++ b/internal/runtime/executor/cursor_usage_test.go
+@@ -35,12 +35,12 @@ func TestOpenAIUsagePayloadTreatsCachedTokensAsPartOfThePrompt(t *testing.T) {
+ 	}
+ }
+ 
+-// OpenAI has no field for a cache write, so gateways read it from vendor
+-// extensions. Reporting the write under only one spelling is how a cold turn
+-// ended up billed at the full input rate: NewAPI looks for
+-// claude_cache_creation_5_m_tokens beside prompt_tokens, found nothing there,
+-// and recorded no cache activity at all.
+-func TestOpenAIUsagePayloadReportsTheCacheWriteWhereGatewaysReadIt(t *testing.T) {
++// prompt_tokens here is inclusive, so nothing Claude-shaped may sit beside it.
++// A gateway that spots one reads the whole payload as Anthropic, where the
++// input figure excludes the cache, and then charges the inclusive prompt at the
++// full rate and the cache counters again on top. Measured against NewAPI:
++// 75313 billed where 29534 was owed.
++func TestOpenAIUsagePayloadKeepsClaudeCountersOutOfTheTopLevel(t *testing.T) {
+ 	payload := openAIUsagePayload(cursorlib.TokenUsage{
+ 		InputTokens:      56783,
+ 		OutputTokens:     3,
+@@ -48,22 +48,22 @@ func TestOpenAIUsagePayloadReportsTheCacheWriteWhereGatewaysReadIt(t *testing.T)
+ 		CacheWriteTokens: 32688,
+ 	})
+ 
+-	// Deliberately not the Anthropic spellings (cache_creation_input_tokens):
+-	// on this endpoint prompt_tokens already contains the cached part, and a
+-	// gateway reading a disjoint Anthropic name beside an inclusive
+-	// prompt_tokens would add the same tokens in twice.
+-	got, ok := payload["claude_cache_creation_5_m_tokens"].(int64)
+-	if !ok || got != 32688 {
+-		t.Fatalf("claude_cache_creation_5_m_tokens = %v, want 32688", payload["claude_cache_creation_5_m_tokens"])
+-	}
+-	if _, exists := payload["cache_creation_input_tokens"]; exists {
+-		t.Fatal("the disjoint Anthropic name must not appear beside an inclusive prompt_tokens")
++	for _, key := range []string{
++		"claude_cache_creation_5_m_tokens",
++		"claude_cache_creation_1_h_tokens",
++		"cache_creation_input_tokens",
++		"cache_read_input_tokens",
++	} {
++		if _, exists := payload[key]; exists {
++			t.Fatalf("%s must not appear beside an inclusive prompt_tokens", key)
++		}
+ 	}
++
++	// The write still travels, but only where it is unambiguously a subset.
+ 	details := payload["prompt_tokens_details"].(map[string]any)
+ 	if got := details["cache_creation_tokens"].(int64); got != 32688 {
+ 		t.Fatalf("prompt_tokens_details.cache_creation_tokens = %d, want 32688", got)
+ 	}
+-	// The write is a subset of the prompt, never an addition to it.
+ 	if details["cached_tokens"].(int64)+32688 > payload["prompt_tokens"].(int64) {
+ 		t.Fatal("read plus write must not exceed the prompt")
+ 	}
+-- 
+2.43.0
+
+
+From bc5cfd0eec424aca51e3ba50eb870acbb2ee173d Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 22 Aug 2026 10:41:09 +0000
+Subject: [PATCH 6/6] cursor: name the MCP tool that replaces each built-in
+
+The steering said only that mcp_-prefixed tools work, which leaves the
+model to guess that mcp_Bash is the shell it wanted. It guesses wrong:
+it calls the built-in Shell, gets refused, and spends a segment deciding
+whether to believe the refusal, which surfaces to the user as a broken
+tool channel. The modeb-relay lineage already enumerated the mapping --
+'mcp_Bash (use this whenever Bash is needed)' -- and listed the built-ins
+by name; restore that wording.
+---
+ internal/cursor/agent.go             | 37 +++++++++++++++++++---------
+ internal/cursor/agent_system_test.go | 23 ++++++++++++++++-
+ 2 files changed, 48 insertions(+), 12 deletions(-)
+
+diff --git a/internal/cursor/agent.go b/internal/cursor/agent.go
+index 990649fa..1ad10f15 100644
+--- a/internal/cursor/agent.go
++++ b/internal/cursor/agent.go
+@@ -377,15 +377,30 @@ func foldToolCallText(tc *ToolCall) string {
+ // builtinToolConstraint is the steering the model needs on every run: the
+ // harness advertises its workspace built-ins even when no tools are attached,
+ // and this gateway backs none of them.
+-func builtinToolConstraint(mcpPrefixed bool) string {
+-	note := "The built-in workspace tools (Shell, Read, Grep, Glob, Edit, Write, ...) are unavailable here; do not call them, wait on them, or describe their results."
+-	if mcpPrefixed {
+-		// Client tools are registered under mcp_-prefixed names on claude
+-		// (see claudeWireModel), so the built-in of the same base name is the
+-		// wrong one to reach for.
+-		note += " Only the mcp_-prefixed tools attached to this conversation actually work."
+-	}
+-	return note
++func builtinToolConstraint(tools []ToolDefinition, mcpPrefixed bool) string {
++	note := "Cursor's built-in tools (task, shell, terminal commands, read_file, list_dir, glob, grep, search, edit_file, write, todo, web fetch/search, subagents) are NOT available here and every call to them fails. Never call them, wait on them, or describe their results."
++	names := make([]string, 0, len(tools))
++	for i := range tools {
++		name := strings.TrimSpace(tools[i].Name)
++		if name == "" {
++			continue
++		}
++		if mcpPrefixed {
++			// Naming the built-in each one replaces is what actually stops the
++			// model reaching for it. Telling it only that "mcp_-prefixed tools
++			// work" leaves it to guess that mcp_Bash is the shell it wanted, and
++			// it guesses wrong: it calls Shell, gets refused, and burns a
++			// segment deciding whether to believe the refusal.
++			names = append(names, fmt.Sprintf("%s%s (use this whenever %s is needed)", mcpToolWirePrefix, name, name))
++			continue
++		}
++		names = append(names, name)
++	}
++	if len(names) == 0 {
++		return note + " Answer the user directly, without tools."
++	}
++	return "The ONLY tools available in this session are these MCP tools: " +
++		strings.Join(names, ", ") + ". " + note
+ }
+ 
+ // systemInstructionText labels a client system message that has to travel as a
+@@ -412,7 +427,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 	// runs that attach no tools at all, and this gateway backs none of them.
+ 	// Gating the warning on the tool list is what let a plain chat spend a
+ 	// segment on Shell and Glob and then report the environment as broken.
+-	systemPrompt += " " + builtinToolConstraint(claudeUpstream && len(tools) > 0)
++	systemPrompt += " " + builtinToolConstraint(tools, claudeUpstream)
+ 	systemBlob := storeBlob(blobStore, mustJSON(map[string]any{
+ 		"role":    "system",
+ 		"content": systemPrompt,
+@@ -553,7 +568,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
+ 	// the client's whole instruction block would push it out of the cacheable
+ 	// prefix on every turn.
+ 	actionText := activeUser.Content
+-	if note := builtinToolConstraint(claudeUpstream && len(tools) > 0); note != "" {
++	if note := builtinToolConstraint(tools, claudeUpstream); note != "" {
+ 		actionText = strings.TrimRight(actionText, "\n") + "\n\n[Tool constraint: " + note + "]"
+ 	}
+ 
+diff --git a/internal/cursor/agent_system_test.go b/internal/cursor/agent_system_test.go
+index c4d88586..f7309c56 100644
+--- a/internal/cursor/agent_system_test.go
++++ b/internal/cursor/agent_system_test.go
+@@ -56,7 +56,28 @@ func TestBuiltinConstraintRidesOnTheUserAction(t *testing.T) {
+ 	if !strings.Contains(text, "List the files here.") {
+ 		t.Fatalf("the user's own text was lost: %q", text)
+ 	}
+-	if !strings.Contains(text, "Tool constraint") || !strings.Contains(text, "Shell") {
++	if !strings.Contains(text, "Tool constraint") || !strings.Contains(text, "shell") {
+ 		t.Fatalf("action text carries no built-in constraint: %q", text)
+ 	}
+ }
++
++// Telling the model only that "mcp_-prefixed tools work" leaves it to guess
++// which one replaces the built-in it wanted. It guesses wrong, calls the
++// built-in, and burns a segment on the refusal. Name the mapping instead.
++func TestConstraintNamesTheMcpToolThatReplacesEachBuiltin(t *testing.T) {
++	msg, _, _, err := buildRunRequest("claude-sonnet-5", []ChatMessage{
++		{Role: "user", Content: "Run date."},
++	}, []ToolDefinition{{Name: "Bash"}, {Name: "Write"}}, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	text := msg.GetRunRequest().GetAction().GetUserMessageAction().GetUserMessage().GetText()
++	for _, want := range []string{
++		"mcp_Bash (use this whenever Bash is needed)",
++		"mcp_Write (use this whenever Write is needed)",
++	} {
++		if !strings.Contains(text, want) {
++			t.Fatalf("action text is missing %q: %s", want, text)
++		}
++	}
++}
 -- 
 2.43.0
 
