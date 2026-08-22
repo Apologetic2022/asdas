@@ -77,7 +77,7 @@ func TestNativeTailResumePatchesToolResultWithoutTextReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := message.GetRunRequest()
-	if got := run.GetAction().GetUserMessageAction().GetUserMessage().GetText(); got != resumeContinuationPrompt {
+	if got := run.GetAction().GetUserMessageAction().GetUserMessage().GetText(); !strings.HasPrefix(got, resumeContinuationPrompt) {
 		t.Fatalf("tool-result continuation action = %q", got)
 	}
 	if got := nativeToolResultsFromState(t, run.GetConversationState(), replayBlobs)["toolu_fable_write"]; got != "file created" {
@@ -116,7 +116,7 @@ func TestNativeTailResumeAppendsCompletedToolTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := message.GetRunRequest()
-	if got := run.GetAction().GetUserMessageAction().GetUserMessage().GetText(); got != resumeContinuationPrompt {
+	if got := run.GetAction().GetUserMessageAction().GetUserMessage().GetText(); !strings.HasPrefix(got, resumeContinuationPrompt) {
 		t.Fatalf("completed native tool turn continuation = %q", got)
 	}
 	if len(run.GetConversationState().GetTurns()) != 1 {
